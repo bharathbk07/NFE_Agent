@@ -9,6 +9,11 @@ from src.agents.navigator_agent import NavigatorAgent
 from src.tools.playwright_tool import PlaywrightBrowserRecorder
 from src.agents.analyst_agent import TrafficAnalystAgent
 
+from config.observability import initialize_observability
+
+# Initialize observability (Dynatrace, Traceloop, and LangSmith)
+initialize_observability()
+
 logger = logging.getLogger("AgentGraph")
 
 # Nodes
