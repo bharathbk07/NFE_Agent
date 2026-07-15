@@ -1,0 +1,2 @@
+# Deprecated for LLM TXN guessing — TXNs are now built deterministically from the
+# Playwright journey (sub_tasks + step_index). Kept for reference only.

@@ -2,6 +2,10 @@
 
 An agentic system built with LangGraph and LangChain that translates natural language user journeys into Playwright automation scripts, executes them across isolated browser contexts, and performs differential network analysis to discover dynamic correlation values (like tokens, authorization headers, session state, etc.) and map request/response dependencies.
 
+Network capture uses **Chrome DevTools Protocol (CDP)** via Playwright (`Network.requestWillBeSent` / `responseReceived` / `getResponseBody`) so parameterization, correlation, and transaction grouping see DevTools-grade request detail.
+
+Optional MCP servers for the **app** (not Cursor) are managed in one file: [`config/mcp_servers.json`](config/mcp_servers.json) — see [`docs/optional-mcps.md`](docs/optional-mcps.md).
+
 ---
 
 ## 🛠️ Setup & Execution

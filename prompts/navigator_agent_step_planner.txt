@@ -8,14 +8,24 @@ User Journey Description:
 Generate a JSON array of step objects. Each object must have an "action" field.
 Supported action structures:
 1. {{"action": "navigate", "url": "..."}}
-2. {{"action": "fill", "selector": "CSS_SELECTOR", "value": "..."}} (Use the provided credentials for username/password fields if they appear in the flow)
+2. {{"action": "fill", "selector": "CSS_SELECTOR", "value": "..."}}
 3. {{"action": "click", "selector": "CSS_SELECTOR"}}
 4. {{"action": "select", "selector": "CSS_SELECTOR", "value": "..."}}
-5. {{"action": "wait", "timeout": 1000}} (Time in milliseconds)
-6. {{"action": "wait_for_selector", "selector": "CSS_SELECTOR"}}
+5. {{"action": "wait", "timeout": 1000}} (timeout in milliseconds)
+6. {{"action": "wait_for_selector", "selector": "CSS_SELECTOR", "timeout": 5000}}
 7. {{"action": "wait_for_load"}}
 
-Guidelines:
-- Choose clear, standard CSS selectors (e.g. input[name='username'], button, id or class names). Avoid over-specifying attributes (e.g., use 'button' instead of 'button[type="submit"]' if not strictly necessary or if type is not specified).
-- Ensure the sequence flows logically from the start URL, completing the login first (if credentials are provided), then navigating the requested journey.
-- Output ONLY a valid JSON array of objects. Do not wrap in markdown blocks, just return raw JSON text.
+Guidelines for Selector Selection:
+- Prioritize stable attributes like `id` (e.g. `#username`), `name` (e.g. `input[name="username"]`), or placeholder (e.g. `input[placeholder*="Username" i]`).
+- For form fields (e.g., username, password, comments), match common naming conventions (`[name="username"]`, `[name="custname"]`, `[name="comments"]`).
+- For buttons/submits, match elements by tag or standard roles (e.g., `button`, `input[type="submit"]`).
+
+Guidelines for Flow & Logic:
+- If credentials are provided and a login is implied/needed, first fill the username/password and submit before proceeding with the rest of the journey.
+- Insert reasonable `wait_for_load` or `wait` steps after clicks that trigger navigation or network operations.
+- Ensure the steps are ordered chronologically.
+
+Output Format:
+- Return a JSON object with a "steps" array.
+- Example: {{"steps": [{{"action": "navigate", "url": "https://example.com"}}]}}
+- Output ONLY valid JSON. Do not include markdown formatting or backticks (no ```json).
