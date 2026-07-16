@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from src.utils.model_router import get_model_router, TaskType
+from src.utils.prompt_loader import render_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,8 @@ STRUCTURED_KEYS_RE = re.compile(
 
 
 class IntentDecision(BaseModel):
+    """A validated routing decision for the latest user message."""
+
     intent: IntentName = Field(
         description=(
             "conversation = casual chat / math / greetings unrelated to prior analysis; "
@@ -90,7 +93,14 @@ class IntentDecision(BaseModel):
 
 
 def get_latest_human_text(messages: Any) -> str:
-    """Return plain text of the most recent human message."""
+    """Extract text from the most recent human chat message.
+
+    Args:
+        messages: Iterable of LangChain messages, potentially with content blocks.
+
+    Returns:
+        Stripped plain text, or an empty string when no human message exists.
+    """
     if not messages:
         return ""
     for msg in reversed(list(messages)):
@@ -115,7 +125,15 @@ def _heuristic_intent(
     text: str,
     has_prior_analysis_context: bool,
 ) -> Optional[Tuple[IntentName, float, str]]:
-    """Fast deterministic routing for obvious cases. Returns None if ambiguous."""
+    """Route obvious requests without invoking an LLM.
+
+    Args:
+        text: Latest user message.
+        has_prior_analysis_context: Whether reusable analysis state exists.
+
+    Returns:
+        An intent, confidence, and reason tuple, or ``None`` when ambiguous.
+    """
     cleaned = text.strip()
     if not cleaned:
         return "conversation", 0.9, "Empty message"
@@ -174,7 +192,15 @@ async def classify_intent(
     text: str,
     has_prior_analysis_context: bool = False,
 ) -> IntentDecision:
-    """Classify user intent with heuristics first, LLM only for ambiguous cases."""
+    """Classify user intent with deterministic rules and LLM fallback.
+
+    Args:
+        text: Latest user message as plain text.
+        has_prior_analysis_context: Whether prior pipeline results are available.
+
+    Returns:
+        A validated intent decision and optional conversational reply.
+    """
     heuristic = _heuristic_intent(text, has_prior_analysis_context)
     if heuristic is not None:
         intent, confidence, reason = heuristic
@@ -190,21 +216,11 @@ async def classify_intent(
 
     try:
         router = get_model_router()
-        prompt = f"""You route messages for an NFE performance-testing agent.
-
-Prior analysis results exist in this chat: {has_prior_analysis_context}
-
-User message:
-\"\"\"{text[:4000]}\"\"\"
-
-Choose exactly one intent:
-- performance_analysis: user provides a NEW URL/journey/recording to run the full browser pipeline.
-- follow_up_analysis: user explicitly wants to RERUN the previous journey (e.g. run again).
-- analysis_qa: user asks about prior results (tokens, correlations, auth, why something missing, parameters). Prefer this when prior analysis exists and the message is a question.
-- conversation: greetings, math, unrelated chit-chat.
-
-If conversation, set reply to a short helpful answer.
-"""
+        prompt = render_prompt(
+            "intent_classifier",
+            has_prior_analysis_context=has_prior_analysis_context,
+            user_message=text[:4000],
+        )
         decision = await router.ainvoke_with_failover(
             TaskType.EXTRACTION,
             lambda model: model.with_structured_output(
@@ -219,6 +235,8 @@ If conversation, set reply to a short helpful answer.
                 )
             return decision
         if isinstance(decision, dict):
+            # Provider adapters may unwrap schema-constrained output to a
+            # dictionary; validate it before relying on routing fields.
             parsed = IntentDecision.model_validate(decision)
             if parsed.intent == "conversation" and not parsed.reply:
                 parsed.reply = _default_conversation_reply(
@@ -244,6 +262,15 @@ If conversation, set reply to a short helpful answer.
 
 
 def _default_conversation_reply(text: str, has_prior: bool = False) -> str:
+    """Generate a deterministic reply for non-pipeline conversation.
+
+    Args:
+        text: Latest user message.
+        has_prior: Whether an earlier analysis can be referenced.
+
+    Returns:
+        A short conversational, arithmetic, or capability response.
+    """
     cleaned = text.strip()
     if GREETING_OR_CHAT.match(cleaned):
         if has_prior:
@@ -285,6 +312,15 @@ async def route_user_message(
     messages: Any,
     has_prior_analysis_context: bool = False,
 ) -> IntentDecision:
+    """Route the latest human message into an NFE graph intent.
+
+    Args:
+        messages: Conversation messages in LangChain-compatible form.
+        has_prior_analysis_context: Whether prior analysis state exists.
+
+    Returns:
+        The validated routing decision for the latest human message.
+    """
     text = get_latest_human_text(messages)
     decision = await classify_intent(
         text, has_prior_analysis_context=has_prior_analysis_context

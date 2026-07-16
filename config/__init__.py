@@ -1,1 +1,1 @@
-# config package init
+"""Application configuration and observability helpers."""

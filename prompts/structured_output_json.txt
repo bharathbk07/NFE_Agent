@@ -1,0 +1,4 @@
+Respond with ONLY a single JSON object.
+Do not use Markdown fences, commentary, or tool calls.
+Match this JSON Schema exactly:
+{json_schema}

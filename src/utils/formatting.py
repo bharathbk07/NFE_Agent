@@ -1,8 +1,18 @@
+"""Render correlation analysis as Markdown and structured performance-test output."""
+
 from typing import List, Dict, Any, Set
 
 
 def get_step_label(idx: int, user_steps: List[Any]) -> str:
-    """Returns a human-readable step label for step_index."""
+    """Build a human-readable label for a journey step index.
+
+    Args:
+        idx: Zero-based step index, with ``-1`` denoting initial navigation.
+        user_steps: Ordered journey step dictionaries or displayable values.
+
+    Returns:
+        Concise step label string.
+    """
     if idx == -1:
         return "Initial Navigation"
     if 0 <= idx < len(user_steps):
@@ -27,6 +37,14 @@ def get_step_label(idx: int, user_steps: List[Any]) -> str:
 
 
 def _dedupe_dependencies(dependencies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate correlation edges while preserving their first-seen order.
+
+    Args:
+        dependencies: Extract-to-pass dependency dictionaries.
+
+    Returns:
+        Dependencies unique by source, target, locations, and value key.
+    """
     seen: Set[tuple] = set()
     unique = []
     for dep in dependencies:
@@ -44,7 +62,15 @@ def _dedupe_dependencies(dependencies: List[Dict[str, Any]]) -> List[Dict[str, A
 
 
 def _escape_table_cell(value: Any, max_len: int = 120) -> str:
-    """Sanitize a value for use in a markdown table cell."""
+    """Sanitize and bound a Markdown table cell.
+
+    Args:
+        value: Arbitrary display value.
+        max_len: Maximum returned character count.
+
+    Returns:
+        Single-line escaped and optionally truncated text.
+    """
     text = str(value or "").replace("|", "\\|").replace("\n", " ").strip()
     if len(text) > max_len:
         return text[: max_len - 3] + "..."
@@ -55,7 +81,15 @@ def _uncorrelated_dynamics(
     correlations: List[Dict[str, Any]],
     dependencies: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Return dynamic values that differ between runs but have no extract→pass link."""
+    """Find dynamic values not covered by an extract-to-pass dependency.
+
+    Args:
+        correlations: Dynamic values discovered between captures.
+        dependencies: Reconciled extract-to-pass edges.
+
+    Returns:
+        Correlation dictionaries with no matching key or observed value pair.
+    """
     covered_keys = set()
     covered_values = set()
     for d in dependencies:
@@ -85,6 +119,15 @@ def _uncorrelated_dynamics(
 
 
 def _format_parameters_table(parameterizable_candidates: List[Dict[str, Any]]) -> str:
+    """Render unique parameter candidates as a Markdown table.
+
+    Args:
+        parameterizable_candidates: Parameter dictionaries with selector,
+            value, variable, credential, and propagation metadata.
+
+    Returns:
+        Markdown table or an empty-state sentence, ending with a newline.
+    """
     seen_params: Set[tuple] = set()
     unique_parameterizable = []
     for cand in parameterizable_candidates:
@@ -125,7 +168,15 @@ def _format_parameters_table(parameterizable_candidates: List[Dict[str, Any]]) -
 
 
 def _short_url(url: str, max_len: int = 70) -> str:
-    """Compact a URL for table display."""
+    """Compact a URL for table display.
+
+    Args:
+        url: URL-like value.
+        max_len: Maximum returned character count.
+
+    Returns:
+        Original or ellipsis-truncated URL text.
+    """
     text = str(url or "")
     if len(text) <= max_len:
         return text
@@ -135,9 +186,14 @@ def _short_url(url: str, max_len: int = 70) -> str:
 def _group_dependencies_by_value(
     dependencies: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    Collapse extract→pass edges into one row per variable value:
-    extract-from (source) + all pass-to targets.
+    """Group dependency edges by extracted variable and source.
+
+    Args:
+        dependencies: Extract-to-pass dependency dictionaries.
+
+    Returns:
+        Group dictionaries containing one extraction source and deduplicated
+        ``pass_to`` target lists.
     """
     groups: Dict[tuple, Dict[str, Any]] = {}
     for dep in dependencies:
@@ -182,6 +238,15 @@ def _group_dependencies_by_value(
 
 
 def _format_pass_to_cell(targets: List[Dict[str, Any]], user_steps: List[Any]) -> str:
+    """Render pass targets into one HTML-break-separated table cell.
+
+    Args:
+        targets: Target request/location/step dictionaries.
+        user_steps: Journey steps used for labels.
+
+    Returns:
+        Markdown/HTML cell text, or an em dash when empty.
+    """
     if not targets:
         return "—"
     parts = []
@@ -198,6 +263,16 @@ def _format_correlations_table(
     dependencies: List[Dict[str, Any]],
     correlations: List[Dict[str, Any]],
 ) -> str:
+    """Render reconciled and leftover correlations as Markdown tables.
+
+    Args:
+        user_steps: Journey steps used for labels.
+        dependencies: Extract-to-pass edges.
+        correlations: All dynamic values observed between runs.
+
+    Returns:
+        Correlation report Markdown ending with a newline.
+    """
     unique_deps = _dedupe_dependencies(dependencies)
     grouped = _group_dependencies_by_value(unique_deps)
     uncorrelated = _uncorrelated_dynamics(correlations, unique_deps)
@@ -210,11 +285,21 @@ def _format_correlations_table(
         ]
         for group in grouped:
             extract_step = get_step_label(group.get("extract_step_index", -1), user_steps)
-            extract_cell = (
-                f"{extract_step}<br>"
-                f"`{group.get('extract_location')}` in "
-                f"`{_short_url(group.get('extract_request'))}`"
-            )
+            ctype = group.get("correlation_type", "response_extract")
+            extract_loc = group.get("extract_location") or ""
+            extract_req = group.get("extract_request") or ""
+            if ctype == "ui_extract" or extract_loc.startswith("ui."):
+                extract_cell = (
+                    f"{extract_step}<br>"
+                    f"UI extract `{extract_loc}` (server-generated after submit/create)"
+                )
+            elif extract_req:
+                extract_cell = (
+                    f"{extract_step}<br>"
+                    f"`{extract_loc}` in `{_short_url(extract_req)}`"
+                )
+            else:
+                extract_cell = f"{extract_step}<br>`{extract_loc}`"
             lines.append(
                 "| "
                 + " | ".join(
@@ -279,6 +364,14 @@ def _format_correlations_table(
 
 
 def _format_transactions_table(transactions: List[Dict[str, Any]]) -> str:
+    """Render transaction summaries as a Markdown table.
+
+    Args:
+        transactions: Transaction dictionaries with request or UI labels.
+
+    Returns:
+        Markdown table or an empty-state sentence.
+    """
     if not transactions:
         return "_No transactions were identified._\n"
 
@@ -323,59 +416,170 @@ def format_correlation_report(
     sub_tasks: List[Dict[str, Any]] = None,
     transactions: List[Dict[str, Any]] = None,
     k6_script: str = None,
+    k6_file: Dict[str, str] = None,
     include_transactions: bool = False,
     include_k6: bool = False,
+    cookie_notes: List[Any] = None,
+    correlation_advice_summary: str = "",
+    extra_run_note: str = "",
 ) -> str:
-    """
-    Default report: Parameters + Correlations only.
-    Transactions / k6 are included only when explicitly requested.
+    """Build the user-facing Markdown performance analysis report.
+
+    Args:
+        user_steps: Journey steps used for labels.
+        run1_requests: First-run requests retained for API compatibility.
+        dependencies: Extract-to-pass dependency dictionaries.
+        parameterizable_candidates: User-fed parameter candidates.
+        correlations: Dynamic values observed across runs.
+        sub_tasks: Journey sub-tasks retained for API compatibility.
+        transactions: Optional transaction summaries.
+        k6_script: Optional generated k6 source.
+        k6_file: Optional saved k6 metadata.
+        include_transactions: Include transaction section when true.
+        include_k6: Include k6 file and preview section when true.
+        cookie_notes: Cookie classification notes.
+        correlation_advice_summary: Optional italicized advice.
+        extra_run_note: Optional quoted capture note.
+
+    Returns:
+        Complete Markdown report string.
     """
     correlations = correlations or []
     transactions = transactions or []
+    k6_file = k6_file or {}
+    cookie_notes = cookie_notes or []
 
     summary_markdown = "## Performance Test Analysis\n\n"
+    summary_markdown += (
+        "_**Parameters** = static test data you provide (CSV/users). "
+        "**Correlations** = server-generated values extracted from a prior "
+        "response/UI and passed into later requests._\n\n"
+    )
+    if correlation_advice_summary:
+        summary_markdown += f"_{correlation_advice_summary}_\n\n"
+    if extra_run_note:
+        summary_markdown += f"> {extra_run_note}\n\n"
     summary_markdown += "### 1. Parameters\n\n"
     summary_markdown += _format_parameters_table(parameterizable_candidates)
     summary_markdown += "\n### 2. Correlations\n\n"
     summary_markdown += _format_correlations_table(user_steps, dependencies, correlations)
+    summary_markdown += "\n### 3. Cookie correlation notes\n\n"
+    try:
+        from src.agents.correlation_classifier_agent import format_cookie_notes_section
+
+        summary_markdown += format_cookie_notes_section(cookie_notes)
+    except Exception:
+        summary_markdown += (
+            "_Enable cookie jar persistence after login; verify session cookies._\n"
+        )
 
     if include_transactions:
-        summary_markdown += "\n### 3. Transactions\n\n"
+        summary_markdown += "\n### 4. Transactions\n\n"
         summary_markdown += _format_transactions_table(transactions)
 
-    if include_k6 and k6_script:
-        section_num = 4 if include_transactions else 3
-        summary_markdown += f"\n### {section_num}. Load Test Stub (k6)\n\n"
-        summary_markdown += (
-            "_Starter script from params / correlations / TXNs. "
-            "Complete extract→pass logic before running under load._\n\n"
+    if include_k6 and (k6_script or k6_file):
+        summary_markdown += "\n"
+        summary_markdown += format_k6_section(
+            k6_script or "",
+            file_path=k6_file.get("path", ""),
+            file_url=k6_file.get("file_url", ""),
+            relative_path=k6_file.get("relative_path", ""),
         )
-        summary_markdown += "```javascript\n"
-        clipped = k6_script if len(k6_script) <= 6000 else k6_script[:6000] + "\n// ... truncated ...\n"
-        summary_markdown += clipped
-        summary_markdown += "\n```\n"
 
     if not include_transactions and not include_k6:
-        summary_markdown += (
-            "\n_Ask for **transactions** or **k6 script** if you want those sections._\n"
+        tip = (
+            "\n_Ask for **transactions** or **k6 script** if you want those sections "
+            "(k6 is saved as a downloadable file)._ \n"
         )
+        if k6_file.get("relative_path") or k6_file.get("path"):
+            tip += (
+                f"\n_k6 script already written to "
+                f"`{k6_file.get('relative_path') or k6_file.get('path')}`._\n"
+            )
+        summary_markdown += tip
 
     return summary_markdown
 
 
 def format_transactions_section(transactions: List[Dict[str, Any]]) -> str:
+    """Build a headed transaction Markdown section.
+
+    Args:
+        transactions: Transaction dictionaries.
+
+    Returns:
+        Heading followed by a transaction table or empty state.
+    """
     return "### Transactions\n\n" + _format_transactions_table(transactions)
 
 
-def format_k6_section(k6_script: str) -> str:
-    if not k6_script:
+def format_k6_section(
+    k6_script: str,
+    *,
+    file_path: str = "",
+    file_url: str = "",
+    relative_path: str = "",
+    preview_lines: int = 24,
+) -> str:
+    """Render k6 artifact links and a bounded source preview.
+
+    Args:
+        k6_script: Generated JavaScript source.
+        file_path: Absolute saved artifact path.
+        file_url: File URI suitable for a Markdown link.
+        relative_path: Project-relative display path.
+        preview_lines: Maximum number of source lines to show.
+
+    Returns:
+        Markdown section describing the artifact and optional preview.
+    """
+    if not k6_script and not file_path:
         return "_No k6 script available yet. Run a journey analysis first._\n"
-    clipped = k6_script if len(k6_script) <= 8000 else k6_script[:8000] + "\n// ... truncated ...\n"
-    return (
-        "### Load Test Stub (k6)\n\n"
-        "_Starter script — complete extract→pass logic before load._\n\n"
-        f"```javascript\n{clipped}\n```\n"
-    )
+
+    lines = [
+        "### Load Test Script (k6)",
+        "",
+        "_Full script is saved to disk (too large for chat). Download / open the file:_",
+        "",
+    ]
+
+    if file_path or relative_path:
+        display = relative_path or file_path
+        lines.append(f"- **File:** `{display}`")
+        if file_path and relative_path and file_path != relative_path:
+            lines.append(f"- **Absolute path:** `{file_path}`")
+        if file_url:
+            lines.append(f"- **Open:** [{relative_path or file_path}]({file_url})")
+        lines.append("")
+        lines.append(
+            "macOS: `open "
+            + (relative_path or file_path)
+            + "`  ·  or copy the path into Finder."
+        )
+        lines.append("")
+    else:
+        lines.append("_Script was generated but not written to disk._")
+        lines.append("")
+
+    # Short preview only
+    preview_src = k6_script or ""
+    if preview_src:
+        preview = "\n".join(preview_src.splitlines()[:preview_lines])
+        truncated = len(preview_src.splitlines()) > preview_lines
+        lines.append("<details>")
+        lines.append("<summary>Preview (first lines)</summary>")
+        lines.append("")
+        lines.append("```javascript")
+        lines.append(preview)
+        if truncated:
+            lines.append("// ... see full file for the rest ...")
+        lines.append("```")
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
+
+    return "\n".join(lines)
+
 
 
 def build_performance_test_output(
@@ -388,12 +592,33 @@ def build_performance_test_output(
     transactions: List[Dict[str, Any]] = None,
     har: Dict[str, Any] = None,
     k6_script: str = None,
+    load_test_ir: Dict[str, Any] = None,
+    k6_file: Dict[str, str] = None,
 ) -> Dict[str, Any]:
-    """Build structured JSON output for performance test tooling."""
+    """Build structured output for downstream performance-test tooling.
+
+    Args:
+        target_url: Journey target URL.
+        user_steps: Ordered journey steps.
+        sub_tasks: Identified journey sub-tasks.
+        correlations: Dynamic values found between runs.
+        dependencies: Extract-to-pass dependency edges.
+        parameterizable_candidates: User-fed parameter candidates.
+        transactions: Optional transaction definitions.
+        har: Optional HAR document.
+        k6_script: Optional generated JavaScript.
+        load_test_ir: Optional deterministic Load-Test IR.
+        k6_file: Optional saved artifact metadata.
+
+    Returns:
+        Dictionary containing journey, parameterization, reconciled correlation,
+        transaction, IR, and artifact sections.
+    """
     unique_deps = _dedupe_dependencies(dependencies)
     grouped = _group_dependencies_by_value(unique_deps)
     uncorrelated = _uncorrelated_dynamics(correlations, unique_deps)
     transactions = transactions or []
+    k6_file = k6_file or {}
 
     return {
         "target_url": target_url,
@@ -441,8 +666,12 @@ def build_performance_test_output(
             "all_dynamic_values": correlations,
         },
         "transactions": transactions,
+        "load_test_ir": load_test_ir,
         "artifacts": {
             "har": har,
+            # Keep script in state for rebuilds, but UI should prefer the file path
             "k6_script": k6_script,
+            "k6_file": k6_file,
+            "load_test_ir": load_test_ir,
         },
     }

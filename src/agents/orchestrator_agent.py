@@ -1,6 +1,7 @@
+"""Decomposes NFE browser journeys into ordered, specialized work phases."""
+
 import json
 import logging
-import os
 from typing import List, Dict, Any
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -9,17 +10,22 @@ from pydantic import BaseModel, Field
 from config.observability import get_diagnostics_callbacks
 from src.utils.model_router import get_model_router, TaskType
 from src.utils.json_parsing import RobustJsonOutputParser, normalize_sub_task_list
+from src.utils.prompt_loader import load_prompt_text
 
 logger = logging.getLogger(__name__)
 
 
 class SubTaskSpec(BaseModel):
+    """A single named phase in an orchestrated browser journey."""
+
     name: str
     description: str
     focus: str = "general"
 
 
 class SubTaskPlanResponse(BaseModel):
+    """Structured LLM output containing an ordered journey decomposition."""
+
     sub_tasks: List[SubTaskSpec] = Field(
         description="Ordered sub-tasks that decompose the user journey"
     )
@@ -29,16 +35,22 @@ class OrchestratorAgent:
     """Decomposes a user journey into sub-tasks for specialized sub-agents."""
 
     def __init__(self):
+        """Configure orchestration models through the shared failover router."""
         self.router = get_model_router()
         self.llm = self.router.get_llm(TaskType.ORCHESTRATION)
 
     def _load_prompt(self) -> ChatPromptTemplate:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        local_path = os.path.abspath(
-            os.path.join(current_dir, "..", "..", "prompts", "orchestrator_task_decomposer.txt")
+        """Load the journey-decomposition prompt from the repository.
+
+        Returns:
+            A chat prompt template for sub-task planning.
+
+        Raises:
+            OSError: If the prompt file cannot be read.
+        """
+        return ChatPromptTemplate.from_template(
+            load_prompt_text("orchestrator_task_decomposer")
         )
-        with open(local_path, "r", encoding="utf-8") as f:
-            return ChatPromptTemplate.from_template(f.read())
 
     async def decompose_journey(
         self,
@@ -46,7 +58,16 @@ class OrchestratorAgent:
         credentials: Dict[str, str],
         journey_description: str,
     ) -> List[Dict[str, Any]]:
-        """Split a user journey into ordered sub-tasks for sub-agent distribution."""
+        """Split a user journey into ordered pipeline phases.
+
+        Args:
+            url: Target application URL.
+            credentials: Credential values keyed by logical names.
+            journey_description: Natural-language end-to-end journey.
+
+        Returns:
+            Ordered sub-task dictionaries with name, description, and focus.
+        """
         if not journey_description or not journey_description.strip():
             return [{
                 "name": "main_flow",
@@ -68,6 +89,7 @@ class OrchestratorAgent:
 
         try:
             def build_structured(llm):
+                """Bind the planner model to the sub-task response schema."""
                 return prompt | llm.with_structured_output(
                     SubTaskPlanResponse,
                     method="json_schema",
@@ -82,6 +104,8 @@ class OrchestratorAgent:
             if isinstance(response, SubTaskPlanResponse):
                 raw = [task.model_dump() for task in response.sub_tasks]
             elif isinstance(response, dict):
+                # Some structured-output providers return decoded dictionaries
+                # instead of Pydantic instances.
                 raw = response.get("sub_tasks", response)
             else:
                 raw = getattr(response, "sub_tasks", [])
@@ -93,6 +117,7 @@ class OrchestratorAgent:
             )
             try:
                 def build_json(llm):
+                    """Build the legacy JSON-parser chain for model fallback."""
                     return prompt | llm | RobustJsonOutputParser()
 
                 payload = await self.router.ainvoke_with_failover(

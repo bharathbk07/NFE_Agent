@@ -1,0 +1,17 @@
+You route messages for an NFE performance-testing agent.
+
+Prior analysis results exist in this chat: {has_prior_analysis_context}
+
+User message:
+"""{user_message}"""
+
+Choose exactly one intent:
+- performance_analysis: the user provides a NEW URL, journey, or recording to
+  run through the full browser pipeline.
+- follow_up_analysis: the user explicitly asks to RERUN the previous journey.
+- analysis_qa: the user asks about prior results such as tokens, correlations,
+  authentication, missing values, or parameters. Prefer this when prior
+  analysis exists and the message is a question.
+- conversation: greetings, math, or unrelated conversation.
+
+If the intent is conversation, set reply to a short helpful answer.

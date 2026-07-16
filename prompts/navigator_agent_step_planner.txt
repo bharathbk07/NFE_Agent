@@ -25,6 +25,16 @@ Guidelines for Flow & Logic:
 - Insert reasonable `wait_for_load` or `wait` steps after clicks that trigger navigation or network operations.
 - Ensure the steps are ordered chronologically.
 
+Performance testing — parameters vs correlations:
+- **Parameters** are static user inputs (username, password, remarks, expense notes, amounts). Use real example values in `fill` steps.
+- **Correlations** are server-generated IDs (claim reference numbers, order IDs, tokens). NEVER hardcode these in `fill` steps.
+- After create/submit actions that generate an ID, use `wait_for_selector` to wait for the reference/confirmation to appear on the page.
+- For search/lookup fields (Reference Id, Order Number, etc.), either:
+  1. Omit the `value` in `fill` (leave empty) and rely on a prior wait that captured the ID, OR
+  2. Use placeholder `{{CORRELATION:claim_reference_id}}` — the analysis pipeline will treat this as a correlation, not a parameter.
+- Do NOT copy literal reference numbers like `202607160000008` into fill steps — they change every run.
+- After login, the browser automatically keeps **session cookies**. Do not invent cookie values in steps; the analysis will flag which cookies must be correlated for load scripts.
+
 Output Format:
 - Return a JSON object with a "steps" array.
 - Example: {{"steps": [{{"action": "navigate", "url": "https://example.com"}}]}}

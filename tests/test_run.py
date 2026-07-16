@@ -1,3 +1,5 @@
+"""Integration smoke test for the compiled LangGraph workflow."""
+
 import os
 import json
 import logging
@@ -7,6 +9,15 @@ from src.graph import graph
 logger = logging.getLogger("TestRun")
 
 def test_graph_execution():
+    """Execute a sample journey and verify analysis fields.
+
+    Returns:
+        ``None``.
+
+    Raises:
+        AssertionError: If correlations, dependencies, or an AI response are absent.
+        Exception: If asynchronous graph execution fails.
+    """
     logger.info("Starting test of LangGraph compilation and flow execution...")
     
     # Initialize input state for the graph

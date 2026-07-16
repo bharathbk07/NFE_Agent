@@ -6,6 +6,8 @@ Network capture uses **Chrome DevTools Protocol (CDP)** via Playwright (`Network
 
 Optional MCP servers for the **app** (not Cursor) are managed in one file: [`config/mcp_servers.json`](config/mcp_servers.json) — see [`docs/optional-mcps.md`](docs/optional-mcps.md).
 
+Load-test scripting uses a **deterministic IR → k6** path (no LLM for script generation): capture → params/correlations/TXNs → `load_test_ir` → `k6_script`.
+
 ---
 
 ## 🛠️ Setup & Execution
@@ -24,6 +26,15 @@ Create a `.env` file in the project root:
 ```ini
 GEMINI_API_KEY="your-gemini-api-key"
 GEMINI_MODEL="gemini-2.5-flash"
+
+# Multi-model auto-routing (optional)
+# LLM_MODELS=google:gemini-3.1-flash-lite,google:gemini-3.5-flash,cursor:composer-2.5
+# LLM_TASK_ROUTING={"orchestration":"cursor:composer-2.5","extraction":"google:gemini-3.1-flash-lite"}
+
+# Cursor AI (optional — native cursor-sdk, orchestration/navigation only)
+# CURSOR_API_KEY="crsr_..."
+# CURSOR_RUNTIME="local"
+# CURSOR_CLOUD_REPO="https://github.com/your-org/NFE_Agent"
 
 # LangSmith Configuration (Optional, for Prompt Registry & Traces)
 LANGCHAIN_TRACING_V2="true"

@@ -1,15 +1,4 @@
-"""
-Browser journey recorder using Playwright + Chrome DevTools Protocol (CDP).
-
-NOTE: Chrome DevTools *MCP* (chrome-devtools-mcp) is an IDE/agent bridge for
-interactive debugging in Cursor. It is not suitable as the capture layer for
-this LangGraph pipeline (needs dual deterministic runs, step tagging, and
-headless automation). Playwright already speaks CDP; we use CDP Network.*
-events here to get DevTools-grade request/response detail for:
-  - parameterization
-  - correlation (extract → pass)
-  - transaction grouping
-"""
+"""Capture browser journeys and network details through Playwright and CDP."""
 from __future__ import annotations
 
 import json
@@ -19,6 +8,9 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, Page, Response, Request
+
+from src.utils.http_body import content_type_from_headers, parse_post_data
+from src.utils.prompt_loader import render_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +38,15 @@ TRACKING_KEYWORDS = (
 
 
 def _should_keep_url(url: str, resource_type: str = "") -> bool:
+    """Decide whether a request is relevant to load-test analysis.
+
+    Args:
+        url: Requested URL.
+        resource_type: CDP or Playwright resource type.
+
+    Returns:
+        ``True`` for application traffic and ``False`` for static or tracking data.
+    """
     lower = (url or "").lower()
     if lower.startswith("data:") or lower.startswith("blob:") or lower.startswith("about:"):
         return False
@@ -64,7 +65,14 @@ def _should_keep_url(url: str, resource_type: str = "") -> bool:
 
 
 class PlaywrightBrowserRecorder:
+    """Execute browser steps and collect step-attributed HTTP traffic."""
+
     def __init__(self, debug_mode: bool = False):
+        """Initialize an empty recorder.
+
+        Args:
+            debug_mode: Whether to launch a visible browser and take step screenshots.
+        """
         self.debug_mode = debug_mode
         self.network_logs: List[Dict[str, Any]] = []
         self.step_timeline: List[Dict[str, Any]] = []
@@ -81,9 +89,13 @@ class PlaywrightBrowserRecorder:
         step_action: str,
         reason: str = "page_url",
     ) -> None:
-        """
-        Record the current page URL as a Document GET when CDP missed a soft/hard
-        navigation (common for SPAs / client-side redirects after login).
+        """Record a synthetic document request when navigation capture is absent.
+
+        Args:
+            page: Active Playwright page.
+            step_index: Journey step owning the navigation.
+            step_action: Action associated with the navigation.
+            reason: Capture-source label for the synthetic entry.
         """
         try:
             url = (page.url or "").strip()
@@ -116,7 +128,12 @@ class PlaywrightBrowserRecorder:
         })
 
     def _settle_after_action(self, page: Page, action: str) -> None:
-        """Give navigations / XHR a moment to fire and attribute to the current step."""
+        """Wait briefly for action-triggered navigation and requests.
+
+        Args:
+            page: Active Playwright page.
+            action: Just-completed journey action.
+        """
         try:
             if action in ("click", "navigate", "select", "wait_for_load"):
                 page.wait_for_load_state("domcontentloaded", timeout=5000)
@@ -134,7 +151,11 @@ class PlaywrightBrowserRecorder:
 
     # ------------------------------------------------------------------ CDP
     def _attach_cdp(self, page: Page) -> None:
-        """Enable Chrome DevTools Protocol Network domain for rich capture."""
+        """Attach CDP network listeners, retaining Playwright as fallback.
+
+        Args:
+            page: Active Chromium page.
+        """
         try:
             self._cdp_session = page.context.new_cdp_session(page)
             self._cdp_session.send("Network.enable", {
@@ -150,6 +171,11 @@ class PlaywrightBrowserRecorder:
             self._cdp_session = None
 
     def _on_cdp_request(self, params: Dict[str, Any]) -> None:
+        """Stage a filtered CDP request until its response completes.
+
+        Args:
+            params: ``Network.requestWillBeSent`` event payload.
+        """
         try:
             request_id = params.get("requestId")
             req = params.get("request") or {}
@@ -158,22 +184,35 @@ class PlaywrightBrowserRecorder:
             if not request_id or not _should_keep_url(url, resource_type):
                 return
 
+            headers = req.get("headers") or {}
             post_data = req.get("postData")
-            parsed_post: Any = post_data
-            if isinstance(post_data, str) and post_data:
-                try:
-                    parsed_post = json.loads(post_data)
-                except Exception:
-                    parsed_post = post_data
+            parsed_post, body_type = parse_post_data(
+                post_data, content_type_from_headers(headers)
+            )
+            cookie_header = ""
+            for hk, hv in headers.items():
+                if str(hk).lower() == "cookie":
+                    cookie_header = str(hv or "")
+                    break
+            req_cookies = []
+            if cookie_header:
+                for part in cookie_header.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        n, _, v = part.partition("=")
+                        req_cookies.append({"name": n.strip(), "value": v.strip()})
 
             initiator = params.get("initiator") or {}
+            # Freeze step tagging at request time — do not retag on response
+            # (late XHR would otherwise land in the wrong TXN).
             self._cdp_pending[request_id] = {
                 "request_id": request_id,
                 "url": url,
                 "method": req.get("method", "GET"),
-                "headers": req.get("headers") or {},
-                "cookies": [],
+                "headers": headers,
+                "cookies": req_cookies,
                 "post_data": parsed_post,
+                "body_type": body_type,
                 "response_headers": {},
                 "response_body": "",
                 "status": 0,
@@ -190,6 +229,11 @@ class PlaywrightBrowserRecorder:
             logger.debug("CDP requestWillBeSent handler error: %s", e)
 
     def _on_cdp_response(self, params: Dict[str, Any]) -> None:
+        """Merge response metadata into a pending CDP request.
+
+        Args:
+            params: ``Network.responseReceived`` event payload.
+        """
         try:
             request_id = params.get("requestId")
             if not request_id or request_id not in self._cdp_pending:
@@ -200,13 +244,16 @@ class PlaywrightBrowserRecorder:
             entry["response_headers"] = response.get("headers") or {}
             entry["mime_type"] = response.get("mimeType") or ""
             entry["timing"] = response.get("timing") or {}
-            # Refresh step tagging to current action when response arrives
-            entry["step_index"] = self.current_step_index
-            entry["step_action"] = self.current_step_action
+            # Intentionally keep step_index/step_action from requestWillBeSent
         except Exception as e:
             logger.debug("CDP responseReceived handler error: %s", e)
 
     def _on_cdp_loading_finished(self, params: Dict[str, Any]) -> None:
+        """Finalize a CDP request and capture a supported response body.
+
+        Args:
+            params: ``Network.loadingFinished`` event payload.
+        """
         try:
             request_id = params.get("requestId")
             if not request_id or request_id not in self._cdp_pending:
@@ -235,7 +282,7 @@ class PlaywrightBrowserRecorder:
             logger.debug("CDP loadingFinished handler error: %s", e)
 
     def _finalize_cdp_pending(self) -> None:
-        """Flush any pending CDP entries that never got loadingFinished."""
+        """Flush CDP entries that never emitted ``loadingFinished``."""
         for request_id, entry in list(self._cdp_pending.items()):
             if entry.get("status") or entry.get("url"):
                 self.network_logs.append(entry)
@@ -243,7 +290,11 @@ class PlaywrightBrowserRecorder:
 
     # -------------------------------------------------------- Playwright fallback
     def _handle_response(self, response: Response) -> None:
-        """Fallback when CDP is unavailable; also fills gaps for navigations."""
+        """Capture a Playwright response when CDP is unavailable.
+
+        Args:
+            response: Completed Playwright response.
+        """
         if self._cdp_session is not None:
             # CDP path is primary; skip duplicate Playwright entries
             return
@@ -257,12 +308,11 @@ class PlaywrightBrowserRecorder:
                 return
 
             post_data = None
+            body_type = "empty"
             if req.post_data:
-                post_data = req.post_data
-                try:
-                    post_data = json.loads(post_data)
-                except Exception:
-                    pass
+                post_data, body_type = parse_post_data(
+                    req.post_data, response.headers.get("content-type", "")
+                )
 
             resp_body = ""
             content_type = response.headers.get("content-type", "")
@@ -272,12 +322,22 @@ class PlaywrightBrowserRecorder:
                 except Exception:
                     pass
 
+            req_headers = dict(req.headers)
+            req_cookies = []
+            cookie_header = req_headers.get("cookie") or req_headers.get("Cookie") or ""
+            for part in str(cookie_header).split(";"):
+                part = part.strip()
+                if "=" in part:
+                    n, _, v = part.partition("=")
+                    req_cookies.append({"name": n.strip(), "value": v.strip()})
+
             self.network_logs.append({
                 "url": url,
                 "method": req.method,
-                "headers": dict(req.headers),
-                "cookies": [],
+                "headers": req_headers,
+                "cookies": req_cookies,
                 "post_data": post_data,
+                "body_type": body_type,
                 "response_headers": dict(response.headers),
                 "response_body": resp_body,
                 "status": response.status,
@@ -300,8 +360,22 @@ class PlaywrightBrowserRecorder:
         steps: List[Dict[str, Any]],
         clear_context: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Executes a user journey and captures network traffic via CDP (+ Playwright fallback).
+        """Execute a user journey and capture browser state and traffic.
+
+        Args:
+            url: Initial HTTP(S) URL; may be empty when steps navigate explicitly.
+            steps: Action dictionaries accepted by the journey dispatcher.
+            clear_context: Whether the caller requests an isolated context. A fresh
+                context is currently created for every invocation.
+
+        Returns:
+            A dictionary containing network requests, step timeline, cookies, and
+            local/session storage. On failure it also contains ``error``,
+            ``failed_step``, and ``failed_action``.
+
+        Raises:
+            Exception: Browser launch or context creation failures that occur before
+                journey error handling begins.
         """
         self.network_logs = []
         self.step_timeline = []
@@ -383,31 +457,40 @@ class PlaywrightBrowserRecorder:
                                 from src.utils.model_router import (
                                     get_model_router,
                                     TaskType,
-                                    invoke_llm_sync,
                                 )
-                                import os
 
-                                llm = get_model_router().get_llm(TaskType.SELF_HEAL)
-                                current_dir = os.path.dirname(os.path.abspath(__file__))
-                                prompt_path = os.path.abspath(
-                                    os.path.join(current_dir, "..", "..", "prompts", "browser_self_heal.txt")
-                                )
-                                with open(prompt_path, "r", encoding="utf-8") as f:
-                                    prompt_template = f.read()
+                                router = get_model_router()
 
                                 # Inject a11y snapshot into HTML context for the healer
                                 heal_context = (
                                     f"{html_content}\n\n"
                                     f"--- Accessibility snapshot (JSON) ---\n{a11y_hint}"
                                 )
-                                self_heal_prompt = prompt_template.format(
+                                self_heal_prompt = render_prompt(
+                                    "browser_self_heal",
                                     action=action,
                                     selector=selector,
                                     current_url=current_url,
                                     action_details=json.dumps(step),
                                     html_content=heal_context,
                                 )
-                                response = invoke_llm_sync(llm, self_heal_prompt)
+
+                                def _build_heal_chain(llm):
+                                    """Return the selected self-healing model unchanged.
+
+                                    Args:
+                                        llm: Routed language-model instance.
+
+                                    Returns:
+                                        The same model instance.
+                                    """
+                                    return llm
+
+                                response = router.invoke_with_failover_sync(
+                                    TaskType.SELF_HEAL,
+                                    _build_heal_chain,
+                                    self_heal_prompt,
+                                )
                                 resp_text = response.content
                                 if isinstance(resp_text, list):
                                     resp_text = "".join(str(p) for p in resp_text)
@@ -457,6 +540,10 @@ class PlaywrightBrowserRecorder:
                         "url_before": url_before,
                         "url_after": url_after,
                         "sub_task": step.get("sub_task"),
+                        "cookies": [
+                            {"name": c.get("name"), "value": c.get("value"), "domain": c.get("domain")}
+                            for c in context.cookies()
+                        ],
                     })
 
                     if self.debug_mode:

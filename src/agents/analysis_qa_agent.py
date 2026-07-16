@@ -10,12 +10,20 @@ import re
 from typing import Any, Dict, List, Optional
 
 from src.utils.model_router import get_model_router, TaskType
+from src.utils.prompt_loader import render_prompt
 
 logger = logging.getLogger(__name__)
 
 
 def _summarize_analysis_context(state: Dict[str, Any]) -> str:
-    """Build a compact context pack from prior analysis state for the QA LLM."""
+    """Build a compact context pack from prior analysis state.
+
+    Args:
+        state: Current pipeline state containing prior captures and analysis.
+
+    Returns:
+        A bounded JSON string suitable for the QA model prompt.
+    """
     payload: Dict[str, Any] = {
         "target_url": state.get("target_url"),
         "sub_tasks": state.get("sub_tasks") or [],
@@ -70,7 +78,8 @@ def _summarize_analysis_context(state: Dict[str, Any]) -> str:
             }
         )
 
-    # Prefer structured output if present
+    # Prefer the normalized report structure because it may contain richer
+    # post-processing than the raw detector state.
     perf = state.get("performance_test_output") or {}
     corr = perf.get("correlation") or {}
     if corr.get("extract_pass"):
@@ -115,15 +124,21 @@ def _summarize_analysis_context(state: Dict[str, Any]) -> str:
 
 
 class AnalysisQAAgent:
-    """Lightweight agent: answer questions about prior analysis results only."""
+    """Answers follow-up questions from existing pipeline state without reruns."""
 
     async def _rebuild_txn_and_k6(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Invoke TransactionAgent + k6 generator from captured network traffic.
-        Used when the user asks for TXNs/k6 so we don't serve stale placeholder scripts.
+        """Rebuild transactions, load-test IR, and k6 output from captures.
+
+        Args:
+            state: Pipeline state containing journey steps and network records.
+
+        Returns:
+            Fresh transactions, IR, k6 script, and optional artifact metadata.
         """
         from src.agents.transaction_agent import TransactionAgent
         from src.utils.k6_generator import generate_k6_script
+        from src.utils.load_test_ir import build_load_test_ir
+        from src.utils.artifacts import save_k6_script, save_load_test_ir
 
         records = state.get("run_records") or []
         network = []
@@ -140,15 +155,46 @@ class AnalysisQAAgent:
             sub_tasks=sub_tasks,
             network_requests=network,
         )
+        load_test_ir = build_load_test_ir(
+            target_url=target_url,
+            parameterizable_candidates=state.get("parameterizable_candidates") or [],
+            dependencies=state.get("dependencies") or [],
+            transactions=transactions,
+            network_requests=network,
+        )
         k6_script = generate_k6_script(
             target_url=target_url,
             parameterizable_candidates=state.get("parameterizable_candidates") or [],
             dependencies=state.get("dependencies") or [],
             transactions=transactions,
+            network_requests=network,
+            ir=load_test_ir,
         )
-        return {"transactions": transactions, "k6_script": k6_script}
+        k6_file: Dict[str, str] = {}
+        try:
+            k6_file = save_k6_script(k6_script, target_url=target_url)
+            save_load_test_ir(load_test_ir, target_url=target_url)
+        except Exception as art_err:
+            logger.warning("Failed to write k6 artifact: %s", art_err)
+
+        return {
+            "transactions": transactions,
+            "k6_script": k6_script,
+            "load_test_ir": load_test_ir,
+            "k6_file": k6_file,
+        }
 
     async def answer(self, question: str, state: Dict[str, Any]) -> str:
+        """Answer a question about a completed NFE analysis.
+
+        Args:
+            question: User question, including optional transaction or k6 intent.
+            state: Existing pipeline state and generated artifacts.
+
+        Returns:
+            A Markdown answer generated from state, rebuilt artifacts, or a
+            deterministic fallback when the model is unavailable.
+        """
         if not state.get("target_url") and not state.get("performance_test_output"):
             return (
                 "I don’t have a prior analysis in this chat yet. "
@@ -163,7 +209,8 @@ class AnalysisQAAgent:
             re.search(r"\b(k6|load\s*script|jmeter|gatling|script\s+stub|generate\s+script)\b", q)
         )
 
-        # Rebuild from network capture via sub-agents when user asks for TXN / k6
+        # Transaction and script requests require regeneration from the capture;
+        # serving a stored placeholder can misrepresent the actual request flow.
         if wants_txn or wants_k6:
             from src.utils.formatting import format_transactions_section, format_k6_section
 
@@ -204,30 +251,29 @@ class AnalysisQAAgent:
                     )
                     or ""
                 )
-                parts.append(format_k6_section(k6))
+                k6_file = rebuilt.get("k6_file") or (
+                    ((state.get("performance_test_output") or {}).get("artifacts") or {}).get(
+                        "k6_file"
+                    )
+                    or {}
+                )
+                parts.append(
+                    format_k6_section(
+                        k6,
+                        file_path=k6_file.get("path", ""),
+                        file_url=k6_file.get("file_url", ""),
+                        relative_path=k6_file.get("relative_path", ""),
+                    )
+                )
 
             return "\n\n".join(parts)
 
         context = _summarize_analysis_context(state)
-        prompt = f"""You are an expert performance-test engineer helping the user understand
-an analysis that ALREADY ran in this conversation.
-
-Answer the user's question using ONLY the analysis context below.
-Be specific and practical for load-test scripting (JMeter/Gatling/k6 style).
-
-If something was not found (e.g. no auth token correlation), explain likely reasons
-and whether correlation is still needed.
-
-Do NOT ask them to paste a new journey unless the question cannot be answered from context.
-Do NOT invent tokens/values that are not in the context.
-Do NOT dump the full transaction table or k6 script unless the user asked for them.
-
-## Prior analysis context
-{context}
-
-## User question
-{question}
-"""
+        prompt = render_prompt(
+            "analysis_qa",
+            context=context,
+            question=question,
+        )
         router = get_model_router()
         try:
             response = await router.ainvoke_with_failover(
@@ -237,6 +283,8 @@ Do NOT dump the full transaction table or k6 script unless the user asked for th
             )
             content = getattr(response, "content", response)
             if isinstance(content, list):
+                # Multimodal/chat providers may return content blocks rather
+                # than one text string; retain only textual blocks for the UI.
                 parts = []
                 for block in content:
                     if isinstance(block, str):
@@ -250,6 +298,15 @@ Do NOT dump the full transaction table or k6 script unless the user asked for th
             return self._fallback_answer(question, state)
 
     def _fallback_answer(self, question: str, state: Dict[str, Any]) -> str:
+        """Build a deterministic answer when model-based QA fails.
+
+        Args:
+            question: User question used to select relevant result categories.
+            state: Existing pipeline analysis state.
+
+        Returns:
+            A Markdown summary of matching correlations or parameters.
+        """
         deps = state.get("dependencies") or []
         params = state.get("parameterizable_candidates") or []
         q = question.lower()

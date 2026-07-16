@@ -1,18 +1,28 @@
+"""Extract target URLs, credentials, and journey descriptions from user state."""
+
 import json
 import logging
 import re
-import os
 from typing import Dict, Any, Tuple, Optional
 
 from langchain_core.messages import HumanMessage
 
 from src.utils.model_router import get_model_router, TaskType
+from src.utils.prompt_loader import render_prompt
 from src.agents.intent_router import get_latest_human_text
 
 logger = logging.getLogger(__name__)
 
 
 def _normalize_message_content(content: Any) -> str:
+    """Normalize string or provider text-block content.
+
+    Args:
+        content: Message content as text, blocks, scalar, or ``None``.
+
+    Returns:
+        Plain text with supported blocks joined by newlines.
+    """
     if isinstance(content, list):
         parts = []
         for part in content:
@@ -27,6 +37,14 @@ def _normalize_message_content(content: Any) -> str:
 
 
 def _clean_text(content: str) -> str:
+    """Normalize typographic quotes and Unicode line separators.
+
+    Args:
+        content: Raw user message text.
+
+    Returns:
+        Text made safer for JSON and regex parsing.
+    """
     return (
         content.replace("“", '"')
         .replace("”", '"')
@@ -38,9 +56,13 @@ def _clean_text(content: str) -> str:
 
 
 async def _parse_journey_payload(content: str) -> Tuple[str, Dict[str, str], str, bool]:
-    """
-    Parse a single user message into url/credentials/journey.
-    Returns (url, credentials, journey, parsed_successfully).
+    """Parse one user message using JSON, repair, regex, then LLM fallback.
+
+    Args:
+        content: Raw latest user-message text.
+
+    Returns:
+        Tuple of target URL, credential mapping, journey text, and success flag.
     """
     content_cleaned = _clean_text(content)
     url = ""
@@ -143,20 +165,20 @@ async def _parse_journey_payload(content: str) -> Tuple[str, Dict[str, str], str
     if not parsed_successfully and ("http://" in content_cleaned or "https://" in content_cleaned):
                     try:
                         logger.info("Using LLM to extract target URL, credentials, and steps...")
-                        import asyncio
-
-                        llm = get_model_router().get_llm(TaskType.EXTRACTION)
-                        current_dir = os.path.dirname(os.path.abspath(__file__))
-                        prompt_path = os.path.abspath(
-                            os.path.join(current_dir, "..", "..", "prompts", "input_extractor.txt")
+                        router = get_model_router()
+                        extract_prompt = render_prompt(
+                            "input_extractor",
+                            input_message=content,
                         )
-                        with open(prompt_path, "r", encoding="utf-8") as f:
-                            prompt_template = f.read()
-                        extract_prompt = prompt_template.format(input_message=content)
-                        from src.utils.model_router import invoke_llm_sync
 
-                        response = await asyncio.to_thread(
-                            invoke_llm_sync, llm, extract_prompt
+                        def _build_extract(llm):
+                            """Return the extraction model as the runnable chain."""
+                            return llm
+
+                        response = await router.ainvoke_with_failover(
+                            TaskType.EXTRACTION,
+                            _build_extract,
+                            extract_prompt,
                         )
                         resp_text = response.content
                         if isinstance(resp_text, list):
@@ -189,12 +211,15 @@ async def extract_inputs_from_message(
     *,
     allow_state_reuse: bool = False,
 ) -> Tuple[str, Dict[str, str], str]:
-    """
-    Extracts target URL, credentials, and journey description.
+    """Extract target URL, credentials, and journey description from state.
 
-    By default only the *latest* human message is considered, so casual follow-ups
-    like "Hi" do not resurrect an older SauceDemo payload from thread history.
-    Set allow_state_reuse=True for explicit follow-up analysis requests.
+    Args:
+        state: Agent state containing messages and optional prior journey fields.
+        allow_state_reuse: Reuse prior target and journey data for explicit
+            follow-up analysis.
+
+    Returns:
+        Tuple of target URL, string credential mapping, and journey text.
     """
     url = ""
     credentials: Dict[str, str] = {}

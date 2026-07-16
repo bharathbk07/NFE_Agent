@@ -1,3 +1,5 @@
+"""Normalize model messages and robustly parse JSON-shaped LLM responses."""
+
 import json
 import logging
 import re
@@ -12,7 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 def extract_message_text(content: Any) -> str:
-    """Normalize LLM message content (str, blocks, or None) to plain text."""
+    """Normalize LLM message content to plain text.
+
+    Args:
+        content: String, provider block list, scalar, or ``None``.
+
+    Returns:
+        Stripped text assembled from supported text blocks.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -32,7 +41,18 @@ def extract_message_text(content: Any) -> str:
 
 
 def parse_json_from_llm(text: str) -> Any:
-    """Parse JSON from LLM text, tolerating markdown fences and partial payloads."""
+    """Parse JSON while tolerating Markdown fences and surrounding prose.
+
+    Args:
+        text: Model response containing an object or array.
+
+    Returns:
+        Decoded JSON value of any JSON-compatible type.
+
+    Raises:
+        ValueError: If the response is empty.
+        json.JSONDecodeError: If no valid JSON payload can be decoded.
+    """
     cleaned = extract_message_text(text)
     if not cleaned:
         raise ValueError("LLM returned empty response")
@@ -58,9 +78,21 @@ def parse_json_from_llm(text: str) -> Any:
 
 
 class RobustJsonOutputParser(JsonOutputParser):
-    """JsonOutputParser that handles empty responses and markdown-wrapped JSON."""
+    """LangChain JSON parser tolerant of provider message formats and fences."""
 
     def parse_result(self, result: List[Any], *, partial: bool = False) -> Any:
+        """Parse the first generation into a JSON-compatible value.
+
+        Args:
+            result: LangChain generations or message-like values.
+            partial: Compatibility flag accepted from ``JsonOutputParser``.
+
+        Returns:
+            Decoded JSON object, array, or scalar.
+
+        Raises:
+            OutputParserException: If no generation, text, or valid JSON exists.
+        """
         if not result:
             raise OutputParserException("LLM returned no generations")
 
@@ -91,7 +123,17 @@ class RobustJsonOutputParser(JsonOutputParser):
 
 
 def normalize_step_list(payload: Any) -> List[dict]:
-    """Accept either a raw step list or {"steps": [...]} wrapper."""
+    """Normalize a raw or wrapped journey-step collection.
+
+    Args:
+        payload: List of steps or mapping containing a ``steps`` list.
+
+    Returns:
+        List containing only dictionary steps.
+
+    Raises:
+        ValueError: If the accepted list shapes are absent.
+    """
     if isinstance(payload, list):
         return [step for step in payload if isinstance(step, dict)]
     if isinstance(payload, dict):
@@ -102,7 +144,17 @@ def normalize_step_list(payload: Any) -> List[dict]:
 
 
 def normalize_sub_task_list(payload: Any) -> List[dict]:
-    """Accept either a raw sub-task list or {"sub_tasks": [...]} wrapper."""
+    """Normalize a raw or wrapped sub-task collection.
+
+    Args:
+        payload: List of tasks or mapping containing a ``sub_tasks`` list.
+
+    Returns:
+        List containing only dictionary tasks.
+
+    Raises:
+        ValueError: If the accepted list shapes are absent.
+    """
     if isinstance(payload, list):
         return [task for task in payload if isinstance(task, dict)]
     if isinstance(payload, dict):

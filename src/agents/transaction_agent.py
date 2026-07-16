@@ -34,11 +34,28 @@ STATIC_PATH_HINTS = (
 
 
 def _slug_txn_name(name: str) -> str:
+    """Normalize a transaction label for reports and generated scripts.
+
+    Args:
+        name: Human-readable transaction name.
+
+    Returns:
+        An underscore-delimited label, or ``Transaction`` when empty.
+    """
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", (name or "").strip()).strip("_")
     return cleaned or "Transaction"
 
 
 def _short_request_label(req: Dict[str, Any], max_len: int = 120) -> str:
+    """Create a bounded method-and-URL label for a captured request.
+
+    Args:
+        req: Captured request dictionary.
+        max_len: Maximum returned label length.
+
+    Returns:
+        A display label retaining the absolute host when available.
+    """
     method = (req.get("method") or "GET").upper()
     url = req.get("url") or ""
     try:
@@ -63,6 +80,14 @@ def _short_request_label(req: Dict[str, Any], max_len: int = 120) -> str:
 
 
 def _http_entry(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Convert an absolute captured request into a structured HTTP entry.
+
+    Args:
+        req: Captured request dictionary.
+
+    Returns:
+        A normalized HTTP entry, or ``None`` for non-HTTP URLs.
+    """
     url = (req.get("url") or "").strip()
     if not url.startswith("http"):
         return None
@@ -76,6 +101,14 @@ def _http_entry(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _structured_ui_step(step: Dict[str, Any]) -> Dict[str, Any]:
+    """Select load-test-relevant fields from a browser step.
+
+    Args:
+        step: Raw Playwright journey step.
+
+    Returns:
+        A normalized action, selector, value, and URL dictionary.
+    """
     return {
         "action": step.get("action"),
         "selector": step.get("selector") or "",
@@ -85,7 +118,16 @@ def _structured_ui_step(step: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _is_meaningful_http_request(url: str, resource_type: str = "") -> bool:
-    """Keep document/XHR/fetch app traffic; drop fonts, images, data URIs, telemetry."""
+    """Decide whether a request belongs in a performance transaction.
+
+    Args:
+        url: Captured request URL.
+        resource_type: Browser resource classification, when available.
+
+    Returns:
+        ``True`` for application traffic and ``False`` for static or telemetry
+        noise.
+    """
     if not url:
         return False
     lower = url.lower().strip()
@@ -111,6 +153,15 @@ def _is_meaningful_http_request(url: str, resource_type: str = "") -> bool:
 
 
 def _step_action_label(idx: int, step: Dict[str, Any]) -> str:
+    """Format one UI step for transaction reports.
+
+    Args:
+        idx: Zero-based journey index, accepted for caller alignment.
+        step: Browser action dictionary.
+
+    Returns:
+        A concise human-readable UI action.
+    """
     action = step.get("action", "step")
     selector = step.get("selector") or ""
     value = step.get("value")
@@ -132,13 +183,11 @@ def _step_action_label(idx: int, step: Dict[str, Any]) -> str:
 
 
 class TransactionAgent:
-    """
-    Journey-first TXN builder.
+    """Builds deterministic load-test transactions from journey phases.
 
-    1. Derive ordered TXNs from Playwright sub_tasks / step labels (full E2E flow).
-    2. Attach only meaningful HTTP requests that fired during those steps.
-    3. If a phase has no HTTP traffic (common for SPA client-side actions),
-       list the Playwright UI actions so the TXN still appears.
+    Ordered phases come from Playwright sub-tasks or inferred step labels.
+    Meaningful captured requests are attached by step index, while UI actions
+    preserve phases that produce no HTTP traffic.
     """
 
     def _derive_txn_phases(
@@ -146,10 +195,15 @@ class TransactionAgent:
         user_steps: List[Any],
         sub_tasks: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """
-        Return ordered phases:
-          { name, description, step_indices: [int, ...] }
-        Always includes Launch, then each journey phase through logout.
+        """Derive ordered transaction phases from journey metadata.
+
+        Args:
+            user_steps: Ordered browser journey steps.
+            sub_tasks: Optional orchestrator-defined journey phases.
+
+        Returns:
+            Phase dictionaries containing names, descriptions, and step indices;
+            the first phase is always the initial launch.
         """
         phases: List[Dict[str, Any]] = []
         phases.append(
@@ -215,6 +269,7 @@ class TransactionAgent:
         current_desc = ""
 
         def flush():
+            """Append and reset the currently inferred phase, if present."""
             nonlocal current_name, current_indices, current_desc
             if current_name is None:
                 return
@@ -277,10 +332,20 @@ class TransactionAgent:
         sub_tasks: List[Dict[str, Any]],
         network_requests: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Primary TXN builder: full Playwright flow → TXN table rows."""
+        """Build transaction rows from journey phases and captured traffic.
+
+        Args:
+            user_steps: Ordered browser journey steps.
+            sub_tasks: Optional orchestrator-defined phases.
+            network_requests: Requests tagged with journey step indices.
+
+        Returns:
+            Transaction dictionaries containing structured HTTP and UI activity.
+        """
         phases = self._derive_txn_phases(user_steps, sub_tasks)
 
-        # Index requests by step_index
+        # Step-index lookup preserves phase ownership even when identical
+        # endpoints fire repeatedly during the journey.
         by_step: Dict[int, List[Dict[str, Any]]] = {}
         for req in network_requests or []:
             url = req.get("url") or ""
@@ -375,9 +440,16 @@ class TransactionAgent:
         sub_tasks: List[Dict[str, Any]],
         network_requests: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """
-        Build TXNs from the Playwright journey (deterministic), not from LLM guessing.
-        LLM is not used here — journey steps + step_index tagging are the source of truth.
+        """Build deterministic transactions without LLM inference.
+
+        Args:
+            target_url: Analyzed application URL, accepted for API consistency.
+            user_steps: Ordered browser journey steps.
+            sub_tasks: Optional orchestrator-defined phases.
+            network_requests: Requests tagged with journey step indices.
+
+        Returns:
+            Transaction dictionaries produced from journey and capture evidence.
         """
         return self.group_from_journey(user_steps, sub_tasks, network_requests)
 
@@ -388,4 +460,14 @@ class TransactionAgent:
         user_steps: List[Any],
         sub_tasks: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """Provide the legacy graph alias for deterministic grouping.
+
+        Args:
+            requests: Captured network requests.
+            user_steps: Ordered browser journey steps.
+            sub_tasks: Optional orchestrator-defined phases.
+
+        Returns:
+            Transaction dictionaries from :meth:`group_from_journey`.
+        """
         return self.group_from_journey(user_steps, sub_tasks, requests)

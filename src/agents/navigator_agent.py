@@ -1,3 +1,5 @@
+"""Plans Playwright actions that drive NFE browser traffic capture."""
+
 import json
 import logging
 import os
@@ -13,6 +15,7 @@ from src.utils.json_parsing import (
     RobustJsonOutputParser,
     normalize_step_list,
 )
+from src.utils.prompt_loader import load_prompt_text, prompt_path
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +23,8 @@ USE_LANGSMITH_PROMPTS = os.getenv("USE_LANGSMITH_PROMPTS", "false").lower() == "
 
 
 class PlaywrightStep(BaseModel):
+    """One structured browser interaction emitted by the navigation planner."""
+
     model_config = ConfigDict(extra="allow")
 
     action: str
@@ -30,31 +35,43 @@ class PlaywrightStep(BaseModel):
 
 
 class StepPlanResponse(BaseModel):
+    """Structured LLM output containing ordered Playwright interactions."""
+
     steps: List[PlaywrightStep] = Field(
         description="Ordered Playwright interaction steps for the user journey"
     )
 
 
 class NavigatorAgent:
+    """Translates journey descriptions into executable Playwright step plans."""
+
     def __init__(self):
+        """Configure navigation models through the shared failover router."""
         self.router = get_model_router()
         self.llm = self.router.get_llm(TaskType.NAVIGATION)
 
     def _load_local_prompt(self) -> ChatPromptTemplate:
+        """Load the local navigation planner prompt.
+
+        Returns:
+            A chat prompt template for Playwright step generation.
+
+        Raises:
+            OSError: If the local prompt file cannot be read.
+        """
         prompt_name = "navigator_agent_step_planner"
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        local_path = os.path.abspath(
-            os.path.join(current_dir, "..", "..", "prompts", f"{prompt_name}.txt")
-        )
+        local_path = prompt_path(prompt_name)
         logger.info(f"Loading local prompt template from: {local_path}")
-        with open(local_path, "r", encoding="utf-8") as f:
-            return ChatPromptTemplate.from_template(f.read())
+        return ChatPromptTemplate.from_template(load_prompt_text(prompt_name))
 
     def _load_prompt(self, prefer_local: bool = True) -> ChatPromptTemplate:
-        """
-        Loads the local step planner prompt by default.
-        LangSmith Hub pulls are opt-in (USE_LANGSMITH_PROMPTS=true) to avoid
-        blocking the async event loop.
+        """Load the local prompt or opt-in LangSmith version.
+
+        Args:
+            prefer_local: Force local loading even when Hub access is enabled.
+
+        Returns:
+            The selected planner prompt, falling back locally on Hub failure.
         """
         if prefer_local or not USE_LANGSMITH_PROMPTS:
             return self._load_local_prompt()
@@ -78,6 +95,14 @@ class NavigatorAgent:
         return self._load_local_prompt()
 
     def _steps_from_structured(self, response: Any) -> List[Dict[str, Any]]:
+        """Normalize structured model output into executable step dictionaries.
+
+        Args:
+            response: Pydantic response, decoded dictionary, or compatible object.
+
+        Returns:
+            Steps containing an action, with null fields removed.
+        """
         if isinstance(response, StepPlanResponse):
             raw_steps = response.steps
         elif isinstance(response, dict):
@@ -103,6 +128,19 @@ class NavigatorAgent:
         credentials: Dict[str, str],
         journey_description: str,
     ) -> List[Dict[str, Any]]:
+        """Invoke the planner with schema output and JSON-parser fallback.
+
+        Args:
+            url: Target application URL.
+            credentials: Credential values keyed by logical names.
+            journey_description: Natural-language user journey.
+
+        Returns:
+            Normalized Playwright step dictionaries.
+
+        Raises:
+            Exception: If both structured and JSON fallback planning fail.
+        """
         prompt = self._load_prompt(prefer_local=True)
         config = {
             "run_name": "navigator_agent_step_planner",
@@ -116,6 +154,7 @@ class NavigatorAgent:
         }
 
         def build_structured(llm):
+            """Bind a candidate model to the step-plan response schema."""
             return prompt | llm.with_structured_output(
                 StepPlanResponse,
                 method="json_schema",
@@ -137,7 +176,10 @@ class NavigatorAgent:
                 structured_err,
             )
 
+        # Preserve support for providers that cannot honor JSON Schema by
+        # parsing and normalizing their free-form JSON response.
         def build_json(llm):
+            """Build the legacy JSON-parser chain for planner fallback."""
             return prompt | llm | RobustJsonOutputParser()
 
         payload = await self.router.ainvoke_with_failover(
@@ -154,8 +196,18 @@ class NavigatorAgent:
         credentials: Dict[str, str],
         journey_description: str,
     ) -> List[Dict[str, Any]]:
-        """
-        Translates a natural language user journey and credentials into sequential Playwright actions.
+        """Synchronously translate a journey into Playwright actions.
+
+        Args:
+            url: Target application URL.
+            credentials: Credential values keyed by logical names.
+            journey_description: Natural-language user journey.
+
+        Returns:
+            Ordered Playwright step dictionaries.
+
+        Raises:
+            RuntimeError: If called while an event loop is already running.
         """
         import asyncio
 
@@ -169,9 +221,15 @@ class NavigatorAgent:
         credentials: Dict[str, str],
         journey_description: str,
     ) -> List[Dict[str, Any]]:
-        """
-        Asynchronously translates a natural language user journey and credentials
-        into sequential Playwright actions.
+        """Asynchronously translate a journey into Playwright actions.
+
+        Args:
+            url: Target application URL.
+            credentials: Credential values keyed by logical names.
+            journey_description: Natural-language user journey.
+
+        Returns:
+            Planned steps, or minimal navigate/wait steps if planning fails.
         """
         logger.info("Requesting Gemini (via LangChain) to compile steps from user flow...")
 

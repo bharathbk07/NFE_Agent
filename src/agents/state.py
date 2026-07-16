@@ -1,9 +1,13 @@
+"""Shared LangGraph state schemas for the NFE performance-testing pipeline."""
+
 from typing import Annotated, NotRequired, Sequence, TypedDict, List, Dict, Any
 # pyrefly: ignore [missing-import]
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 class NetworkRequestLog(TypedDict):
+    """A captured HTTP exchange associated with a browser journey step."""
+
     url: str
     method: str
     headers: Dict[str, str]
@@ -17,9 +21,12 @@ class NetworkRequestLog(TypedDict):
     mime_type: NotRequired[str]
     step_index: NotRequired[int]
     step_action: NotRequired[str]
-    capture_source: NotRequired[str]  # "cdp" | "playwright"
+    capture_source: NotRequired[str]  # "cdp" | "playwright" | "page_url" | "page_navigation"
+    body_type: NotRequired[str]  # json | form | text | empty
 
 class RunRecord(TypedDict):
+    """Artifacts and browser state captured during one journey execution."""
+
     run_id: int
     network_requests: List[NetworkRequestLog]
     cookies: List[Dict[str, Any]]
@@ -30,6 +37,8 @@ class RunRecord(TypedDict):
 
 
 class CorrelationItem(TypedDict):
+    """A request value observed to vary across repeated journey runs."""
+
     request_url: str
     method: str
     location: str  # "header" | "cookie" | "body" | "query" | "path"
@@ -43,6 +52,8 @@ class CorrelationItem(TypedDict):
 
 
 class DependencyChain(TypedDict):
+    """An extract-to-pass relationship between source and target requests."""
+
     source_request: str  # Request URL where value originated
     source_location: str  # response headers or body json path
     source_step_index: int
@@ -55,12 +66,16 @@ class DependencyChain(TypedDict):
 
 
 class SubTask(TypedDict):
+    """An ordered journey phase assigned to specialized pipeline agents."""
+
     name: str
     description: str
     focus: str  # authentication | navigation | form_input | transaction | general
 
 
 class ParameterCandidate(TypedDict):
+    """A user-supplied value eligible for load-test parameterization."""
+
     selector: str
     value: str
     variable_name: str
@@ -70,6 +85,8 @@ class ParameterCandidate(TypedDict):
 
 
 class TransactionGroup(TypedDict):
+    """A logical load-test transaction containing UI and HTTP activity."""
+
     name: str
     description: str
     request_urls: List[str]
@@ -81,9 +98,7 @@ class TransactionGroup(TypedDict):
 
 
 class AgentState(TypedDict):
-    """
-    Type-safe core schema holding active states across state nodes.
-    """
+    """Type-safe state exchanged among NFE LangGraph pipeline nodes."""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     intent: NotRequired[str]
     target_url: NotRequired[str]
@@ -96,4 +111,6 @@ class AgentState(TypedDict):
     parameterizable_candidates: NotRequired[List[ParameterCandidate]]
     transactions: NotRequired[List[TransactionGroup]]
     performance_test_output: NotRequired[Dict[str, Any]]
+    correlation_advice: NotRequired[Dict[str, Any]]
+    cookie_correlation_notes: NotRequired[List[Dict[str, Any]]]
     error_log: NotRequired[List[str]]

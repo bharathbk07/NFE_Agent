@@ -1,8 +1,4 @@
-"""
-Module: Dual Observability System Configurator
-Description: Integrates LangSmith tracing, OpenTelemetry distributed tracing,
-             OTLP log export, and Dynatrace Log Ingestion with trace correlation.
-"""
+"""Configure LangSmith, OpenTelemetry, and Dynatrace observability."""
 import logging
 import os
 import queue
@@ -20,7 +16,14 @@ _INITIALIZED = False
 
 
 def _normalize_dynatrace_env_url(base_url: str) -> str:
-    """Return the Dynatrace environment root URL (without OTLP path suffix)."""
+    """Remove an OTLP suffix from a Dynatrace URL.
+
+    Args:
+        base_url: Dynatrace environment or OTLP endpoint URL.
+
+    Returns:
+        The environment root URL without a trailing slash.
+    """
     url = base_url.rstrip("/")
     for suffix in ("/api/v2/otlp", "/api/v2"):
         if url.endswith(suffix):
@@ -29,7 +32,14 @@ def _normalize_dynatrace_env_url(base_url: str) -> str:
 
 
 def _normalize_otlp_base_url(base_url: str) -> str:
-    """Return the OTLP base URL expected by OpenTelemetry exporters."""
+    """Normalize a Dynatrace URL to its OTLP base endpoint.
+
+    Args:
+        base_url: Dynatrace environment, API v2, or OTLP endpoint URL.
+
+    Returns:
+        A URL ending in ``/api/v2/otlp``.
+    """
     url = base_url.rstrip("/")
     if url.endswith("/api/v2/otlp"):
         return url
@@ -39,13 +49,13 @@ def _normalize_otlp_base_url(base_url: str) -> str:
 
 
 def _parse_dynatrace_headers(raw_headers: str) -> tuple[dict[str, str], str]:
-    """
-    Parse Dynatrace OTLP headers from env.
+    """Parse supported Dynatrace authorization header formats.
 
-    Supports:
-      - Authorization=Api-Token%20<token>
-      - Api-Token=<token>
-      - Authorization: Api-Token <token>
+    Args:
+        raw_headers: Encoded OTLP headers, an Authorization header, or a token.
+
+    Returns:
+        A tuple of exporter headers and the extracted API token.
     """
     if not raw_headers:
         return {}, ""
@@ -80,7 +90,14 @@ def _parse_dynatrace_headers(raw_headers: str) -> tuple[dict[str, str], str]:
 
 
 def _trace_context_from_record(record: logging.LogRecord) -> tuple[str | None, str | None]:
-    """Resolve trace/span IDs from injected log record fields or active OTel span."""
+    """Resolve trace identifiers from a record or active OpenTelemetry span.
+
+    Args:
+        record: Standard-library log record.
+
+    Returns:
+        A ``(trace_id, span_id)`` tuple; each value is ``None`` when unavailable.
+    """
     trace_id = getattr(record, "otelTraceID", None)
     span_id = getattr(record, "otelSpanID", None)
     if trace_id and trace_id != "0":
@@ -99,19 +116,32 @@ def _trace_context_from_record(record: logging.LogRecord) -> tuple[str | None, s
 
 
 def _enrich_log_content(content: str, trace_id: str | None, span_id: str | None) -> str:
-    """Prefix log content with Dynatrace trace correlation marker when context exists."""
+    """Add a Dynatrace correlation marker when trace context exists.
+
+    Args:
+        content: Formatted log message.
+        trace_id: Optional hexadecimal trace identifier.
+        span_id: Optional hexadecimal span identifier.
+
+    Returns:
+        Correlated or unchanged log content.
+    """
     if trace_id and span_id:
         return f"[!dt dt.trace_id={trace_id},dt.span_id={span_id}] - {content}"
     return content
 
 
 class DynatraceLogHandler(logging.Handler):
-    """
-    Sends logs to the Dynatrace Log Ingestion API v2 with trace/span correlation
-    so entries appear linked inside distributed traces.
-    """
+    """Queue correlated records for Dynatrace Log Ingestion API v2."""
 
     def __init__(self, env_url: str, api_token: str, app_name: str = "nfe-agent"):
+        """Initialize the asynchronous ingestion handler.
+
+        Args:
+            env_url: Dynatrace environment root URL.
+            api_token: API token authorized for log ingestion.
+            app_name: Service name attached to emitted records.
+        """
         super().__init__()
         self.url = f"{env_url.rstrip('/')}/api/v2/logs/ingest"
         self.headers = {
@@ -124,6 +154,11 @@ class DynatraceLogHandler(logging.Handler):
         self.worker.start()
 
     def emit(self, record: logging.LogRecord) -> None:
+        """Queue a formatted log record for ingestion.
+
+        Args:
+            record: Standard-library log record to serialize.
+        """
         try:
             trace_id, span_id = _trace_context_from_record(record)
             content = _enrich_log_content(self.format(record), trace_id, span_id)
@@ -148,6 +183,11 @@ class DynatraceLogHandler(logging.Handler):
             self.handleError(record)
 
     def _post_logs_worker(self) -> None:
+        """Continuously post queued records in batches.
+
+        Returns:
+            This daemon worker does not return during normal operation.
+        """
         while True:
             batch: list[dict[str, Any]] = []
             try:
@@ -176,7 +216,17 @@ def _configure_otlp_log_export(
     otlp_headers: dict[str, str],
     service_name: str,
 ) -> None:
-    """Export Python logs via OTLP so they appear in distributed trace views."""
+    """Install a root handler that exports Python logs over OTLP.
+
+    Args:
+        otlp_base_url: OTLP base endpoint without the signal-specific suffix.
+        otlp_headers: Authentication headers for the exporter.
+        service_name: OpenTelemetry service resource name.
+
+    Raises:
+        ImportError: If required OpenTelemetry logging packages are unavailable.
+        Exception: If provider or exporter setup fails.
+    """
     from opentelemetry._logs import set_logger_provider
     from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
     from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
@@ -198,7 +248,12 @@ def _configure_otlp_log_export(
 
 
 def _configure_log_correlation() -> None:
-    """Inject active trace context into stdlib log records."""
+    """Inject active trace context into standard-library log records.
+
+    Raises:
+        ImportError: If OpenTelemetry logging instrumentation is unavailable.
+        Exception: If instrumentation cannot be installed.
+    """
     from opentelemetry.instrumentation.logging import LoggingInstrumentor
 
     LoggingInstrumentor().instrument(set_logging_format=False)
@@ -206,9 +261,11 @@ def _configure_log_correlation() -> None:
 
 
 def initialize_observability() -> None:
-    """
-    Initializes telemetries globally: LangSmith flags, OpenLLMetry traces,
-    OTLP log export, and Dynatrace log ingestion with trace correlation.
+    """Initialize process-wide tracing and log export once.
+
+    Returns:
+        ``None``. Missing optional dependencies or incomplete configuration are
+        logged and skipped.
     """
     global _INITIALIZED
     if _INITIALIZED:
@@ -245,7 +302,7 @@ def initialize_observability() -> None:
             f"Authorization={otlp_headers['Authorization']}",
         )
 
-    # 1. Traces first so subsequent logs can attach to active spans.
+    # Initialize traces first so later log handlers can correlate active spans.
     try:
         from traceloop.sdk import Traceloop
 
@@ -299,7 +356,11 @@ def initialize_observability() -> None:
 
 
 def get_diagnostics_callbacks() -> list:
-    """Returns standard diagnostic callbacks for fallback execution monitoring."""
+    """Build callbacks for fallback execution diagnostics.
+
+    Returns:
+        A stdout callback list in debug mode, otherwise an empty list.
+    """
     callbacks = []
     if os.getenv("DEBUG_MODE", "false").lower() == "true":
         callbacks.append(StdOutCallbackHandler())

@@ -1,4 +1,9 @@
-"""Generate a starter k6 script from analysis results (params, correlations, TXNs)."""
+"""
+Deterministic k6 emitter.
+
+Takes Load-Test IR (from load_test_ir.build_load_test_ir) and produces a k6 script.
+No LLM. Same IR → same script.
+"""
 from __future__ import annotations
 
 import json
@@ -6,162 +11,259 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from src.utils.load_test_ir import build_load_test_ir
+
 
 def _js_string(value: Any) -> str:
+    """Encode a value as a JSON-quoted JavaScript string literal.
+
+    Args:
+        value: Value to stringify; ``None`` becomes an empty string.
+
+    Returns:
+        JavaScript string expression.
+    """
     return json.dumps("" if value is None else str(value))
 
 
 def _safe_ident(name: str, fallback: str = "value") -> str:
+    """Normalize arbitrary text into a JavaScript identifier.
+
+    Args:
+        name: Desired identifier.
+        fallback: Replacement or prefix for invalid names.
+
+    Returns:
+        Identifier containing only letters, digits, and underscores.
+    """
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", name or "").strip("_")
     if not cleaned or cleaned[0].isdigit():
         cleaned = f"{fallback}_{cleaned}" if cleaned else fallback
     return cleaned
 
 
-def _normalize_url(url: str, default_origin: str = "") -> str:
-    u = (url or "").strip().rstrip("`").strip()
-    if not u:
-        return ""
-    if u.startswith("http://") or u.startswith("https://"):
-        return u
-    # Labels like "www.saucedemo.com/inventory.html"
-    if default_origin and u.startswith("/"):
-        return default_origin.rstrip("/") + u
-    if "://" not in u and "." in u.split("/")[0]:
-        scheme = urlparse(default_origin).scheme or "https"
-        return f"{scheme}://{u.lstrip('/')}"
-    if default_origin and u.startswith("/"):
-        return default_origin.rstrip("/") + u
-    return u
+def _resolve_var_expr(value: Any) -> str:
+    """Convert an IR scalar or placeholder into a JavaScript expression.
+
+    Args:
+        value: IR scalar, including exact ``${name}`` placeholders.
+
+    Returns:
+        JavaScript literal, ``null``, or ``vars.name`` expression.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float, bool)):
+        return json.dumps(value)
+    s = str(value)
+    m = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", s)
+    if m:
+        return f"vars.{m.group(1)}"
+    return _js_string(s)
 
 
-def _parse_request_label(label: str, default_origin: str = "") -> Optional[Dict[str, str]]:
-    """Parse 'GET https://host/path' or 'POST host/path' into method+url."""
-    text = (label or "").strip()
-    if not text or text.startswith("UI ") or text.startswith("("):
-        return None
-    m = re.match(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)$", text, re.I)
-    if not m:
-        # Bare URL
-        if text.startswith("http://") or text.startswith("https://"):
-            return {"method": "GET", "url": text}
-        return None
-    method = m.group(1).upper()
-    raw = m.group(2)
-    url = _normalize_url(raw, default_origin)
-    if not url.startswith("http"):
-        return None
-    return {"method": method, "url": url}
+def _body_to_js(body: Any, body_type: str) -> Tuple[str, Optional[str]]:
+    """Render an IR body as a JavaScript expression.
+
+    Args:
+        body: Parsed request body containing optional placeholders.
+        body_type: IR body classification such as ``json`` or ``form``.
+
+    Returns:
+        Pair of JavaScript expression and optional Content-Type override.
+    """
+    if body is None or body_type in ("empty", ""):
+        return "null", None
+
+    if body_type == "form" and isinstance(body, dict):
+        # Build object then urlencode at runtime for var substitution
+        fields = []
+        for k, v in body.items():
+            fields.append(f"    {_js_string(k)}: {_resolve_var_expr(v)}")
+        obj = "{\n" + ",\n".join(fields) + "\n  }"
+        return f"Object.entries({obj}).map(([k,v]) => `${{encodeURIComponent(k)}}=${{encodeURIComponent(v)}}`).join('&')", (
+            "application/x-www-form-urlencoded"
+        )
+
+    if isinstance(body, (dict, list)):
+        # JSON with possible ${var} leaves — rebuild as JS object literal
+        def render(node: Any) -> str:
+            """Recursively render JSON-compatible data as JavaScript syntax."""
+            if isinstance(node, dict):
+                parts = [f"{_js_string(k)}: {render(v)}" for k, v in node.items()]
+                return "{ " + ", ".join(parts) + " }"
+            if isinstance(node, list):
+                return "[ " + ", ".join(render(v) for v in node) + " ]"
+            return _resolve_var_expr(node)
+
+        return f"JSON.stringify({render(body)})", "application/json"
+
+    return _resolve_var_expr(body), None
 
 
-def _http_entries_for_txn(
-    txn: Dict[str, Any],
-    target_url: str,
-) -> List[Dict[str, str]]:
-    """Prefer structured http_entries; else parse labels."""
-    origin = ""
-    try:
-        p = urlparse(target_url or "")
-        if p.scheme and p.netloc:
-            origin = f"{p.scheme}://{p.netloc}"
-    except Exception:
-        origin = ""
+def _extract_snippets_for_txn(
+    txn_name: str,
+    correlations: List[Dict[str, Any]],
+    request_urls: List[str],
+) -> List[str]:
+    """Generate extraction statements for matching response sources.
 
-    entries: List[Dict[str, str]] = []
-    seen = set()
+    Args:
+        txn_name: Transaction name retained for emitter context.
+        correlations: IR correlation definitions.
+        request_urls: URLs represented by the current transaction or response.
 
-    for e in txn.get("http_entries") or []:
-        if not isinstance(e, dict):
-            continue
-        method = (e.get("method") or "GET").upper()
-        url = _normalize_url(str(e.get("url") or ""), origin)
-        if not url.startswith("http"):
-            continue
-        key = (method, url)
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append({"method": method, "url": url})
-
-    if entries:
-        return entries
-
-    for label in txn.get("http_requests") or txn.get("request_urls") or []:
-        parsed = _parse_request_label(str(label), origin)
-        if not parsed:
-            continue
-        key = (parsed["method"], parsed["url"])
-        if key in seen:
-            continue
-        seen.add(key)
-        entries.append(parsed)
-
-    return entries
-
-
-def _ui_steps_for_txn(txn: Dict[str, Any]) -> List[Dict[str, Any]]:
-    steps = txn.get("ui_steps") or []
-    if steps:
-        return [s for s in steps if isinstance(s, dict)]
-    # Best-effort parse from ui_actions labels
-    out: List[Dict[str, Any]] = []
-    for line in txn.get("ui_actions") or []:
-        text = str(line)
-        if text.startswith("UI fill "):
-            # UI fill #user-name = standard_user
-            m = re.match(r"UI fill\s+(\S+)\s*=\s*(.*)$", text)
-            if m:
-                out.append({"action": "fill", "selector": m.group(1), "value": m.group(2)})
-        elif text.startswith("UI click "):
-            out.append({"action": "click", "selector": text[len("UI click ") :].strip()})
-        elif text.startswith("UI navigate"):
-            m = re.search(r"→\s*(\S+)", text)
-            if m:
-                out.append({"action": "navigate", "url": m.group(1)})
-        elif "wait_for_selector" in text:
-            m = re.search(r"wait_for_selector\s+(\S+)", text)
-            if m:
-                out.append({"action": "wait_for_selector", "selector": m.group(1)})
-        elif text.startswith("UI wait_for_load") or text == "UI wait_for_load":
-            out.append({"action": "wait_for_load"})
-    return out
-
-
-def _emit_http_calls(entries: List[Dict[str, str]], txn_name: str) -> str:
+    Returns:
+        Ordered JavaScript lines for applicable extractions and notes.
+    """
     lines: List[str] = []
-    for i, e in enumerate(entries):
-        method = e["method"]
-        url_js = _js_string(e["url"])
-        tag = f"{{ tags: {{ txn: {_js_string(txn_name)} }} }}"
-        var = "res" if i == 0 else f"res{i}"
-        if method == "GET":
-            lines.append(f"    const {var} = http.get({url_js}, {tag});")
-        elif method == "POST":
+    url_set = set(request_urls)
+    for c in correlations:
+        if c.get("auto_cookie"):
+            continue
+        src = c.get("extract") or {}
+        from_req = src.get("from_request") or ""
+        if from_req and from_req not in url_set:
+            # Also match if any request URL equals or shares path
+            if not any(from_req.rstrip("/") == u.rstrip("/") for u in url_set):
+                continue
+        var = _safe_ident(c.get("var") or "token", "token")
+        loc = str(src.get("from_location") or "")
+        if loc.startswith("body.$") or loc.startswith("body."):
+            path = loc[len("body.") :] if loc.startswith("body.") else loc
+            # k6 json path: $.token → 'token' or nested
+            jp = path.lstrip("$.").replace(".", ".")
+            if jp.startswith("$"):
+                jp = jp[1:].lstrip(".")
             lines.append(
-                f"    const {var} = http.post({url_js}, null, {tag}); "
-                f"// TODO: add form body / JSON from recording"
+                f"    // Correlation extract `{var}` from {loc}"
             )
-        elif method == "PUT":
-            lines.append(f"    const {var} = http.put({url_js}, null, {tag});")
-        elif method == "PATCH":
-            lines.append(f"    const {var} = http.patch({url_js}, null, {tag});")
-        elif method == "DELETE":
-            lines.append(f"    const {var} = http.del({url_js}, null, {tag});")
+            lines.append(
+                f"    vars.{var} = res.json({_js_string(jp)}) || vars.{var};"
+            )
+        elif "set-cookie" in loc.lower():
+            lines.append(
+                f"    // Cookie `{var}` managed by k6 cookie jar (from {loc})"
+            )
+        elif "ui." in loc.lower():
+            lines.append(
+                f"    // UI correlation `{var}`: read from page after submit/create "
+                f"(see browser TXN before this request)"
+            )
         else:
             lines.append(
-                f"    const {var} = http.request({_js_string(method)}, {url_js}, null, {tag});"
+                f"    // TODO extract `{var}` from {loc} on {from_req}"
             )
-        lines.append(
-            f"    check({var}, {{ '{txn_name} {method} {i+1} is 2xx': "
+    return lines
+
+
+def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) -> str:
+    """Emit one protocol-mode k6 transaction function.
+
+    Args:
+        txn: IR transaction with requests and timing metadata.
+        correlations: IR correlations used to place extraction statements.
+
+    Returns:
+        JavaScript function source.
+    """
+    name = txn["name"]
+    desc = txn.get("description") or name
+    think = txn.get("think_time_s", 1)
+    reqs = txn.get("requests") or []
+    comments = "\n".join(
+        f"    // - {r.get('method')} {r.get('url')}" for r in reqs[:30]
+    ) or "    // (no requests)"
+
+    body_lines: List[str] = []
+    urls = [r.get("url") or "" for r in reqs]
+
+    for i, r in enumerate(reqs):
+        method = (r.get("method") or "GET").upper()
+        url_js = _js_string(r.get("url"))
+        var = "res" if i == 0 else f"res{i}"
+        body_js, ct = _body_to_js(r.get("body"), r.get("body_type") or "empty")
+        headers = dict(r.get("headers") or {})
+        if ct and "content-type" not in {h.lower() for h in headers}:
+            headers["Content-Type"] = ct
+
+        header_parts = [f"{_js_string(k)}: {_js_string(v)}" for k, v in headers.items()]
+        headers_js = "{ " + ", ".join(header_parts) + " }" if header_parts else "{}"
+
+        params_obj = (
+            f"{{ headers: {headers_js}, tags: {{ txn: {_js_string(name)} }} }}"
+        )
+
+        if method == "GET":
+            body_lines.append(f"    const {var} = http.get({url_js}, {params_obj});")
+        elif method == "POST":
+            body_lines.append(
+                f"    const {var} = http.post({url_js}, {body_js}, {params_obj});"
+            )
+        elif method == "PUT":
+            body_lines.append(
+                f"    const {var} = http.put({url_js}, {body_js}, {params_obj});"
+            )
+        elif method == "PATCH":
+            body_lines.append(
+                f"    const {var} = http.patch({url_js}, {body_js}, {params_obj});"
+            )
+        elif method == "DELETE":
+            body_lines.append(
+                f"    const {var} = http.del({url_js}, {body_js}, {params_obj});"
+            )
+        else:
+            body_lines.append(
+                f"    const {var} = http.request({_js_string(method)}, {url_js}, {body_js}, {params_obj});"
+            )
+        body_lines.append(
+            f"    check({var}, {{ '{name} {method} {i+1} is 2xx': "
             f"(r) => r.status >= 200 && r.status < 300 }});"
         )
-    if not lines:
-        return "    // No protocol-level HTTP captured for this TXN"
-    return "\n".join(lines)
+
+        # Extract correlations after the last matching source response
+        if i == len(reqs) - 1 or (r.get("url") in {
+            (c.get("extract") or {}).get("from_request") for c in correlations
+        }):
+            body_lines.extend(
+                _extract_snippets_for_txn(name, correlations, [r.get("url") or ""])
+            )
+
+    if not body_lines:
+        body_lines.append("    // No protocol HTTP for this TXN — check browser mode")
+
+    extracts_note = _extract_snippets_for_txn(name, correlations, urls)
+
+    return f"""
+export function {name}() {{
+  // TXN: {desc}
+  // Mode: protocol (from IR)
+  // Requests:
+{comments}
+  group({_js_string(name)}, function () {{
+{chr(10).join(body_lines)}
+    sleep({think});
+  }});
+}}""".rstrip()
 
 
-def _emit_browser_actions(ui_steps: List[Dict[str, Any]], params: Dict[str, str]) -> str:
-    """Emit k6/browser page actions from Playwright UI steps."""
+def _emit_browser_txn(txn: Dict[str, Any], target_url: str) -> str:
+    """Emit one browser-mode k6 transaction function.
+
+    Args:
+        txn: IR transaction containing normalized UI steps.
+        target_url: Fallback navigation URL.
+
+    Returns:
+        Async JavaScript function source.
+    """
+    name = txn["name"]
+    desc = txn.get("description") or name
+    think = txn.get("think_time_s", 1)
+    ui_steps = txn.get("ui_steps") or []
+    reqs = txn.get("requests") or []
+    seed = (reqs[0]["url"] if reqs else target_url) or "about:blank"
+
     lines: List[str] = []
     for step in ui_steps:
         action = step.get("action")
@@ -171,155 +273,144 @@ def _emit_browser_actions(ui_steps: List[Dict[str, Any]], params: Dict[str, str]
         if action == "navigate" and url:
             lines.append(f"    await page.goto({_js_string(url)});")
         elif action == "fill" and selector:
-            # Prefer vars.* when value matches a known param
-            val_expr = _js_string(value)
-            for pname, pval in params.items():
-                if str(value) == str(pval):
-                    val_expr = f"vars.{pname}"
-                    break
-            lines.append(f"    await page.locator({_js_string(selector)}).type({val_expr});")
+            lines.append(
+                f"    await page.locator({_js_string(selector)}).type({_resolve_var_expr(value)});"
+            )
         elif action == "click" and selector:
             lines.append(f"    await page.locator({_js_string(selector)}).click();")
         elif action == "select" and selector:
             lines.append(
-                f"    await page.locator({_js_string(selector)}).selectOption({_js_string(value)});"
+                f"    await page.locator({_js_string(selector)}).selectOption({_resolve_var_expr(value)});"
             )
         elif action == "wait_for_selector" and selector:
             lines.append(f"    await page.locator({_js_string(selector)}).waitFor();")
         elif action in ("wait", "wait_for_load"):
             lines.append("    await page.waitForLoadState('networkidle');")
-    return "\n".join(lines) if lines else "    // (no UI steps)"
 
+    body = "\n".join(lines) if lines else "    // (no UI steps)"
+    comments = "\n".join(
+        f"    // - UI {s.get('action')} {s.get('selector') or s.get('url') or ''}".rstrip()
+        for s in ui_steps[:20]
+    ) or "    // (no UI)"
 
-def generate_k6_script(
-    *,
-    target_url: str,
-    parameterizable_candidates: List[Dict[str, Any]],
-    dependencies: List[Dict[str, Any]],
-    transactions: List[Dict[str, Any]],
-) -> str:
-    """
-    Produce a k6 script from captured HTTP per TXN.
-
-    - Protocol (http.*) when TXN has real METHOD+URL entries
-    - k6 browser module when a TXN is UI-only (SPA client-side actions)
-    """
-    params: Dict[str, str] = {}
-    for cand in parameterizable_candidates or []:
-        var = _safe_ident(cand.get("variable_name") or "input")
-        if var not in params:
-            params[var] = str(cand.get("value") or "")
-
-    corr_lines = []
-    seen_corr = set()
-    for dep in dependencies or []:
-        key = (
-            dep.get("value_key"),
-            dep.get("source_request"),
-            dep.get("target_request"),
-        )
-        if key in seen_corr:
-            continue
-        seen_corr.add(key)
-        var = _safe_ident(dep.get("value_key") or "token", "token")
-        corr_lines.append(
-            f"  // Extract `{var}` from {dep.get('source_location')} "
-            f"in {dep.get('source_request')}\n"
-            f"  // Pass `{var}` into {dep.get('target_location')} "
-            f"in {dep.get('target_request')}"
-        )
-
-    param_block = ",\n".join(
-        f"  {name}: {_js_string(val)}" for name, val in params.items()
-    ) or "  // no parameters detected"
-
-    host = urlparse(target_url or "").netloc or "example.com"
-    needs_browser = False
-    txn_fns: List[str] = []
-    txn_meta: List[Tuple[str, bool]] = []  # (name, is_async_browser)
-
-    for txn in transactions or []:
-        name = _safe_ident(txn.get("name") or "Txn", "Txn")
-        desc = txn.get("description") or name
-        entries = _http_entries_for_txn(txn, target_url or "")
-        ui_steps = _ui_steps_for_txn(txn)
-
-        req_comments = "\n".join(
-            f"    // - {e['method']} {e['url']}" for e in entries[:30]
-        )
-        if not req_comments and ui_steps:
-            req_comments = "\n".join(
-                f"    // - UI {s.get('action')} {s.get('selector') or s.get('url') or ''}".rstrip()
-                for s in ui_steps[:20]
-            )
-        if not req_comments:
-            req_comments = "    // (no requests)"
-
-        # Prefer protocol when we have captured METHOD+URL entries.
-        # Use browser only for UI-driven phases with no useful distinct HTTP.
-        use_browser = not entries and bool(ui_steps)
-        if (
-            entries
-            and ui_steps
-            and len({e["url"].rstrip("/") for e in entries}) == 1
-            and len(ui_steps) >= 2
-        ):
-            # Same page document only (e.g. add-to-cart on inventory) → browser actions
-            use_browser = True
-        if (
-            entries
-            and ui_steps
-            and len({e["url"] for e in entries}) == 1
-            and entries[0]["url"].rstrip("/") == (target_url or "").rstrip("/")
-            and len(ui_steps) >= 2
-        ):
-            use_browser = True
-
-        if use_browser:
-            needs_browser = True
-            body = _emit_browser_actions(ui_steps, params)
-            # Seed page at first URL if known
-            seed = entries[0]["url"] if entries else (target_url or f"https://{host}/")
-            txn_fns.append(
-                f"""
+    return f"""
 export async function {name}(page) {{
   // TXN: {desc}
-  // Mode: k6 browser (client-side / UI-driven phase)
-  // Activity:
-{req_comments}
+  // Mode: browser (SPA / UI-driven — from IR)
+{comments}
   await group({_js_string(name)}, async function () {{
-    if (page.url() === 'about:blank') {{
+    if (!page.url() || page.url() === 'about:blank') {{
       await page.goto({_js_string(seed)});
     }}
 {body}
-    await sleep(1);
+    await sleep({think});
   }});
 }}""".rstrip()
-            )
-            txn_meta.append((name, True))
+
+
+def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
+    """Deterministically emit k6 JavaScript from Load-Test IR.
+
+    Args:
+        ir: IR mapping with variables, correlations, and transactions.
+
+    Returns:
+        Complete protocol or browser-enabled k6 JavaScript source.
+    """
+    target_url = ir.get("target_url") or ""
+    host = urlparse(target_url).netloc or "example.com"
+    vars_list = ir.get("vars") or []
+    correlations = ir.get("correlations") or []
+    transactions = ir.get("transactions") or []
+
+    # Preserve IR insertion order so identical IR emits byte-for-byte.
+    param_block = ",\n".join(
+        f"  {v['name']}: {_js_string(v.get('value'))}" for v in vars_list
+    ) or "  // no parameters detected"
+
+    # Mutable bag for runtime correlation extracts
+    corr_var_decls = []
+    for c in correlations:
+        if c.get("auto_cookie"):
+            continue
+        var = _safe_ident(c.get("var") or "token", "token")
+        if var not in {v["name"] for v in vars_list}:
+            corr_var_decls.append(f"  {var}: '', // filled by correlation extract")
+
+    if corr_var_decls:
+        if param_block.startswith("  //"):
+            param_block = ",\n".join(corr_var_decls)
         else:
-            if not entries:
-                # Last resort: single GET target — marked clearly
-                entries = [{"method": "GET", "url": target_url or f"https://{host}/"}]
-                req_comments = (
-                    f"    // - GET {entries[0]['url']} "
-                    "(fallback — no per-phase HTTP captured; re-run journey to enrich)"
-                )
-            http_body = _emit_http_calls(entries, name)
-            txn_fns.append(
-                f"""
-export function {name}() {{
-  // TXN: {desc}
-  // Mode: protocol (captured HTTP)
-  // Requests under this transaction:
-{req_comments}
-  group({_js_string(name)}, function () {{
-{http_body}
-    sleep(1);
-  }});
-}}""".rstrip()
+            param_block = param_block + ",\n" + ",\n".join(corr_var_decls)
+
+    corr_comments = []
+    for c in correlations:
+        var = c.get("var")
+        ex = c.get("extract") or {}
+        ps = c.get("pass") or {}
+        if c.get("auto_cookie"):
+            corr_comments.append(
+                f"  // Cookie `{var}`: extract {ex.get('from_location')} → "
+                f"pass {ps.get('to_location')} (k6 cookie jar handles this)"
             )
-            txn_meta.append((name, False))
+        else:
+            corr_comments.append(
+                f"  // `{var}` [{c.get('confidence')}]: "
+                f"{ex.get('from_location')} @ {ex.get('from_request')} → "
+                f"{ps.get('to_location')} @ {ps.get('to_request')}"
+            )
+    corr_block = (
+        "\n".join(corr_comments)
+        if corr_comments
+        else "  // No traced correlations — cookie jar / session may still apply."
+    )
+
+    cookie_notes = ir.get("cookie_notes") or []
+    cookie_lines = []
+    for n in cookie_notes[:20]:
+        if not isinstance(n, dict):
+            continue
+        name = n.get("cookie_name") or "?"
+        must = "REQUIRED" if n.get("must_correlate") else "verify"
+        conf = n.get("confidence") or "uncertain"
+        cookie_lines.append(
+            f"  // Cookie `{name}` [{must}/{conf}]: {n.get('note') or ''}"
+        )
+    if cookie_lines:
+        corr_block = corr_block + "\n" + "\n".join(cookie_lines)
+    elif not cookie_notes:
+        corr_block = (
+            corr_block
+            + "\n  // Tip: persist cookies after login; many apps rely on session cookies."
+        )
+
+    needs_browser = False
+    txn_fns: List[str] = []
+    txn_meta: List[Tuple[str, bool]] = []
+
+    for txn in transactions:
+        mode = txn.get("mode") or "protocol"
+        if mode == "browser":
+            needs_browser = True
+            txn_fns.append(_emit_browser_txn(txn, target_url))
+            txn_meta.append((txn["name"], True))
+        else:
+            if not txn.get("requests"):
+                # fallback single GET to avoid empty fn
+                txn = {
+                    **txn,
+                    "requests": [
+                        {
+                            "method": "GET",
+                            "url": target_url or f"https://{host}/",
+                            "headers": {},
+                            "body": None,
+                            "body_type": "empty",
+                        }
+                    ],
+                }
+            txn_fns.append(_emit_protocol_txn(txn, correlations))
+            txn_meta.append((txn["name"], False))
 
     if not txn_fns:
         txn_fns.append(
@@ -334,12 +425,6 @@ export function Launch() {{
         )
         txn_meta.append(("Launch", False))
 
-    corr_block = (
-        "\n".join(corr_lines)
-        if corr_lines
-        else "  // No traced correlations — manage cookies/session if auth is cookie-based."
-    )
-
     if needs_browser:
         call_lines = []
         for name, is_browser in txn_meta:
@@ -353,13 +438,9 @@ import {{ browser }} from 'k6/browser';
 import {{ check, group, sleep }} from 'k6';
 
 /**
- * Auto-generated by NFE Agent (hybrid protocol + browser)
+ * Auto-generated by NFE Agent from Load-Test IR (deterministic — no LLM).
  * Target: {target_url}
- *
- * Protocol TXNs use captured METHOD+URL sequences.
- * UI-only SPA phases use the k6 browser module (real selectors from Playwright).
- * Run with: k6 run --no-usage-report script.js
- * (Browser scenario requires a k6 build with browser support.)
+ * IR version: {ir.get('version', 1)}
  */
 
 export const options = {{
@@ -401,11 +482,12 @@ export default async function () {{
 import {{ check, group, sleep }} from 'k6';
 
 /**
- * Auto-generated by NFE Agent (protocol mode)
+ * Auto-generated by NFE Agent from Load-Test IR (deterministic — no LLM).
  * Target: {target_url}
+ * IR version: {ir.get('version', 1)}
  *
- * Each TXN emits the captured METHOD+URL sequence (not a single landing-page GET).
- * Fill in POST bodies / correlation extractors from the Correlations section.
+ * Protocol TXNs replay captured METHOD+URL (+ body when available).
+ * Cookie-based sessions use the k6 cookie jar automatically.
  */
 
 export const options = {{
@@ -430,3 +512,36 @@ export default function () {{
 {calls}
 }}
 """
+
+
+def generate_k6_script(
+    *,
+    target_url: str,
+    parameterizable_candidates: List[Dict[str, Any]],
+    dependencies: List[Dict[str, Any]],
+    transactions: List[Dict[str, Any]],
+    network_requests: Optional[List[Dict[str, Any]]] = None,
+    ir: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build IR when needed and return deterministic k6 source.
+
+    Args:
+        target_url: Journey target URL.
+        parameterizable_candidates: User-fed parameter candidates.
+        dependencies: Extract-to-pass correlation edges.
+        transactions: Transaction definitions.
+        network_requests: Optional captures used to enrich newly built IR.
+        ir: Optional pre-built Load-Test IR.
+
+    Returns:
+        Complete k6 JavaScript source string.
+    """
+    if ir is None:
+        ir = build_load_test_ir(
+            target_url=target_url,
+            parameterizable_candidates=parameterizable_candidates,
+            dependencies=dependencies,
+            transactions=transactions,
+            network_requests=network_requests,
+        )
+    return emit_k6_from_ir(ir)

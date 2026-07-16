@@ -1,3 +1,5 @@
+"""Compares repeated captures to discover dynamic values and dependencies."""
+
 import json
 import logging
 import re
@@ -7,10 +9,21 @@ from urllib.parse import urlparse, parse_qs
 logger = logging.getLogger(__name__)
 
 class TrafficAnalystAgent:
-    def __init__(self):
-        pass
+    """Detects cross-run value changes and traces response-to-request reuse."""
+
+    def __init__(self) -> None:
+        """Create a stateless analyst; no configuration is required."""
 
     def _extract_query_params(self, url: str) -> Dict[str, List[str]]:
+        """Parse query parameters from a captured URL.
+
+        Args:
+            url: Absolute or relative request URL.
+
+        Returns:
+            Query values grouped by parameter name, or an empty dictionary for
+            malformed input.
+        """
         try:
             parsed = urlparse(url)
             return parse_qs(parsed.query)
@@ -18,7 +31,15 @@ class TrafficAnalystAgent:
             return {}
 
     def _get_json_paths(self, data: Any, current_path: str = "$") -> Dict[str, Any]:
-        """Recursive helper to build flat dictionary of JSON paths and their values."""
+        """Flatten nested JSON-compatible data into scalar JSON paths.
+
+        Args:
+            data: Dictionary, list, scalar, or ``None`` to traverse.
+            current_path: JSON path prefix for the current recursion level.
+
+        Returns:
+            A mapping of leaf JSON paths to stringified non-null values.
+        """
         paths = {}
         if isinstance(data, dict):
             for k, v in data.items():
@@ -32,7 +53,15 @@ class TrafficAnalystAgent:
         return paths
 
     def _generate_dynamic_name(self, location: str, key: str) -> str:
-        # Generate a clean, lowercase variable name
+        """Generate a script-safe name for a dynamic request value.
+
+        Args:
+            location: Request area such as ``query``, ``header``, or ``body``.
+            key: Field name or JSON path identifying the value.
+
+        Returns:
+            A lowercase identifier suitable for correlation variables.
+        """
         name = key
         if location == "body" and key == "raw":
             name = "raw_body"
@@ -47,7 +76,14 @@ class TrafficAnalystAgent:
         return clean_name
 
     def _parse_cookies(self, cookie_header: str) -> Dict[str, str]:
-        """Parse a Cookie or Set-Cookie header into name→value pairs."""
+        """Parse a Cookie or Set-Cookie header into name-value pairs.
+
+        Args:
+            cookie_header: Semicolon-delimited HTTP cookie header value.
+
+        Returns:
+            Cookie values keyed by name, excluding Set-Cookie attributes.
+        """
         cookies = {}
         if not cookie_header:
             return cookies
@@ -63,6 +99,14 @@ class TrafficAnalystAgent:
         return cookies
 
     def _is_client_side_value(self, val: str) -> bool:
+        """Identify timestamps likely generated locally by the browser.
+
+        Args:
+            val: Candidate dynamic value.
+
+        Returns:
+            ``True`` when the value resembles a Unix or ISO-like timestamp.
+        """
         val_str = str(val).strip()
         # UNIX timestamp (10 or 13 digits)
         if val_str.isdigit() and len(val_str) in [10, 13]:
@@ -76,8 +120,14 @@ class TrafficAnalystAgent:
         return False
 
     def analyze_runs(self, run1: Dict[str, Any], run2: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """
-        Compares Run 1 and Run 2 network traffic to detect dynamic values and trace their origins.
+        """Compare two captures and trace changing values to earlier responses.
+
+        Args:
+            run1: First run record containing captured network requests.
+            run2: Second run record containing captured network requests.
+
+        Returns:
+            A tuple of dynamic correlation candidates and traced dependencies.
         """
         reqs1 = run1.get("network_requests", [])
         reqs2 = run2.get("network_requests", [])
@@ -85,8 +135,8 @@ class TrafficAnalystAgent:
         correlations = []
         dependencies = []
 
-        # Step 1: Align requests by matching index, method, URL path, and step_index
-        # (Assuming the sequential journey is executed identically)
+        # Prefer step-aware alignment so repeated endpoints map to the same UI
+        # phase. Fall back to method/path when step metadata is unavailable.
         aligned_pairs = []
         for r1 in reqs1:
             path1 = urlparse(r1["url"]).path
@@ -113,7 +163,8 @@ class TrafficAnalystAgent:
 
         logger.info(f"Aligned {len(aligned_pairs)} request pairs for differential analysis.")
 
-        # Step 2: Compare parameters, headers, bodies to find differences (dynamic candidates)
+        # Compare each aligned request surface independently so the eventual
+        # dependency records retain the exact injection location.
         dynamic_candidates = [] # list of dicts with details
 
         for r1, r2 in aligned_pairs:
@@ -185,6 +236,18 @@ class TrafficAnalystAgent:
             body1 = r1.get("post_data")
             body2 = r2.get("post_data")
             if body1 and body2:
+                # Normalize form-urlencoded strings into dicts when possible
+                from src.utils.http_body import content_type_from_headers, parse_post_data
+
+                if not isinstance(body1, (dict, list)):
+                    body1, _ = parse_post_data(
+                        body1, content_type_from_headers(r1.get("headers") or {})
+                    )
+                if not isinstance(body2, (dict, list)):
+                    body2, _ = parse_post_data(
+                        body2, content_type_from_headers(r2.get("headers") or {})
+                    )
+
                 if isinstance(body1, dict) and isinstance(body2, dict):
                     paths1 = self._get_json_paths(body1)
                     paths2 = self._get_json_paths(body2)
@@ -200,7 +263,7 @@ class TrafficAnalystAgent:
                                 "dynamic_name": self._generate_dynamic_name("body", path),
                                 "run1_value": val1,
                                 "run2_value": val2,
-                                "reason": "Post body JSON element changes between executions",
+                                "reason": "Post body field changes between executions",
                                 "step_index": r1.get("step_index", -1),
                                 "step_action": r1.get("step_action", "unknown")
                             })
@@ -231,7 +294,8 @@ class TrafficAnalystAgent:
                 correlations.append(candidate)
                 continue
 
-            # We search in previous responses of Run 1
+            # Search only preceding aligned responses: a value cannot originate
+            # from a response that occurs after its target request.
             found_origin = False
             for prev_r1, prev_r2 in aligned_pairs:
                 # Stop when we reach the current candidate request to ensure chronological origin
@@ -241,7 +305,11 @@ class TrafficAnalystAgent:
                 # A. Search Response Headers (Set-Cookie, Authorization, CSRF tokens, Locations, custom headers)
                 for h_key, h_val in prev_r1.get("response_headers", {}).items():
                     h_key_lower = h_key.lower()
-                    if h_key_lower not in ["set-cookie", "x-csrf-token", "csrf-token", "authorization", "location", "x-session-id", "token"]:
+                    if h_key_lower not in [
+                        "set-cookie", "x-csrf-token", "csrf-token", "authorization",
+                        "location", "x-session-id", "token", "x-xsrf-token",
+                        "x-auth-token", "x-access-token", "www-authenticate",
+                    ]:
                         continue
 
                     # For Set-Cookie, match individual cookie values
@@ -267,6 +335,7 @@ class TrafficAnalystAgent:
                                         "run1_value": val1,
                                         "run2_value": val2,
                                         "correlation_type": "response_extract",
+                                        "confidence": "high",
                                     })
                                     found_origin = True
                                     break
@@ -325,7 +394,8 @@ class TrafficAnalystAgent:
                                 found_origin = True
                                 break
                 except Exception:
-                    # Non-JSON or parsing error
+                    # HTML/text responses cannot provide JSON paths, so retain
+                    # a lower-confidence raw-body containment trace.
                     if val1 in resp_body1 and val2 in resp_body2:
                         dependencies.append({
                             "source_request": prev_r1["url"],
@@ -348,8 +418,9 @@ class TrafficAnalystAgent:
 
             correlations.append(candidate)
 
-        # Step 4: Same-value reuse across requests (first occurrence = extract, later = pass)
-        # Groups duplicates like session/guid appearing in multiple telemetry POSTs.
+        # Values reused across request inputs may have no captured response
+        # origin. Treat the earliest occurrence as a low-confidence source and
+        # later occurrences as passes, while avoiding already-traced targets.
         value_groups: Dict[tuple, List[Dict[str, Any]]] = {}
         for idx, candidate in enumerate(dynamic_candidates):
             group_key = (
@@ -396,6 +467,7 @@ class TrafficAnalystAgent:
                     "run1_value": val1,
                     "run2_value": val2,
                     "correlation_type": "shared_value",
+                    "confidence": "low",
                 })
                 traced_targets.add(dep_key)
 

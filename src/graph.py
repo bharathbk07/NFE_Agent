@@ -1,3 +1,5 @@
+"""Define and compile the LangGraph performance-analysis workflow."""
+
 import logging
 import re
 from typing import Dict, Any, List, Literal
@@ -18,6 +20,9 @@ from src.utils.validation import extract_inputs_from_message
 from src.utils.formatting import format_correlation_report, build_performance_test_output
 from src.utils.har_export import network_logs_to_har
 from src.utils.k6_generator import generate_k6_script
+from src.utils.load_test_ir import build_load_test_ir
+from src.utils.artifacts import save_k6_script, save_load_test_ir
+from src.utils.perf_test_classification import reconcile_analysis
 
 from config.observability import initialize_observability
 
@@ -25,8 +30,23 @@ initialize_observability()
 
 logger = logging.getLogger("AgentGraph")
 
+try:
+    from src.utils.model_router import get_model_router
+
+    logger.info("LLM auto-routing: %s", get_model_router().routing_summary())
+except Exception as _router_err:
+    logger.warning("LLM router not ready: %s", _router_err)
+
 
 def _has_prior_analysis(state: AgentState) -> bool:
+    """Check whether state contains reusable analysis context.
+
+    Args:
+        state: Current workflow state.
+
+    Returns:
+        ``True`` when prior captures or analysis outputs are present.
+    """
     return bool(
         state.get("performance_test_output")
         or state.get("dependencies")
@@ -38,11 +58,16 @@ def _has_prior_analysis(state: AgentState) -> bool:
 
 
 async def route_intent(state: AgentState) -> Dict[str, Any]:
-    """
-    Gatekeeper: classify the latest user message before invoking agents.
-    - conversation → chat reply
-    - analysis_qa → answer from prior results (no browser)
-    - performance_analysis / follow_up_analysis → full pipeline
+    """Classify the latest message and initialize routing state.
+
+    Args:
+        state: Current workflow state containing conversation messages.
+
+    Returns:
+        A partial state with intent, reset errors, and an optional chat reply.
+
+    Raises:
+        Exception: If intent classification fails.
     """
     logger.info("Node: route_intent starting...")
     has_prior = _has_prior_analysis(state)
@@ -62,6 +87,14 @@ async def route_intent(state: AgentState) -> Dict[str, Any]:
 def after_intent_router(
     state: AgentState,
 ) -> Literal["respond_conversation", "answer_analysis_question", "orchestrate_journey"]:
+    """Select the node that handles the classified intent.
+
+    Args:
+        state: State containing the intent set by :func:`route_intent`.
+
+    Returns:
+        The next LangGraph node name.
+    """
     intent = state.get("intent", "conversation")
     if intent == "analysis_qa":
         return "answer_analysis_question"
@@ -71,13 +104,30 @@ def after_intent_router(
 
 
 async def respond_conversation(state: AgentState) -> Dict[str, Any]:
-    """No-op terminal node for conversation; reply already added in route_intent."""
+    """Terminate a conversational request after its reply is prepared.
+
+    Args:
+        state: Current workflow state; it is not modified.
+
+    Returns:
+        An empty state update.
+    """
     logger.info("Node: respond_conversation (pipeline skipped).")
     return {}
 
 
 async def answer_analysis_question(state: AgentState) -> Dict[str, Any]:
-    """Answer follow-ups about prior analysis without re-running browser agents."""
+    """Answer a follow-up using existing analysis context.
+
+    Args:
+        state: State containing prior analysis and conversation messages.
+
+    Returns:
+        A partial state with an AI answer and any rebuilt transaction artifacts.
+
+    Raises:
+        Exception: If the analysis QA agent cannot produce an answer.
+    """
     logger.info("Node: answer_analysis_question (lightweight QA only).")
     question = get_latest_human_text(state.get("messages"))
     qa = AnalysisQAAgent()
@@ -99,6 +149,11 @@ async def answer_analysis_question(state: AgentState) -> Dict[str, Any]:
             perf = dict(state.get("performance_test_output") or {})
             artifacts = dict(perf.get("artifacts") or {})
             artifacts["k6_script"] = rebuilt["k6_script"]
+            if rebuilt.get("k6_file"):
+                artifacts["k6_file"] = rebuilt["k6_file"]
+            if rebuilt.get("load_test_ir"):
+                artifacts["load_test_ir"] = rebuilt["load_test_ir"]
+                perf["load_test_ir"] = rebuilt["load_test_ir"]
             perf["artifacts"] = artifacts
             perf["transactions"] = rebuilt["transactions"]
             updates["performance_test_output"] = perf
@@ -112,7 +167,18 @@ async def answer_analysis_question(state: AgentState) -> Dict[str, Any]:
 
 
 async def orchestrate_journey(state: AgentState) -> Dict[str, Any]:
-    """Decomposes the user journey into sub-tasks for specialized sub-agents."""
+    """Extract journey inputs and decompose them into navigator tasks.
+
+    Args:
+        state: State containing the user request and optional reusable inputs.
+
+    Returns:
+        A partial state with target data and subtasks, or an error response when
+        no target URL is available.
+
+    Raises:
+        Exception: If input extraction or orchestration fails.
+    """
     logger.info("Node: orchestrate_journey starting...")
 
     allow_reuse = state.get("intent") == "follow_up_analysis"
@@ -154,7 +220,18 @@ async def orchestrate_journey(state: AgentState) -> Dict[str, Any]:
 
 
 async def plan_navigator_steps(state: AgentState) -> Dict[str, Any]:
-    """Distributes sub-tasks to NavigatorAgent sub-agents and merges Playwright steps."""
+    """Plan and merge Playwright steps for all journey subtasks.
+
+    Args:
+        state: State containing the target, credentials, and subtasks.
+
+    Returns:
+        A partial state whose ``user_journey_steps`` value is a list of step
+        dictionaries, or an empty update when prior errors exist.
+
+    Raises:
+        Exception: If navigator planning fails.
+    """
     logger.info("Node: plan_navigator_steps starting...")
 
     if state.get("error_log"):
@@ -197,7 +274,14 @@ async def plan_navigator_steps(state: AgentState) -> Dict[str, Any]:
 
 
 async def run_automation(state: AgentState) -> Dict[str, Any]:
-    """Runs the Playwright journeys (Run 1 and Run 2) to capture clean traffic."""
+    """Capture two independent executions of the planned journey.
+
+    Args:
+        state: State containing the target URL and planned browser steps.
+
+    Returns:
+        A partial state with run-record dictionaries and accumulated error strings.
+    """
     import asyncio
 
     logger.info("Node: run_automation starting...")
@@ -215,6 +299,14 @@ async def run_automation(state: AgentState) -> Dict[str, Any]:
     from src.utils.model_router import allow_blocking_io
 
     def _execute_run(capture_storage: bool):
+        """Execute one synchronous capture in a worker thread.
+
+        Args:
+            capture_storage: Whether to create a fresh browser context.
+
+        Returns:
+            Recorder output containing network, timeline, cookie, and storage data.
+        """
         # Playwright + optional self-heal LLM use sync I/O; allow under blockbuster.
         with allow_blocking_io():
             return recorder.execute_journey(url, steps, capture_storage)
@@ -260,11 +352,25 @@ async def run_automation(state: AgentState) -> Dict[str, Any]:
 
 
 async def analyse_traffic(state: AgentState) -> Dict[str, Any]:
-    """Runs sub-agents to identify correlations and parameterization for performance testing."""
+    """Analyze captures and generate performance-test artifacts.
+
+    Args:
+        state: State containing at least two browser run records.
+
+    Returns:
+        A partial state with correlations, dependencies, parameters, transactions,
+        artifacts, and a summary message. Returns only an error message when fewer
+        than two captures are available.
+
+    Raises:
+        Exception: If core traffic analysis or artifact generation fails.
+    """
+    import asyncio
+
     logger.info("Node: analyse_traffic starting...")
 
-    error_log = state.get("error_log", [])
-    records = state.get("run_records", [])
+    error_log = list(state.get("error_log", []))
+    records = list(state.get("run_records", []) or [])
 
     if len(records) < 2:
         error_summary = "\n- ".join(error_log) if error_log else "Unknown automation error."
@@ -279,18 +385,149 @@ Please verify the user journey steps or selectors. If credentials are required, 
 """
         return {"messages": [AIMessage(content=error_msg)]}
 
-    run1 = {"network_requests": records[0]["network_requests"]}
-    run2 = {"network_requests": records[1]["network_requests"]}
     user_steps = state.get("user_journey_steps", [])
     sub_tasks = state.get("sub_tasks", [])
+    credentials = state.get("credentials", {}) or {}
 
-    analyst = TrafficAnalystAgent()
-    correlations, dependencies = analyst.analyze_runs(run1, run2)
-
-    param_agent = ParameterAgent()
-    parameterizable_candidates = param_agent.analyze(
-        user_steps, run1["network_requests"], state.get("credentials", {})
+    from src.agents.correlation_classifier_agent import (
+        CorrelationClassifierAgent,
+        apply_correlation_advice,
     )
+    from src.utils.model_router import allow_blocking_io
+
+    def _analyze_pair(run_a: Dict[str, Any], run_b: Dict[str, Any]):
+        """Analyze and reconcile a pair of capture records.
+
+        Args:
+            run_a: First capture record.
+            run_b: Independent comparison capture record.
+
+        Returns:
+            A tuple of parameter candidates, correlations, and dependencies.
+        """
+        analyst = TrafficAnalystAgent()
+        corrs, deps = analyst.analyze_runs(
+            {"network_requests": run_a.get("network_requests") or []},
+            {"network_requests": run_b.get("network_requests") or []},
+        )
+        param_agent = ParameterAgent()
+        params = param_agent.analyze(
+            user_steps, run_a.get("network_requests") or [], credentials
+        )
+        params, corrs, deps = reconcile_analysis(
+            user_steps=user_steps,
+            parameterizable_candidates=params,
+            correlations=corrs,
+            dependencies=deps,
+            run1_requests=run_a.get("network_requests") or [],
+            run2_requests=run_b.get("network_requests") or [],
+            credentials=credentials,
+        )
+        return params, corrs, deps
+
+    run1 = records[0]
+    run2 = records[1]
+    parameterizable_candidates, correlations, dependencies = _analyze_pair(run1, run2)
+
+    classifier = CorrelationClassifierAgent()
+    advice = await classifier.classify(
+        target_url=state["target_url"],
+        user_steps=user_steps,
+        credentials=credentials,
+        run1=run1,
+        run2=run2,
+        parameterizable_candidates=parameterizable_candidates,
+        correlations=correlations,
+        dependencies=dependencies,
+        sub_tasks=sub_tasks,
+    )
+    parameterizable_candidates, correlations, dependencies = apply_correlation_advice(
+        advice=advice,
+        user_steps=user_steps,
+        parameterizable_candidates=parameterizable_candidates,
+        correlations=correlations,
+        dependencies=dependencies,
+    )
+
+    extra_run_note = ""
+    if advice.needs_extra_run and len(records) < 3:
+        reason = advice.extra_run_reason or "LLM requested another capture to confirm correlations"
+        logger.info("Executing RUN 3 (extra correlation probe): %s", reason)
+        extra_run_note = f"**Extra run performed:** {reason}"
+        try:
+            recorder = PlaywrightBrowserRecorder(debug_mode=False)
+            url = state["target_url"]
+            steps = user_steps
+
+            def _execute_run():
+                """Execute the optional third capture with blocking I/O allowed.
+
+                Returns:
+                    Recorder output containing network, timeline, cookie, and
+                    storage data.
+                """
+                with allow_blocking_io():
+                    return recorder.execute_journey(url, steps, True)
+
+            run3_data = await asyncio.to_thread(_execute_run)
+            records.append(
+                {
+                    "run_id": 3,
+                    "network_requests": run3_data.get("network_requests") or [],
+                    "step_timeline": run3_data.get("step_timeline") or [],
+                    "cookies": run3_data.get("cookies") or [],
+                    "local_storage": run3_data.get("local_storage") or {},
+                    "session_storage": run3_data.get("session_storage") or {},
+                    "screenshot_paths": [],
+                }
+            )
+            if run3_data.get("error"):
+                error_log.append(f"Run 3 incomplete: {run3_data['error']}")
+
+            # Re-diff Run 1 vs Run 3 (fresh independent session) then re-classify once
+            run3 = records[-1]
+            parameterizable_candidates, correlations, dependencies = _analyze_pair(
+                run1, run3
+            )
+            advice = await classifier.classify(
+                target_url=state["target_url"],
+                user_steps=user_steps,
+                credentials=credentials,
+                run1=run1,
+                run2=run3,
+                parameterizable_candidates=parameterizable_candidates,
+                correlations=correlations,
+                dependencies=dependencies,
+                sub_tasks=sub_tasks,
+            )
+            # Force no further runs
+            advice.needs_extra_run = False
+            parameterizable_candidates, correlations, dependencies = (
+                apply_correlation_advice(
+                    advice=advice,
+                    user_steps=user_steps,
+                    parameterizable_candidates=parameterizable_candidates,
+                    correlations=correlations,
+                    dependencies=dependencies,
+                )
+            )
+        except Exception as e:
+            logger.warning("Extra correlation run failed: %s", e)
+            error_log.append(f"Run 3 failed: {e}")
+            extra_run_note = (
+                f"**Extra run requested but failed:** {e}. "
+                "Cookie / correlation notes below still apply."
+            )
+    elif advice.needs_extra_run:
+        extra_run_note = (
+            f"**Extra run suggested:** {advice.extra_run_reason or 're-run to confirm'} "
+            "(already have 3 captures — using existing evidence)."
+        )
+
+    cookie_notes = [
+        n.model_dump() if hasattr(n, "model_dump") else n
+        for n in (advice.cookie_notes or [])
+    ]
 
     txn_agent = TransactionAgent()
     try:
@@ -298,7 +535,7 @@ Please verify the user journey steps or selectors. If credentials are required, 
             target_url=state["target_url"],
             user_steps=user_steps,
             sub_tasks=sub_tasks,
-            network_requests=run1["network_requests"],
+            network_requests=run1.get("network_requests") or [],
         )
     except Exception as txn_err:
         logger.warning(
@@ -306,16 +543,36 @@ Please verify the user journey steps or selectors. If credentials are required, 
             txn_err,
         )
         transactions = txn_agent._heuristic_group(
-            run1["network_requests"], user_steps, sub_tasks
+            run1.get("network_requests") or [], user_steps, sub_tasks
         )
 
-    har = network_logs_to_har(run1["network_requests"])
+    har = network_logs_to_har(run1.get("network_requests") or [])
+    load_test_ir = build_load_test_ir(
+        target_url=state["target_url"],
+        parameterizable_candidates=parameterizable_candidates,
+        dependencies=dependencies,
+        transactions=transactions,
+        network_requests=run1.get("network_requests") or [],
+    )
+    # Attach cookie advice into IR for emitters / QA
+    load_test_ir["cookie_notes"] = cookie_notes
+    load_test_ir["correlation_advice_summary"] = advice.summary
+
     k6_script = generate_k6_script(
         target_url=state["target_url"],
         parameterizable_candidates=parameterizable_candidates,
         dependencies=dependencies,
         transactions=transactions,
+        network_requests=run1.get("network_requests") or [],
+        ir=load_test_ir,
     )
+
+    k6_file: Dict[str, str] = {}
+    try:
+        k6_file = save_k6_script(k6_script, target_url=state["target_url"])
+        save_load_test_ir(load_test_ir, target_url=state["target_url"])
+    except Exception as art_err:
+        logger.warning("Failed to write k6 artifact file: %s", art_err)
 
     perf_output = build_performance_test_output(
         target_url=state["target_url"],
@@ -327,27 +584,40 @@ Please verify the user journey steps or selectors. If credentials are required, 
         transactions=transactions,
         har=har,
         k6_script=k6_script,
+        load_test_ir=load_test_ir,
+        k6_file=k6_file,
     )
+    perf_output["cookie_correlation_notes"] = cookie_notes
+    if advice.summary:
+        perf_output["correlation_advice_summary"] = advice.summary
 
     summary_markdown = format_correlation_report(
         user_steps=user_steps,
-        run1_requests=run1["network_requests"],
+        run1_requests=run1.get("network_requests") or [],
         dependencies=dependencies,
         parameterizable_candidates=parameterizable_candidates,
         correlations=correlations,
         sub_tasks=sub_tasks,
         transactions=transactions,
         k6_script=k6_script,
+        k6_file=k6_file,
         include_transactions=False,
         include_k6=False,
+        cookie_notes=cookie_notes,
+        correlation_advice_summary=advice.summary or "",
+        extra_run_note=extra_run_note,
     )
 
     return {
+        "run_records": records,
         "correlations": correlations,
         "dependencies": dependencies,
         "parameterizable_candidates": parameterizable_candidates,
         "transactions": transactions,
         "performance_test_output": perf_output,
+        "correlation_advice": advice.model_dump(),
+        "cookie_correlation_notes": cookie_notes,
+        "error_log": error_log,
         "messages": [AIMessage(content=summary_markdown)],
     }
 
@@ -355,11 +625,20 @@ Please verify the user journey steps or selectors. If credentials are required, 
 def after_orchestrate(
     state: AgentState,
 ) -> Literal["plan_navigator_steps", "__end__"]:
+    """Route successful orchestration to planning or terminate on errors.
+
+    Args:
+        state: State containing orchestration errors, if any.
+
+    Returns:
+        The navigator node name or LangGraph's terminal marker.
+    """
     if state.get("error_log"):
         return "__end__"
     return "plan_navigator_steps"
 
 
+# Node updates merge into AgentState; conditional edges choose lightweight or full flow.
 workflow = StateGraph(AgentState)
 
 workflow.add_node("route_intent", route_intent)

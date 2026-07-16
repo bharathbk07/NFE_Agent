@@ -1,15 +1,4 @@
-"""
-Project MCP registry — single place to load servers defined in config/mcp_servers.json.
-
-Usage:
-    from src.tools.mcp_client import get_mcp_tools, list_mcp_servers
-
-    # Discover what's configured
-    print(list_mcp_servers())
-
-    # Load LangChain tools from enabled servers (requires langchain-mcp-adapters)
-    tools = await get_mcp_tools()
-"""
+"""Load and adapt project MCP server configuration for LangChain clients."""
 from __future__ import annotations
 
 import json
@@ -28,10 +17,25 @@ _ENV_PATTERN = re.compile(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _interpolate(value: Any) -> Any:
-    """Resolve ${env:VAR} placeholders in strings / nested structures."""
+    """Resolve environment placeholders recursively.
+
+    Args:
+        value: A scalar, list, or dictionary that may contain ``${env:VAR}``.
+
+    Returns:
+        A value of the same shape with string placeholders expanded.
+    """
     if isinstance(value, str):
 
         def repl(match: re.Match[str]) -> str:
+            """Replace one environment placeholder with its current value.
+
+            Args:
+                match: Regular-expression match containing the variable name.
+
+            Returns:
+                The environment value, or an empty string when unset.
+            """
             return os.getenv(match.group(1), "")
 
         return _ENV_PATTERN.sub(repl, value)
@@ -43,6 +47,11 @@ def _interpolate(value: Any) -> Any:
 
 
 def mcp_config_path() -> Path:
+    """Resolve the MCP registry path.
+
+    Returns:
+        The absolute configured path, or the project default path.
+    """
     override = os.getenv("MCP_SERVERS_CONFIG", "").strip()
     if override:
         return Path(override).expanduser().resolve()
@@ -50,7 +59,19 @@ def mcp_config_path() -> Path:
 
 
 def load_mcp_config(path: Optional[Path] = None) -> Dict[str, Any]:
-    """Load the project MCP servers JSON (raw, before filtering)."""
+    """Load the unfiltered MCP server registry.
+
+    Args:
+        path: Optional registry path; defaults to :func:`mcp_config_path`.
+
+    Returns:
+        The decoded JSON object, or an empty ``mcpServers`` mapping if absent.
+
+    Raises:
+        json.JSONDecodeError: If the file is not valid JSON.
+        OSError: If an existing file cannot be read.
+        ValueError: If the JSON root is not an object.
+    """
     cfg_path = path or mcp_config_path()
     if not cfg_path.exists():
         logger.warning("MCP config not found at %s", cfg_path)
@@ -63,7 +84,14 @@ def load_mcp_config(path: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def list_mcp_servers(*, enabled_only: bool = False) -> List[Dict[str, Any]]:
-    """Return a summary of configured MCP servers for logging / diagnostics."""
+    """Summarize configured MCP servers.
+
+    Args:
+        enabled_only: Whether to omit disabled servers.
+
+    Returns:
+        Dictionaries containing name, enabled state, transport, and description.
+    """
     servers = load_mcp_config().get("mcpServers") or {}
     out: List[Dict[str, Any]] = []
     for name, raw in servers.items():
@@ -89,10 +117,15 @@ def get_mcp_connections(
     enabled_only: bool = True,
     server_names: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    Build the connections dict expected by MultiServerMCPClient.
+    """Build connections accepted by ``MultiServerMCPClient``.
 
-    Skips project-only keys like `enabled` / `description`.
+    Args:
+        enabled_only: Whether to omit disabled servers.
+        server_names: Optional allowlist of server names.
+
+    Returns:
+        A server-name mapping with environment values expanded and project-only
+        metadata removed.
     """
     servers = load_mcp_config().get("mcpServers") or {}
     allow = set(server_names) if server_names else None
@@ -110,7 +143,7 @@ def get_mcp_connections(
         entry.pop("enabled", None)
         entry.pop("description", None)
 
-        # Infer transport if omitted
+        # MCP adapters require a transport even when the registry omits it.
         if "transport" not in entry:
             if entry.get("command"):
                 entry["transport"] = "stdio"
@@ -132,10 +165,18 @@ async def get_mcp_client(
     server_names: Optional[List[str]] = None,
     tool_name_prefix: bool = True,
 ):
-    """
-    Create a MultiServerMCPClient from config/mcp_servers.json.
+    """Create a configured multi-server MCP client.
 
-    Returns None when no servers are enabled / configured.
+    Args:
+        enabled_only: Whether to omit disabled servers.
+        server_names: Optional allowlist of server names.
+        tool_name_prefix: Whether tool names include their server prefix.
+
+    Returns:
+        A ``MultiServerMCPClient``, or ``None`` when no connections remain.
+
+    Raises:
+        ImportError: If ``langchain-mcp-adapters`` is unavailable.
     """
     connections = get_mcp_connections(
         enabled_only=enabled_only, server_names=server_names
@@ -169,7 +210,19 @@ async def get_mcp_tools(
     server_names: Optional[List[str]] = None,
     tool_name_prefix: bool = True,
 ) -> List[Any]:
-    """Load LangChain tools from all enabled (or named) MCP servers."""
+    """Load LangChain tools from configured MCP servers.
+
+    Args:
+        enabled_only: Whether to omit disabled servers.
+        server_names: Optional allowlist of server names.
+        tool_name_prefix: Whether tool names include their server prefix.
+
+    Returns:
+        A list of LangChain tools; empty when setup or discovery fails.
+
+    Raises:
+        ImportError: If connections exist but the MCP adapter is unavailable.
+    """
     client = await get_mcp_client(
         enabled_only=enabled_only,
         server_names=server_names,

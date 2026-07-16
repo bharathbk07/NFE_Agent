@@ -1,4 +1,4 @@
-"""Build a HAR 1.2-compatible dict from captured network logs (CDP / Playwright)."""
+"""Convert CDP or Playwright network captures into HAR 1.2 documents."""
 from __future__ import annotations
 
 import json
@@ -9,10 +9,27 @@ from urllib.parse import parse_qsl, urlparse
 
 
 def _headers_list(headers: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Convert a header mapping to HAR name/value objects.
+
+    Args:
+        headers: Header names mapped to arbitrary scalar values.
+
+    Returns:
+        List of ``{"name": str, "value": str}`` dictionaries.
+    """
     return [{"name": str(k), "value": str(v)} for k, v in (headers or {}).items()]
 
 
 def _query_string(url: str) -> List[Dict[str, str]]:
+    """Parse URL query parameters into HAR name/value objects.
+
+    Args:
+        url: URL whose query string should be parsed.
+
+    Returns:
+        Ordered list of query parameter dictionaries, or an empty list when
+        parsing fails.
+    """
     try:
         return [{"name": k, "value": v} for k, v in parse_qsl(urlparse(url).query, keep_blank_values=True)]
     except Exception:
@@ -20,6 +37,15 @@ def _query_string(url: str) -> List[Dict[str, str]]:
 
 
 def _post_data_block(post_data: Any) -> Dict[str, Any] | None:
+    """Create a bounded HAR ``postData`` block.
+
+    Args:
+        post_data: Request body as JSON-compatible data or text.
+
+    Returns:
+        HAR body mapping with MIME type and at most 200,000 text characters,
+        or ``None`` for an empty body.
+    """
     if post_data is None or post_data == "":
         return None
     if isinstance(post_data, (dict, list)):
@@ -37,9 +63,17 @@ def network_logs_to_har(
     creator_name: str = "nfe-agent",
     creator_version: str = "1.0",
 ) -> Dict[str, Any]:
-    """
-    Convert recorder network_requests into a HAR 1.2 document.
-    Useful for JMeter/BlazeMeter import and offline DevTools analysis.
+    """Convert recorder requests into a HAR 1.2 document.
+
+    Args:
+        network_requests: Captured request dictionaries with request and
+            optional response metadata.
+        creator_name: Name placed in the HAR creator block.
+        creator_version: Version placed in the HAR creator block.
+
+    Returns:
+        HAR mapping shaped as ``{"log": {"version", "creator", "pages",
+        "entries"}}`` for import or offline analysis.
     """
     entries = []
     for req in network_requests:

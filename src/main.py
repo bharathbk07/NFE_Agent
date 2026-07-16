@@ -1,3 +1,5 @@
+"""Run the browser-flow analyzer from Python or a JSON configuration file."""
+
 import os
 import sys
 import json
@@ -21,6 +23,22 @@ def run_analyzer(
     journey_description: str,
     output_filepath: str = "correlation_metadata.json"
 ):
+    """Analyze two captures of a browser journey and persist correlations.
+
+    Args:
+        url: Initial HTTP(S) URL for the journey.
+        credentials: Values available to the navigator when planning steps.
+        journey_description: Natural-language actions to automate.
+        output_filepath: Destination JSON report path.
+
+    Returns:
+        A report dictionary containing journey steps, correlations, dependencies,
+        and per-run capture counts.
+
+    Raises:
+        OSError: If the report cannot be written.
+        Exception: If planning, browser automation, or traffic analysis fails.
+    """
     initialize_observability()
     
     logger.info("Initializing Agent 1: Navigator...")
