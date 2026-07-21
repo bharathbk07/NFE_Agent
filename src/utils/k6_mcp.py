@@ -1,7 +1,8 @@
-"""Call Grafana k6 MCP tools from the NFE bot (validate / run).
+"""Optional Grafana k6 MCP helpers (validate / run).
 
-Configured in ``config/mcp_servers.json`` (``k6 x mcp``). Smoke/heal prefers
-MCP when it responds quickly, otherwise falls back to CLI ``k6 run``.
+Smoke/heal in the analysis pipeline uses CLI ``k6 run`` (needed for
+``--out json`` + HTML report). MCP is opt-in via ``NFE_K6_MCP=mcp`` and is
+disabled after the first BrokenResourceError / TaskGroup failure.
 
 See https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/
 """
@@ -17,7 +18,6 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Total budget for MCP validate+run before CLI fallback (seconds).
 _MCP_BUDGET_S = float(os.getenv("NFE_K6_MCP_TIMEOUT", "8"))
 _mcp_disabled_this_process = False
 
@@ -60,28 +60,34 @@ def _normalize_tool_result(raw: Any) -> str:
     return str(raw)
 
 
-def _mcp_enabled_in_config() -> bool:
-    """Return True when the k6 server is enabled in the project MCP registry."""
-    try:
-        from src.tools.mcp_client import list_mcp_servers
+def _disable_mcp(reason: str) -> None:
+    """Stop further MCP attempts for this process (stdio often stays broken)."""
+    global _mcp_disabled_this_process
+    _mcp_disabled_this_process = True
+    logger.warning("k6 MCP disabled for this process: %s", reason)
 
-        return any(
-            s.get("name") == "k6" and s.get("enabled")
-            for s in list_mcp_servers(enabled_only=False)
-        )
-    except Exception:
-        return False
+
+def _is_stdio_breakage(exc: BaseException) -> bool:
+    """Return True for MCP stdio teardown / TaskGroup failures."""
+    name = type(exc).__name__
+    if name in ("BrokenResourceError", "ExceptionGroup", "BaseExceptionGroup"):
+        return True
+    text = str(exc).lower()
+    return (
+        "brokenresource" in text
+        or "taskgroup" in text
+        or "unhandled errors in a taskgroup" in text
+    )
 
 
 def _want_mcp() -> bool:
-    """Whether to attempt k6 MCP (env can force off)."""
-    flag = (os.getenv("NFE_K6_MCP") or "auto").strip().lower()
-    if flag in ("0", "false", "no", "off", "cli"):
-        return False
-    if flag in ("1", "true", "yes", "on", "mcp"):
-        return True
-    # auto
-    return _mcp_enabled_in_config()
+    """Whether to attempt k6 MCP (opt-in only).
+
+    Default / ``cli`` / ``auto`` → False. Set ``NFE_K6_MCP=mcp`` (or ``1``)
+    to try MCP before CLI.
+    """
+    flag = (os.getenv("NFE_K6_MCP") or "cli").strip().lower()
+    return flag in ("1", "true", "yes", "on", "mcp")
 
 
 async def load_k6_mcp_tools() -> List[Any]:
@@ -93,8 +99,7 @@ async def load_k6_mcp_tools() -> List[Any]:
     try:
         from src.tools.mcp_client import get_mcp_tools
     except Exception as exc:
-        logger.warning("MCP client unavailable: %s", exc)
-        _mcp_disabled_this_process = True
+        _disable_mcp(f"client unavailable ({exc})")
         return []
 
     try:
@@ -103,16 +108,16 @@ async def load_k6_mcp_tools() -> List[Any]:
             timeout=min(6.0, _MCP_BUDGET_S),
         )
     except asyncio.TimeoutError:
-        logger.warning("k6 MCP tool discovery timed out; CLI for this process")
-        _mcp_disabled_this_process = True
+        _disable_mcp("tool discovery timed out")
         return []
-    except Exception as exc:
-        logger.warning("Failed to load k6 MCP tools: %s", exc)
-        _mcp_disabled_this_process = True
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        _disable_mcp(f"tool discovery failed ({type(exc).__name__}: {exc})")
         return []
 
     if not tools:
-        _mcp_disabled_this_process = True
+        _disable_mcp("no tools returned")
         return []
 
     logger.info(
@@ -120,6 +125,26 @@ async def load_k6_mcp_tools() -> List[Any]:
         ", ".join(_tool_name(t) for t in tools) or "(none)",
     )
     return tools
+
+
+async def _ainvoke_script(tool: Any, script_text: str, *, timeout: float) -> Any:
+    """Invoke an MCP tool with ``script`` only; swallow stdio breakages."""
+    try:
+        return await asyncio.wait_for(
+            tool.ainvoke({"script": script_text}),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        _disable_mcp(f"ainvoke timed out after {timeout:.0f}s")
+        raise
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if _is_stdio_breakage(exc):
+            _disable_mcp(f"stdio broken ({type(exc).__name__})")
+            return None
+        _disable_mcp(f"ainvoke failed ({type(exc).__name__}: {exc})")
+        return None
 
 
 async def mcp_validate_script(
@@ -146,50 +171,43 @@ async def mcp_validate_script(
         return None
 
     script_text = path.read_text(encoding="utf-8")
-    attempts = [
-        {"script": script_text},
-        {"content": script_text},
-        {"code": script_text},
-        {"path": str(path.resolve())},
-        {"file": str(path.resolve())},
-    ]
-    last_err = ""
-    for args in attempts:
-        try:
-            raw = await asyncio.wait_for(tool.ainvoke(args), timeout=10.0)
-            text = _normalize_tool_result(raw)
-            lower = text.lower()
-            ok = True
-            if isinstance(raw, dict) and "ok" in raw:
-                ok = bool(raw["ok"])
-            elif any(
-                tok in lower
-                for tok in (
-                    "syntaxerror",
-                    "invalid script",
-                    "validation failed",
-                    "parse error",
-                )
-            ):
-                ok = False
-            elif "error" in lower and "valid" not in lower:
-                ok = False
-            return {
-                "ok": ok,
-                "via": "mcp-validate",
-                "stdout": text[-8000:],
-                "stderr": "" if ok else text[-4000:],
-                "summary": "validated" if ok else "validate failed",
-                "failed_checks": [],
-                "failed_urls": [],
-                "exit_code": 0 if ok else 1,
-                "skipped": False,
-            }
-        except Exception as exc:
-            last_err = str(exc)
-            continue
-    logger.warning("k6 MCP validate_script failed: %s", last_err)
-    return None
+    try:
+        raw = await _ainvoke_script(tool, script_text, timeout=10.0)
+    except asyncio.TimeoutError:
+        return None
+    if raw is None:
+        return None
+
+    text = _normalize_tool_result(raw)
+    lower = text.lower()
+    ok = True
+    if isinstance(raw, dict) and "ok" in raw:
+        ok = bool(raw["ok"])
+    elif isinstance(raw, dict) and "valid" in raw:
+        ok = bool(raw["valid"])
+    elif any(
+        tok in lower
+        for tok in (
+            "syntaxerror",
+            "invalid script",
+            "validation failed",
+            "parse error",
+        )
+    ):
+        ok = False
+    elif "error" in lower and "valid" not in lower:
+        ok = False
+    return {
+        "ok": ok,
+        "via": "mcp-validate",
+        "stdout": text[-8000:],
+        "stderr": "" if ok else text[-4000:],
+        "summary": "validated" if ok else "validate failed",
+        "failed_checks": [],
+        "failed_urls": [],
+        "exit_code": 0 if ok else 1,
+        "skipped": False,
+    }
 
 
 def _nonzero_exit(text: str) -> bool:
@@ -206,7 +224,7 @@ def _nonzero_exit(text: str) -> bool:
 async def mcp_run_script(
     script_path: str, tools: Optional[List[Any]] = None
 ) -> Optional[Dict[str, Any]]:
-    """Run a k6 script via MCP when available."""
+    """Run a k6 script via MCP when available (no HTML points export)."""
     path = Path(script_path)
     if not path.is_file():
         return {
@@ -226,98 +244,76 @@ async def mcp_run_script(
     if tool is None:
         return None
 
+    from src.utils.k6_html_report import find_html_report, report_paths_for_script
     from src.utils.k6_runner import _parse_failed_checks, _parse_failed_urls
 
+    report_paths = report_paths_for_script(path)
+    os.environ["NFE_K6_HTML_REPORT"] = report_paths["html"]
+    os.environ["NFE_K6_SUMMARY_JSON"] = report_paths["json"]
+
     script_text = path.read_text(encoding="utf-8")
-    attempts = [
-        {"script": script_text},
-        {"content": script_text},
-        {"code": script_text},
-        {"path": str(path.resolve())},
-        {"file": str(path.resolve())},
-        {"script_path": str(path.resolve())},
-    ]
-    last_err = ""
-    for args in attempts:
-        try:
-            raw = await asyncio.wait_for(tool.ainvoke(args), timeout=90.0)
-            text = _normalize_tool_result(raw)
-            failed_checks = _parse_failed_checks(text)
-            failed_urls = _parse_failed_urls(text)
-            lower = text.lower()
-            ok = True
-            if isinstance(raw, dict) and "ok" in raw:
-                ok = bool(raw["ok"])
-            elif _nonzero_exit(text):
-                ok = False
-            elif failed_checks:
-                ok = False
-            elif "threshold" in lower and "crossed" in lower:
-                ok = False
-            return {
-                "ok": ok,
-                "via": "mcp-run",
-                "stdout": text[-8000:],
-                "stderr": "" if ok else text[-4000:],
-                "summary": "passed" if ok else "failed (mcp run)",
-                "failed_checks": failed_checks[:40],
-                "failed_urls": failed_urls[:40],
-                "exit_code": 0 if ok else 1,
-                "skipped": False,
-            }
-        except Exception as exc:
-            last_err = str(exc)
-            continue
-    logger.warning("k6 MCP run_script failed: %s", last_err)
-    return None
-
-
-async def _mcp_smoke_path(script_path: str) -> Optional[Dict[str, Any]]:
-    """Full MCP validate→run path; returns None to trigger CLI fallback."""
-    tools = await load_k6_mcp_tools()
-    if not tools:
+    try:
+        raw = await _ainvoke_script(tool, script_text, timeout=90.0)
+    except asyncio.TimeoutError:
+        return None
+    if raw is None:
         return None
 
-    validated = await mcp_validate_script(script_path, tools=tools)
-    if validated is not None and not validated.get("ok"):
-        return validated
-
-    mcp_run = await mcp_run_script(script_path, tools=tools)
-    if mcp_run is None:
-        return None
-    if validated and validated.get("ok"):
-        mcp_run["validated_via"] = "mcp"
-    return mcp_run
+    text = _normalize_tool_result(raw)
+    failed_checks = _parse_failed_checks(text)
+    failed_urls = _parse_failed_urls(text)
+    lower = text.lower()
+    ok = True
+    if isinstance(raw, dict):
+        if "ok" in raw:
+            ok = bool(raw["ok"])
+        elif "success" in raw:
+            ok = bool(raw["success"])
+        elif "exit_code" in raw:
+            try:
+                ok = int(raw["exit_code"]) == 0
+            except (TypeError, ValueError):
+                pass
+    if ok and _nonzero_exit(text):
+        ok = False
+    if ok and failed_checks:
+        ok = False
+    if ok and "threshold" in lower and "crossed" in lower:
+        ok = False
+    html_report = find_html_report(path) or ""
+    summary_json = (
+        report_paths["json"] if Path(report_paths["json"]).is_file() else ""
+    )
+    return {
+        "ok": ok,
+        "via": "mcp-run",
+        "stdout": text[-8000:],
+        "stderr": "" if ok else text[-4000:],
+        "summary": "passed" if ok else "failed (mcp run)",
+        "failed_checks": failed_checks[:40],
+        "failed_urls": failed_urls[:40],
+        "exit_code": 0 if ok else 1,
+        "skipped": False,
+        "html_report": html_report,
+        "summary_json": summary_json,
+    }
 
 
 async def run_k6_smoke_preferred(script_path: str, **kwargs: Any) -> Dict[str, Any]:
-    """Validate + run via k6 MCP when possible; else CLI ``k6 run``.
+    """Run smoke via CLI ``k6 run`` only (HTML report + JSON points).
+
+    MCP is not used on this path: it cannot emit ``--out json`` points for
+    TXN/request tables and frequently crashes the stdio session.
 
     Args:
         script_path: Path to the generated ``.js`` script.
-        **kwargs: Forwarded to :func:`run_k6_smoke` on CLI fallback.
+        **kwargs: Forwarded to :func:`run_k6_smoke`.
 
     Returns:
-        Smoke result dictionary (same shape as CLI runner).
+        Smoke result dictionary with ``via=cli``.
     """
     from src.utils.k6_runner import run_k6_smoke
 
-    if _want_mcp():
-        try:
-            mcp_result = await asyncio.wait_for(
-                _mcp_smoke_path(script_path),
-                timeout=_MCP_BUDGET_S,
-            )
-            if mcp_result is not None:
-                return mcp_result
-        except asyncio.TimeoutError:
-            logger.warning(
-                "k6 MCP smoke path exceeded %.0fs; falling back to CLI",
-                _MCP_BUDGET_S,
-            )
-        except Exception as exc:
-            logger.warning("k6 MCP smoke path error (%s); CLI fallback", exc)
-
     result = run_k6_smoke(script_path, **kwargs)
-    result["via"] = result.get("via") or "cli"
+    result["via"] = "cli"
     return result

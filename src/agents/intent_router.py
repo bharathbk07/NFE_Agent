@@ -22,6 +22,7 @@ IntentName = Literal[
     "performance_analysis",
     "follow_up_analysis",
     "watch_me",
+    "reuse_recording",
 ]
 
 WATCH_ME_KEYWORDS = re.compile(
@@ -33,6 +34,22 @@ WATCH_ME_KEYWORDS = re.compile(
     r"record\s+my\s+(clicks|actions|flow)|"
     r"i\s+will\s+(drive|navigate)|"
     r"open\s+(a\s+)?browser\s+(and\s+)?(i|let\s+me)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+REUSE_RECORDING_KEYWORDS = re.compile(
+    r"\b("
+    r"reuse\s+(the\s+)?((last|saved|previous)\s+)?recording|"
+    r"analyse?\s+saved\s+recording|"
+    r"analyze\s+saved\s+recording|"
+    r"load\s+(the\s+)?(saved\s+)?recording|"
+    r"use\s+(the\s+)?(last|saved|previous)\s+recording|"
+    r"from\s+saved\s+recording|"
+    r"list\s+recordings|"
+    r"saved\s+recordings|"
+    r"rerun\s+(from\s+)?(saved\s+)?recording|"
+    r"replay\s+saved"
     r")\b",
     re.IGNORECASE,
 )
@@ -178,6 +195,9 @@ def _heuristic_intent(
             return "watch_me", 0.96, "Watch-me recording requested with URL"
         return "watch_me", 0.9, "Watch-me recording requested (URL may come from extract)"
 
+    if REUSE_RECORDING_KEYWORDS.search(cleaned):
+        return "reuse_recording", 0.95, "Reuse / list saved Watch-me recording"
+
     # New journey payload always wins
     if has_url or has_structured or looks_like_recording:
         return "performance_analysis", 0.95, "URL / structured journey payload detected"
@@ -307,7 +327,8 @@ def _default_conversation_reply(text: str, has_prior: bool = False) -> str:
             "(dynamic values between requests).\n\n"
             "To start:\n"
             "- Send a target URL plus journey steps, **or**\n"
-            "- Say **watch me** with a URL — I’ll open a browser; click through, then **Done recording**."
+            "- Say **watch me** with a URL — I’ll open a browser; click through, then **Done recording**.\n"
+            "- Later: **analyse saved recording** (no re-record) or **list recordings**."
         )
 
     math = re.search(r"(\d+)\s*([\+\-\*/])\s*(\d+)", cleaned)

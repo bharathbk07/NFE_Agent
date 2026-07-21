@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -90,14 +91,12 @@ def _body_to_js(body: Any, body_type: str) -> Tuple[str, Optional[str]]:
         return "null", None
 
     if body_type == "form" and isinstance(body, dict):
-        # Build object then urlencode at runtime for var substitution
+        # Pass a JS object — k6 form-encodes when Content-Type is urlencoded
         fields = []
         for k, v in body.items():
             fields.append(f"    {_js_string(k)}: {_resolve_var_expr(v)}")
         obj = "{\n" + ",\n".join(fields) + "\n  }"
-        return f"Object.entries({obj}).map(([k,v]) => `${{encodeURIComponent(k)}}=${{encodeURIComponent(v)}}`).join('&')", (
-            "application/x-www-form-urlencoded"
-        )
+        return obj, "application/x-www-form-urlencoded"
 
     if isinstance(body, (dict, list)):
         # JSON with possible ${var} leaves — rebuild as JS object literal
@@ -172,7 +171,16 @@ def _extract_snippets_for_txn(
             continue
         var = _safe_ident(c.get("var") or "token", "token")
         loc = str(src.get("from_location") or "")
-        if loc.startswith("body.$") or loc.startswith("body."):
+        if loc.startswith("body.regex:"):
+            pattern = loc[len("body.regex:") :]
+            lines.append(f"    // Correlation extract `{var}` via HTML/body regex")
+            # Support patterns with one or two capturing groups (attr order variants)
+            lines.append(
+                f"    {{ const __m = String({res_var}.body || '').match("
+                f"new RegExp({_js_string(pattern)})); "
+                f"if (__m) vars.{var} = __m[1] || __m[2] || vars.{var}; }}"
+            )
+        elif loc.startswith("body.$") or loc.startswith("body."):
             path = loc[len("body.") :] if loc.startswith("body.") else loc
             jp = path.lstrip("$.").replace(".", ".")
             if jp.startswith("$"):
@@ -196,6 +204,24 @@ def _extract_snippets_for_txn(
     return lines
 
 
+def _runtime_helpers_js() -> str:
+    """Inline NFE metrics + assertion helpers (no external imports)."""
+    path = Path(__file__).with_name("k6_runtime_helpers.js")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _expect_json(headers: Dict[str, Any], body_type: str) -> bool:
+    """Return True when the response is expected to be JSON."""
+    if (body_type or "").lower() in ("json",):
+        return True
+    for k, v in (headers or {}).items():
+        if str(k).lower() == "accept" and "json" in str(v).lower():
+            return True
+        if str(k).lower() == "content-type" and "json" in str(v).lower():
+            return True
+    return False
+
+
 def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) -> str:
     """Emit one protocol-mode k6 transaction function.
 
@@ -214,7 +240,9 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
         f"    // - {r.get('method')} {r.get('url')}" for r in reqs[:30]
     ) or "    // (no requests)"
 
-    body_lines: List[str] = []
+    body_lines: List[str] = [
+        f"    const __nfeTxnStart = Date.now();",
+    ]
     urls = [r.get("url") or "" for r in reqs]
 
     for i, r in enumerate(reqs):
@@ -232,9 +260,23 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
         ]
         headers_js = "{ " + ", ".join(header_parts) + " }" if header_parts else "{}"
 
-        params_obj = (
-            f"{{ headers: {headers_js}, tags: {{ txn: {_js_string(name)} }} }}"
+        # name tag groups URL metrics in k6; txn links rows in the HTML report
+        name_tag = f"{method} " + (r.get("url") or "")
+        if len(name_tag) > 180:
+            name_tag = name_tag[:177] + "..."
+        tags_js = (
+            "{ "
+            f"txn: {_js_string(name)}, "
+            f"method: {_js_string(method)}, "
+            f"name: {_js_string(name_tag)} "
+            "}"
         )
+        params_bits = [f"headers: {headers_js}", f"tags: {tags_js}"]
+        if r.get("redirects") is not None:
+            params_bits.append(f"redirects: {int(r.get('redirects'))}")
+        elif method == "POST" and "/auth/" in str(r.get("url") or "").lower():
+            params_bits.append("redirects: 5")
+        params_obj = "{ " + ", ".join(params_bits) + " }"
 
         if method == "GET":
             body_lines.append(f"    const {var} = http.get({url_js}, {params_obj});")
@@ -258,19 +300,14 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
             body_lines.append(
                 f"    const {var} = http.request({_js_string(method)}, {url_js}, {body_js}, {params_obj});"
             )
-        if r.get("soft_check"):
-            body_lines.append(
-                f"    check({var}, {{ '{name} {method} {i+1} soft': "
-                f"(r) => r.status > 0 && r.status < 500 }});"
-            )
-        else:
-            body_lines.append(
-                f"    check({var}, {{ '{name} {method} {i+1} is 2xx': "
-                f"(r) => r.status >= 200 && r.status < 300 }});"
-            )
 
-        # Extract after this response when it matches a correlation source URL
-        # (compare without ${} placeholders — use path presence)
+        soft = "true" if r.get("soft_check") else "false"
+        expect_json = "true" if _expect_json(headers, str(r.get("body_type") or "")) else "false"
+        body_lines.append(
+            f"    nfeAssertResponse({var}, {_js_string(name)}, {_js_string(method)}, "
+            f"{{ soft: {soft}, expectJson: {expect_json}, label: {url_js} }});"
+        )
+
         raw_url = r.get("url") or ""
         body_lines.extend(
             _extract_snippets_for_txn(
@@ -278,8 +315,15 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
             )
         )
 
-    if not body_lines:
-        body_lines.append("    // No protocol HTTP for this TXN — check browser mode")
+    body_lines.append(f"    nfeMarkTxn({_js_string(name)}, __nfeTxnStart);")
+    body_lines.append(f"    sleep({think});")
+
+    if len(body_lines) <= 2:
+        body_lines = [
+            "    // No protocol HTTP for this TXN — check browser mode",
+            f"    nfeMarkTxn({_js_string(name)}, Date.now());",
+            f"    sleep({think});",
+        ]
 
     return f"""
 export function {name}() {{
@@ -289,7 +333,6 @@ export function {name}() {{
 {comments}
   group({_js_string(name)}, function () {{
 {chr(10).join(body_lines)}
-    sleep({think});
   }});
 }}""".rstrip()
 
@@ -345,13 +388,14 @@ export async function {name}(page) {{
   // TXN: {desc}
   // Mode: browser (SPA / UI-driven — from IR)
 {comments}
-  await group({_js_string(name)}, async function () {{
-    if (!page.url() || page.url() === 'about:blank') {{
-      await page.goto({_js_string(seed)});
-    }}
+  // Note: k6 group() does not support async callbacks — mark TXN timing manually.
+  const __nfeTxnStart = Date.now();
+  if (!page.url() || page.url() === 'about:blank') {{
+    await page.goto({_js_string(seed)});
+  }}
 {body}
-    await sleep({think});
-  }});
+  nfeMarkTxn({_js_string(name)}, __nfeTxnStart);
+  await sleep({think});
 }}""".rstrip()
 
 
@@ -467,8 +511,12 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
             f"""
 export function Launch() {{
   group('Launch', function () {{
-    const res = http.get({_js_string(target_url or f'https://{host}/')}, {{ tags: {{ txn: 'Launch' }} }});
-    check(res, {{ 'Launch ok': (r) => r.status >= 200 && r.status < 400 }});
+    const __nfeTxnStart = Date.now();
+    const res = http.get({_js_string(target_url or f'https://{host}/')}, {{
+      tags: {{ txn: 'Launch', method: 'GET', name: 'GET launch' }},
+    }});
+    nfeAssertResponse(res, 'Launch', 'GET', {{ soft: false, expectJson: false }});
+    nfeMarkTxn('Launch', __nfeTxnStart);
     sleep(1);
   }});
 }}""".rstrip()
@@ -480,17 +528,35 @@ export function Launch() {{
         for name, is_browser in txn_meta:
             if is_browser:
                 call_lines.append(f"  await {name}(page);")
+                # After browser login, copy cookies into the http module jar
+                txn_obj = next((t for t in transactions if t.get("name") == name), {})
+                if txn_obj.get("sync_cookies_to_http") or name.lower() == "login":
+                    call_lines.append(
+                        "  // Sync browser session cookies → http jar for protocol TXNs\n"
+                        "  {\n"
+                        "    const jar = http.cookieJar();\n"
+                        "    const cookies = await page.context().cookies();\n"
+                        "    for (const c of cookies) {\n"
+                        "      const host = (c.domain || '').replace(/^\\./, '');\n"
+                        "      if (!host || !c.name) continue;\n"
+                        "      const base = `${c.secure ? 'https' : 'http'}://${host}${c.path || '/'}`;\n"
+                        "      try { jar.set(base, c.name, c.value); } catch (e) {}\n"
+                        "    }\n"
+                        "  }"
+                    )
             else:
                 call_lines.append(f"  {name}();")
         calls = "\n".join(call_lines)
         return f"""import http from 'k6/http';
 import {{ browser }} from 'k6/browser';
 import {{ check, group, sleep }} from 'k6';
+import {{ Trend, Counter }} from 'k6/metrics';
 
 /**
  * Auto-generated by NFE Agent from Load-Test IR (deterministic — no LLM).
  * Target: {target_url}
  * IR version: {ir.get('version', 1)}
+ * Hybrid: browser login (SPA CSRF) + protocol API TXNs.
  */
 
 export const options = {{
@@ -503,11 +569,16 @@ export const options = {{
       options: {{ browser: {{ type: 'chromium' }} }},
     }},
   }},
+  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
+  // SLA thresholds (k6-learn): error rate, p95 response time, checks
   thresholds: {{
     http_req_failed: ['rate<0.01'],
+    http_req_duration: ['p(95)<2000'],
     checks: ['rate>0.99'],
   }},
 }};
+
+{_runtime_helpers_js()}
 
 const vars = {{
 {param_block}
@@ -526,11 +597,14 @@ export default async function () {{
     await page.close();
   }}
 }}
+
+{_handle_summary_block()}
 """
 
     calls = "\n".join(f"  {name}();" for name, _ in txn_meta)
     return f"""import http from 'k6/http';
 import {{ check, group, sleep }} from 'k6';
+import {{ Trend, Counter }} from 'k6/metrics';
 
 /**
  * Auto-generated by NFE Agent from Load-Test IR (deterministic — no LLM).
@@ -539,6 +613,8 @@ import {{ check, group, sleep }} from 'k6';
  *
  * Protocol TXNs replay captured METHOD+URL (+ body when available).
  * Cookie-based sessions use the k6 cookie jar automatically.
+ * Each response is asserted (status / body / optional JSON) and recorded
+ * into tagged metrics for the HTML report tables.
  */
 
 export const options = {{
@@ -550,11 +626,16 @@ export const options = {{
       maxDuration: '2m',
     }},
   }},
+  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
+  // SLA thresholds (k6-learn): error rate, p95 response time, checks
   thresholds: {{
     http_req_failed: ['rate<0.01'],
+    http_req_duration: ['p(95)<2000'],
     checks: ['rate>0.99'],
   }},
 }};
+
+{_runtime_helpers_js()}
 
 const vars = {{
 {param_block}
@@ -568,7 +649,19 @@ export default function () {{
 
 {calls}
 }}
+
+{_handle_summary_block()}
 """
+
+
+def _handle_summary_block() -> str:
+    """Return embedded ``handleSummary`` source for the HTML report."""
+    from src.utils.k6_html_report import load_handle_summary_js
+
+    return (
+        "// --- NFE HTML report (handleSummary) ---\n"
+        + load_handle_summary_js()
+    )
 
 
 def generate_k6_script(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -33,7 +34,8 @@ def run_k6_smoke(
 
     Returns:
         Dictionary with ``ok``, ``skipped``, ``exit_code``, ``stdout``,
-        ``stderr``, ``failed_checks``, ``failed_urls``, and ``summary``.
+        ``stderr``, ``failed_checks``, ``failed_urls``, ``summary``, and
+        optional ``html_report`` / ``summary_json`` paths.
     """
     path = Path(script_path)
     if not path.is_file():
@@ -60,10 +62,21 @@ def run_k6_smoke(
             "summary": "k6 missing",
         }
 
+    from src.utils.k6_html_report import find_html_report, report_paths_for_script
+    from src.utils.k6_report_builder import write_html_report
+
+    report_paths = report_paths_for_script(path)
+    points_path = str(path.resolve().with_name("k6-points.json"))
+    env = os.environ.copy()
+    env["NFE_K6_HTML_REPORT"] = report_paths["html"]
+    env["NFE_K6_SUMMARY_JSON"] = report_paths["json"]
+
     cmd = [
         "k6",
         "run",
-        str(path),
+        "--out",
+        f"json={points_path}",
+        str(path.resolve()),
     ]
     # Script options already define smoke (1 VU × 2 iterations). Avoid CLI
     # overrides that fight scenario blocks.
@@ -75,6 +88,8 @@ def run_k6_smoke(
             text=True,
             timeout=timeout_s,
             check=False,
+            env=env,
+            cwd=str(path.parent),
         )
     except subprocess.TimeoutExpired as exc:
         out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
@@ -88,6 +103,8 @@ def run_k6_smoke(
             "failed_checks": [],
             "failed_urls": [],
             "summary": "timeout",
+            "html_report": find_html_report(path) or "",
+            "summary_json": report_paths["json"] if Path(report_paths["json"]).is_file() else "",
         }
     except OSError as exc:
         return {
@@ -108,6 +125,24 @@ def run_k6_smoke(
     failed_urls = _parse_failed_urls(combined)
     ok = proc.returncode == 0
     summary = "passed" if ok else f"failed (exit {proc.returncode})"
+
+    html_report = ""
+    try:
+        html_report = write_html_report(
+            script_path=path,
+            points_path=points_path,
+            summary_path=report_paths["json"],
+            html_path=report_paths["html"],
+        )
+    except Exception as exc:
+        logger.warning("Failed to build HTML report from points: %s", exc)
+        html_report = find_html_report(path) or ""
+
+    summary_json = (
+        report_paths["json"] if Path(report_paths["json"]).is_file() else ""
+    )
+    if html_report:
+        logger.info("k6 HTML report → %s", html_report)
     return {
         "ok": ok,
         "skipped": False,
@@ -117,6 +152,8 @@ def run_k6_smoke(
         "failed_checks": failed_checks[:40],
         "failed_urls": failed_urls[:40],
         "summary": summary,
+        "html_report": html_report,
+        "summary_json": summary_json,
     }
 
 

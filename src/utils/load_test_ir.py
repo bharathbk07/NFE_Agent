@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from src.utils.http_body import content_type_from_headers, parse_post_data
+
+CSRF_TOKEN_REGEX = (
+    r"""name=["']_token["'][^>]*value=["']([^"']+)|"""
+    r"""value=["']([^"']+)["'][^>]*name=["']_token["']"""
+)
 
 
 def _safe_ident(name: str, fallback: str = "value") -> str:
@@ -25,7 +29,11 @@ def _safe_ident(name: str, fallback: str = "value") -> str:
     Returns:
         Identifier containing only letters, digits, and underscores.
     """
-    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", name or "").strip("_")
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", name or "")
+    cleaned = cleaned.strip("_") if cleaned.strip("_") else cleaned.replace("_", "x")
+    # Preserve intentional leading underscore names by normalizing instead of strip
+    if (name or "").startswith("_") and not cleaned.startswith("_"):
+        cleaned = f"nfe_{cleaned}" if cleaned else "nfe_value"
     if not cleaned or cleaned[0].isdigit():
         cleaned = f"{fallback}_{cleaned}" if cleaned else fallback
     return cleaned
@@ -127,8 +135,8 @@ def _substitute_url_values(url: str, vars_by_value: Dict[str, str]) -> str:
     """Replace known correlation/parameter literals in a URL with ``${var}``.
 
     Longer values are applied first so partial overlaps prefer the full ID.
-    Digit-only IDs are replaced only as path segments or query values so
-    ``22`` cannot corrupt ``222``.
+    Digit-only IDs and short text params are replaced only as path segments or
+    full query values so ``jo`` cannot corrupt ``joj`` → ``${nameorid}j``.
     """
     if not url or not vars_by_value:
         return url
@@ -139,24 +147,18 @@ def _substitute_url_values(url: str, vars_by_value: Dict[str, str]) -> str:
         if not literal:
             continue
         placeholder = f"${{{var}}}"
-        if literal.isdigit():
-            # Path segment: /{id}/ or /{id}? or /{id}$
-            out = re.sub(
-                rf"(?<=/)({re.escape(literal)})(?=/|\?|$)",
-                placeholder,
-                out,
-            )
-            # Query value: ={id}& or ={id}$
-            out = re.sub(
-                rf"(=)({re.escape(literal)})(?=&|$)",
-                rf"\1{placeholder}",
-                out,
-            )
-            continue
-        if len(literal) < 2:
-            continue
-        if literal in out:
-            out = out.replace(literal, placeholder)
+        # Path segment: /{literal}/ or /{literal}? or /{literal}$
+        out = re.sub(
+            rf"(?<=/)({re.escape(literal)})(?=/|\?|$)",
+            placeholder,
+            out,
+        )
+        # Query value: ={literal}& or ={literal}$ (full value only)
+        out = re.sub(
+            rf"(=)({re.escape(literal)})(?=&|$)",
+            rf"\1{placeholder}",
+            out,
+        )
     return out
 
 
@@ -215,6 +217,350 @@ def _infer_txn_mode(txn: Dict[str, Any], requests: List[Dict[str, Any]]) -> str:
     if ui_steps:
         return "browser"
     return "protocol"
+
+
+def _query_fingerprint(url: str) -> Tuple[str, str, Tuple[str, ...]]:
+    """Fingerprint (scheme+host+path, method-agnostic) + sorted query keys."""
+    try:
+        p = urlparse(url or "")
+        base = f"{p.scheme}://{p.netloc}{p.path}"
+        keys = tuple(sorted({k for k, _ in parse_qsl(p.query, keep_blank_values=True)}))
+        return base, p.query, keys
+    except Exception:
+        return url or "", "", ()
+
+
+def _fix_placeholder_leakage(url: str) -> str:
+    """Strip leftover chars after ``${var}`` from bad substring substitution.
+
+    Example: ``nameOrId=${nameorid}h`` → ``nameOrId=${nameorid}``.
+    """
+    if not url or "${" not in url:
+        return url
+    return re.sub(
+        r"(\$\{[A-Za-z_][A-Za-z0-9_]*\})[A-Za-z0-9._-]+(?=&|/|\?|$)",
+        r"\1",
+        url,
+    )
+
+
+def _coalesce_typeahead_requests(requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep the last request per (method, path, query-keys) autocomplete group.
+
+    Typeahead fires ``nameOrId=j``, ``jo``, ``joh`` — only the final value belongs
+    in a load script.
+    """
+    if len(requests) <= 1:
+        return requests
+    # Autocomplete-ish query params
+    typeahead_keys = {"nameorid", "name", "q", "query", "search", "term", "keyword"}
+    last_idx: Dict[Tuple[str, str, Tuple[str, ...]], int] = {}
+    for i, r in enumerate(requests):
+        method = str(r.get("method") or "GET").upper()
+        if method != "GET":
+            continue
+        url = _fix_placeholder_leakage(str(r.get("url") or ""))
+        r["url"] = url
+        base, _q, keys = _query_fingerprint(url)
+        if not keys or not any(k.lower() in typeahead_keys for k in keys):
+            continue
+        last_idx[(method, base, keys)] = i
+    drop: Set[int] = set()
+    for i, r in enumerate(requests):
+        method = str(r.get("method") or "GET").upper()
+        if method != "GET":
+            continue
+        url = str(r.get("url") or "")
+        base, _q, keys = _query_fingerprint(url)
+        if not keys or not any(k.lower() in typeahead_keys for k in keys):
+            continue
+        keep = last_idx.get((method, base, keys))
+        if keep is not None and i != keep:
+            drop.add(i)
+    # Always scrub placeholder leakage on every request URL
+    cleaned: List[Dict[str, Any]] = []
+    for i, r in enumerate(requests):
+        if i in drop:
+            continue
+        item = dict(r)
+        item["url"] = _fix_placeholder_leakage(str(item.get("url") or ""))
+        cleaned.append(item)
+    return cleaned
+
+
+def _has_auth_post(transactions: List[Dict[str, Any]]) -> bool:
+    """True when any transaction already includes an auth/login POST."""
+    for txn in transactions:
+        for r in txn.get("requests") or []:
+            method = str(r.get("method") or "").upper()
+            url = str(r.get("url") or "").lower()
+            if method == "POST" and any(
+                h in url for h in ("/auth/validate", "/auth/login", "/login", "/signin", "/session")
+            ):
+                return True
+            body = r.get("body")
+            if method == "POST" and isinstance(body, dict):
+                keys = {str(k).lower() for k in body}
+                if "password" in keys and ("username" in keys or "user" in keys or "email" in keys):
+                    return True
+    return False
+
+
+def _credential_vars(vars_list: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    """Return (username_var, password_var) names from IR vars."""
+    user_var = pwd_var = None
+    for v in vars_list or []:
+        name = str(v.get("name") or "")
+        src = str(v.get("source") or "").lower()
+        is_cred = bool(v.get("is_credential"))
+        if not user_var and (
+            name.lower() in ("username", "user", "email", "login")
+            or "username" in src
+            or (is_cred and "pass" not in name.lower())
+        ):
+            user_var = name
+        if not pwd_var and (
+            name.lower() in ("password", "passwd", "pwd")
+            or "password" in src
+            or (is_cred and "pass" in name.lower())
+        ):
+            pwd_var = name
+    return user_var, pwd_var
+
+
+def _ensure_auth_csrf(
+    transactions: List[Dict[str, Any]],
+    correlations: List[Dict[str, Any]],
+    *,
+    origin: str,
+) -> None:
+    """No-op for browser-mode login; keep CSRF only when protocol auth/validate exists."""
+    has_browser_login = any(
+        (t.get("mode") == "browser" and "login" in str(t.get("name") or "").lower())
+        or t.get("synthesized") == "browser_login"
+        for t in (transactions or [])
+    )
+    if has_browser_login:
+        return
+    csrf_var = "csrf_token"
+    login_url = ""
+    validate_url = ""
+    for txn in transactions or []:
+        for r in txn.get("requests") or []:
+            url = str(r.get("url") or "")
+            method = str(r.get("method") or "").upper()
+            if method == "GET" and "/auth/login" in url.lower():
+                login_url = url
+            if method == "POST" and "/auth/validate" in url.lower():
+                validate_url = url
+                body = r.get("body")
+                if isinstance(body, dict):
+                    token_val = body.get("_token")
+                    needs = token_val is None or (
+                        isinstance(token_val, str)
+                        and "csrf_token" not in token_val
+                        and token_val in ("", "${_token}", "${token}")
+                    )
+                    if needs or token_val is None:
+                        body = dict(body)
+                        body["_token"] = f"${{{csrf_var}}}"
+                        r["body"] = body
+                    if not r.get("body_type") or r.get("body_type") == "empty":
+                        r["body_type"] = "form"
+    if not login_url and origin:
+        login_url = f"{origin}/web/index.php/auth/login"
+    if not validate_url:
+        return
+    for c in correlations:
+        if str(c.get("var") or "") in ("_token", "token"):
+            c["var"] = csrf_var
+    if not any(str(c.get("var") or "") == csrf_var for c in correlations):
+        correlations.append(
+            {
+                "var": csrf_var,
+                "extract": {
+                    "from_request": login_url,
+                    "from_location": f"body.regex:{CSRF_TOKEN_REGEX}",
+                    "from_step": -1,
+                },
+                "pass": {
+                    "to_request": validate_url,
+                    "to_location": "body._token",
+                    "to_step": -1,
+                },
+                "correlation_type": "response_extract",
+                "confidence": "high",
+                "auto_cookie": False,
+                "synthesized": True,
+            }
+        )
+
+
+def _inject_missing_auth(
+    transactions: List[Dict[str, Any]],
+    *,
+    origin: str,
+    vars_list: List[Dict[str, Any]],
+    target_url: str,
+    correlations: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Ensure login establishes a real session before protocol API calls.
+
+    Vue/SPA apps (e.g. OrangeHRM) inject CSRF ``_token`` via JavaScript, so a
+    protocol-only ``GET /auth/login`` has no token and ``POST /auth/validate``
+    silently fails → every API returns 401. Prefer **browser-mode login**
+    (fill + submit) and sync cookies into the http jar for later protocol TXNs.
+    """
+    if not origin:
+        return transactions
+    # Drop previously synthesized protocol auth (SPA CSRF cannot work over raw HTTP)
+    for txn in transactions:
+        reqs = list(txn.get("requests") or [])
+        cleaned = [
+            r
+            for r in reqs
+            if not str(r.get("synthesized") or "").startswith("auth")
+        ]
+        if len(cleaned) != len(reqs):
+            txn["requests"] = cleaned
+    if _has_auth_post(transactions):
+        # Real captured form POST exists — keep protocol path
+        return transactions
+    user_var, pwd_var = _credential_vars(vars_list)
+    if not user_var or not pwd_var:
+        return transactions
+
+    login_path = "/web/index.php/auth/login"
+    try:
+        tp = urlparse(target_url or "")
+        if "/auth/" in (tp.path or ""):
+            login_path = tp.path
+    except Exception:
+        pass
+    login_url = f"{origin}{login_path}"
+
+    ui_steps = [
+        {"action": "navigate", "url": login_url, "selector": "", "value": None},
+        {
+            "action": "fill",
+            "selector": 'input[name="username"]',
+            "value": f"${{{user_var}}}",
+            "url": "",
+        },
+        {
+            "action": "fill",
+            "selector": 'input[name="password"]',
+            "value": f"${{{pwd_var}}}",
+            "url": "",
+        },
+        {
+            "action": "click",
+            "selector": 'button[type="submit"]',
+            "value": None,
+            "url": "",
+        },
+        {"action": "wait_for_load", "selector": "", "value": None, "url": ""},
+    ]
+
+    out = [dict(t) for t in transactions]
+    login_idx = next(
+        (
+            i
+            for i, t in enumerate(out)
+            if "login" in str(t.get("name") or "").lower()
+        ),
+        None,
+    )
+    login_txn = {
+        "name": "login",
+        "description": "Browser login (SPA CSRF cannot be extracted via protocol HTTP)",
+        "mode": "browser",
+        "think_time_s": 1,
+        "requests": [],
+        "ui_steps": ui_steps,
+        "step_indices": [],
+        "sync_cookies_to_http": True,
+        "synthesized": "browser_login",
+    }
+    if login_idx is None:
+        insert_at = next(
+            (
+                i
+                for i, t in enumerate(out)
+                if str(t.get("name") or "").lower() not in ("launch", "")
+            ),
+            0,
+        )
+        out.insert(insert_at, login_txn)
+    else:
+        existing = dict(out[login_idx])
+        # Drop fake protocol stand-ins (dashboard GET / empty auth)
+        existing_reqs = [
+            r
+            for r in (existing.get("requests") or [])
+            if not (
+                str(r.get("method") or "").upper() == "GET"
+                and (
+                    "/dashboard/" in str(r.get("url") or "").lower()
+                    or "/auth/login" in str(r.get("url") or "").lower()
+                )
+            )
+            and not str(r.get("synthesized") or "").startswith("auth")
+        ]
+        login_txn["requests"] = existing_reqs
+        # Keep any real UI steps from Watch-me, prefer our credential fills
+        prior_ui = [
+            s
+            for s in (existing.get("ui_steps") or [])
+            if s.get("action") not in ("fill", "click", "navigate", "wait_for_load")
+        ]
+        login_txn["ui_steps"] = ui_steps + prior_ui
+        out[login_idx] = login_txn
+
+    # Drop protocol CSRF correlations — browser handles login
+    if correlations is not None:
+        correlations[:] = [
+            c
+            for c in correlations
+            if str(c.get("var") or "") not in ("csrf_token", "_token", "token")
+            or not c.get("synthesized")
+        ]
+    return out
+
+
+def _retarget_create_id_extracts(correlations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract create-resource IDs from the create POST, not a later GET.
+
+    Using a GET that already embeds the ID causes empty ``${requestId}`` → 404.
+    """
+    out: List[Dict[str, Any]] = []
+    for c in correlations or []:
+        item = dict(c)
+        var = str(item.get("var") or "")
+        var_l = var.lower()
+        ex = dict(item.get("extract") or {})
+        from_req = str(ex.get("from_request") or "")
+        lower = from_req.lower()
+        is_id_var = var_l in (
+            "requestid",
+            "request_id",
+            "id",
+            "claimid",
+            "claim_id",
+        ) or var_l.endswith("id") and "reference" not in var_l
+        # GET .../requests/13 → POST .../requests (create)
+        if is_id_var and re.search(r"/requests/\d+(/|\?|$)", lower):
+            fixed = re.sub(r"/requests/\d+(?=/|\?|$)", "/requests", from_req)
+            if fixed != from_req:
+                ex["from_request"] = fixed
+                loc = str(ex.get("from_location") or "")
+                if "reference" not in var_l:
+                    if not loc.startswith("body.") or "reference" in loc.lower():
+                        ex["from_location"] = "body.$.data.id"
+                item["extract"] = ex
+                item["retargeted"] = True
+        out.append(item)
+    return out
 
 
 def build_load_test_ir(
@@ -406,6 +752,8 @@ def build_load_test_ir(
                 }
             )
 
+        requests_ir = _coalesce_typeahead_requests(requests_ir)
+
         ui_steps = [
             {
                 "action": s.get("action"),
@@ -445,10 +793,21 @@ def build_load_test_ir(
             }
         )
 
+    origin = _origin(target_url or "")
+    corr_list = _retarget_create_id_extracts(corr_list)
+    txn_list = _inject_missing_auth(
+        txn_list,
+        origin=origin,
+        vars_list=vars_list,
+        target_url=target_url or "",
+        correlations=corr_list,
+    )
+    _ensure_auth_csrf(txn_list, corr_list, origin=origin)
+
     return {
         "version": 1,
         "target_url": target_url or "",
-        "origin": _origin(target_url or ""),
+        "origin": origin,
         "vars": vars_list,
         "correlations": corr_list,
         "transactions": txn_list,

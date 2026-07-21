@@ -58,26 +58,21 @@ Requires: `pip install langchain-mcp-adapters` (listed in `requirements.txt`).
 
 | Server | Default | Notes |
 | --- | --- | --- |
-| `k6` | `enabled: true` | Grafana [`k6 x mcp`](https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/) — validate/run for smoke + heal. Needs **k6 v2+** on `PATH`. |
+| `k6` | `enabled: false` | Optional Grafana [`k6 x mcp`](https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/). Smoke/heal uses **CLI** `k6 run` (needed for HTML report JSON). Enable only if you want MCP tools in-bot. |
 | `playwright` | `enabled: false` | Pipeline already uses in-process Playwright + CDP |
 | `chrome-devtools` | `enabled: false` | Optional live DevTools traces — not the capture layer |
 
 Turn a server on only when a sub-agent should call that MCP at runtime.
 
-### k6 MCP (recommended)
+### k6 smoke (CLI)
 
-The analysis pipeline prefers Grafana k6 MCP tools (`validate_script` / `run_script`) via [`src/utils/k6_mcp.py`](../src/utils/k6_mcp.py), then falls back to CLI `k6 run`. First-time `k6 x mcp` may download an extension binary (needs network).
-
-```bash
-# Confirm k6 supports the MCP subcommand (k6 v2+)
-k6 x mcp --help
-```
+Analysis smoke/heal always runs ``k6 run --out json=...`` via [`src/utils/k6_runner.py`](../src/utils/k6_runner.py) so ``artifacts/k6/html-report.html`` gets full TXN/request tables.
 
 | Env | Effect |
 | --- | --- |
-| `NFE_K6_MCP=auto` (default) | Try MCP when enabled in config; CLI on timeout/error |
-| `NFE_K6_MCP=0` / `cli` | Force CLI smoke only |
-| `NFE_K6_MCP=1` | Prefer MCP |
+| `NFE_K6_MCP=cli` (default) | CLI only (recommended) |
+| `NFE_K6_MCP=mcp` / `1` | Try MCP first, then still CLI for the HTML report |
+| `NFE_K6_MCP_TIMEOUT` | MCP attempt budget seconds (default `8`) |
 | `NFE_K6_MCP_TIMEOUT=8` | Seconds before CLI fallback |
 
 Disable the server with `"enabled": false` on the `k6` entry if you do not want MCP at all.

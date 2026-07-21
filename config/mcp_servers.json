@@ -1,8 +1,8 @@
 {
     "mcpServers": {
         "k6": {
-            "enabled": true,
-            "description": "Grafana k6 MCP (k6 x mcp). Validates and runs scripts for smoke/heal. Requires k6 v2+ on PATH.",
+            "enabled": false,
+            "description": "Grafana k6 MCP (k6 x mcp). Optional — smoke/heal uses CLI k6 run for HTML reports. Set enabled true and NFE_K6_MCP=mcp only if you need MCP tools in-bot.",
             "transport": "stdio",
             "command": "k6",
             "args": [

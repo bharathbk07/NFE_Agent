@@ -9,6 +9,9 @@ Choose exactly one intent:
 - watch_me: the user wants interactive recording — phrases like "watch me",
   "record while I click", or "I'll click" (usually with a URL). The bot opens
   a browser and the user drives the journey.
+- reuse_recording: the user wants to reuse a previously saved Watch-me capture
+  without re-recording — phrases like "analyse saved recording",
+  "list recordings", "reuse recording", or "use last recording".
 - performance_analysis: the user provides a NEW URL, journey, or recording to
   run through the full browser pipeline (bot plans and clicks for them).
 - follow_up_analysis: the user explicitly asks to RERUN the previous journey.
@@ -18,6 +21,7 @@ Choose exactly one intent:
 - conversation: greetings, math, or unrelated conversation.
 
 Prefer watch_me over performance_analysis when interactive-recording language
-is present.
+is present. Prefer reuse_recording when the user asks to load/list saved
+recordings.
 
 If the intent is conversation, set reply to a short helpful answer.

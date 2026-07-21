@@ -36,7 +36,7 @@ GEMINI_MODEL="gemini-2.5-flash"
 # CURSOR_RUNTIME="local"
 # CURSOR_CLOUD_REPO="https://github.com/your-org/NFE_Agent"
 
-# LangSmith Configuration (Optional, for Prompt Registry & Traces)
+# LangSmith Configuration (Optional — traces + prompt hub; NOT a recording store)
 LANGCHAIN_TRACING_V2="true"
 LANGCHAIN_API_KEY="your-langsmith-api-key"
 LANGCHAIN_PROJECT="nfe-agent"
@@ -86,12 +86,36 @@ Stay in one product: chat plus a browser window the agent opens. No DevTools, no
    - **End TXN** — close the current transaction (optional; starting another TXN auto-ends the previous)
    - **Pause** / **Resume**, **Done**, or **Cancel**; drag the handle to move the panel
 4. Click **Done** when finished (or **Cancel** to abort without analysis).
-5. The agent saves your steps + network as Run 1, **auto-replays** headless as Run 2, then runs analysis and emits a **k6 smoke script** (`1 VU` × `2 iterations`).
-6. If `k6` is on your `PATH`, the agent **runs the smoke** and applies deterministic self-heal (drop chrome GETs, relax optional checks, retarget extracts) up to twice before delivering the file.
+5. The agent saves your steps + network as Run 1, **auto-replays** headless as Run 2, then runs analysis and emits a **k6 smoke script** (`1 VU` × `2 iterations`) as a single stable file per host (`artifacts/k6/<host>.js`, overwritten on heal — not a new file each attempt).
+6. The capture is also written to **`artifacts/recordings/<host>.json`** so you can re-analyse without re-recording (see below).
+7. If `k6` is on your `PATH`, the agent **runs the smoke** and applies deterministic self-heal (drop chrome GETs, relax optional checks, retarget extracts) up to twice before delivering the file. Each run writes **`artifacts/k6/html-report.html`** with general details, observations, full TXN table (min/max/avg/percentiles), full request table (method/URL/failures), failed requests with **URL + status**, and SLA thresholds. Generated scripts assert each response (status, body, JSON when applicable).
+
+### Reuse a saved recording (no re-record)
+
+After one Watch-me session, chat:
+
+```text
+list recordings
+analyse saved recording
+analyse saved recording opensource-demo.orangehrmlive.com
+```
+
+- **2 runs already on disk** → analysis + k6 immediately (no browser).
+- **Only Run 1** → headless replay for Run 2, then analysis.
+- Override store path with `NFE_RECORDINGS_DIR` if needed.
+
+### LangSmith vs saved recordings
+
+| Need | Use |
+|------|-----|
+| Re-run analysis on the same clicks/network | Disk store: `artifacts/recordings/*.json` + chat above |
+| Debug LLM/tool traces, prompt versions | LangSmith (`LANGCHAIN_TRACING_V2` + API key) |
+
+LangSmith traces Studio **runs** (inputs/outputs per node). It does **not** replace Watch-me capture storage. Thread state in Studio can keep `run_records` in one thread, but a new thread or restart needs the disk recording.
 
 Correlation focuses on cookies, body/query tokens, and auth/CSRF headers — not generic request headers (Accept, User-Agent, sec-fetch-*, etc.).
 
-Install k6 for smoke validation: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). The bot loads Grafana’s **k6 MCP** from [`config/mcp_servers.json`](config/mcp_servers.json) (`k6 x mcp`) to validate/run scripts during heal; CLI `k6 run` is the fallback. Optionally also wire Cursor with `k6 x agent init cursor` ([docs](https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/)).
+Install k6 for smoke validation: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). Smoke/heal uses **CLI** `k6 run` (writes `html-report.html`). Grafana k6 MCP is optional and off by default (stdio can crash with `BrokenResourceError`); see [`docs/optional-mcps.md`](docs/optional-mcps.md).
 
 **Requirements:** a local display (macOS/Linux desktop). Remote or headless-only Studio hosts without a display are unsupported for Watch-me — use local `langgraph dev --allow-blocking`.
 

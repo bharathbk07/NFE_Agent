@@ -58,7 +58,7 @@ def heal_load_test_ir(
     if chrome_dropped:
         notes.append(f"Removed {chrome_dropped} non-critical/chrome GET request(s).")
 
-    # 2) Soften checks on optional GETs; attempt 2 softens all GETs
+    # 2) Soften checks ONLY on non-critical GETs (never soft 401-prone APIs)
     soft = 0
     for txn in healed["transactions"]:
         for r in txn.get("requests") or []:
@@ -66,18 +66,21 @@ def heal_load_test_ir(
             if method != "GET":
                 continue
             url = str(r.get("url") or "")
+            if _is_business_critical_http(url, method):
+                # Critical GETs must stay hard — soft-pass hides 401/404 product failure
+                if r.get("soft_check"):
+                    r["soft_check"] = False
+                continue
             if attempt >= 2:
                 if not r.get("soft_check"):
                     r["soft_check"] = True
                     soft += 1
                 continue
-            if _is_business_critical_http(url, method):
-                continue
             if not r.get("soft_check"):
                 r["soft_check"] = True
                 soft += 1
     if soft:
-        notes.append(f"Relaxed status checks on {soft} GET request(s).")
+        notes.append(f"Relaxed status checks on {soft} non-critical GET request(s).")
 
     # 3) Dedupe correlation vars that collide on the same name
     before = len(healed["correlations"])
@@ -91,6 +94,46 @@ def heal_load_test_ir(
     if path_fixes:
         notes.extend(path_fixes)
 
+    # 5) Real product fixes (not soft-pass): auth + create-id extract + typeahead
+    from src.utils.load_test_ir import (
+        _coalesce_typeahead_requests,
+        _ensure_auth_csrf,
+        _inject_missing_auth,
+        _retarget_create_id_extracts,
+    )
+
+    before_corr = json_dumps_safe(healed.get("correlations"))
+    healed["correlations"] = _retarget_create_id_extracts(healed.get("correlations") or [])
+    if json_dumps_safe(healed.get("correlations")) != before_corr:
+        notes.append("Retargeted create-resource ID extracts to the create POST response.")
+
+    for txn in healed["transactions"]:
+        before_n = len(txn.get("requests") or [])
+        txn["requests"] = _coalesce_typeahead_requests(list(txn.get("requests") or []))
+        after_n = len(txn.get("requests") or [])
+        if after_n < before_n:
+            notes.append(
+                f"Dropped {before_n - after_n} typeahead intermediate GET(s) in `{txn.get('name')}`."
+            )
+
+    before_auth = _has_auth_post_local(healed["transactions"])
+    healed["transactions"] = _inject_missing_auth(
+        healed["transactions"],
+        origin=str(healed.get("origin") or ""),
+        vars_list=list(healed.get("vars") or []),
+        target_url=str(healed.get("target_url") or ""),
+        correlations=healed["correlations"],
+    )
+    _ensure_auth_csrf(
+        healed["transactions"],
+        healed["correlations"],
+        origin=str(healed.get("origin") or ""),
+    )
+    if not before_auth and _has_auth_post_local(healed["transactions"]):
+        notes.append("Injected missing login POST + CSRF token extract.")
+    elif any(str(c.get("var")) == "csrf_token" for c in healed["correlations"]):
+        notes.append("Ensured login CSRF `csrf_token` extract → auth/validate.")
+
     if not notes:
         notes.append(
             "No deterministic heal applied — review failed checks and correlations."
@@ -98,6 +141,26 @@ def heal_load_test_ir(
     healed["heal_notes"] = list(healed.get("heal_notes") or []) + notes
     healed["heal_attempt"] = attempt
     return healed, notes
+
+
+def json_dumps_safe(obj: Any) -> str:
+    """Stable-ish string compare helper for heal notes."""
+    import json
+
+    try:
+        return json.dumps(obj, sort_keys=True, default=str)
+    except Exception:
+        return str(obj)
+
+
+def _has_auth_post_local(transactions: List[Dict[str, Any]]) -> bool:
+    for txn in transactions or []:
+        for r in txn.get("requests") or []:
+            method = str(r.get("method") or "").upper()
+            url = str(r.get("url") or "").lower()
+            if method == "POST" and "/auth/" in url:
+                return True
+    return False
 
 
 def _url_mentioned(url: str, smoke_result: Dict[str, Any]) -> bool:
@@ -199,6 +262,12 @@ def format_smoke_section(smoke: Dict[str, Any], heal_notes: List[str]) -> str:
         fails = smoke.get("failed_checks") or []
         if fails:
             lines.append("- **Failed checks:** " + ", ".join(f"`{f}`" for f in fails[:8]))
+    html_report = smoke.get("html_report") or ""
+    if html_report:
+        lines.append(
+            f"- **HTML report:** `{html_report}` "
+            "(general details, observations, TXN summary, failures, SLA)."
+        )
     if heal_notes:
         lines.append("- **Heal notes:**")
         for n in heal_notes[:8]:

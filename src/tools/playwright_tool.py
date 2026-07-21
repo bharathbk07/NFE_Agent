@@ -157,6 +157,12 @@ class PlaywrightBrowserRecorder:
             page: Active Chromium page.
         """
         try:
+            if self._cdp_session is not None:
+                try:
+                    self._cdp_session.detach()
+                except Exception:
+                    pass
+                self._cdp_session = None
             self._cdp_session = page.context.new_cdp_session(page)
             self._cdp_session.send("Network.enable", {
                 "maxPostDataSize": 256 * 1024,
@@ -290,18 +296,28 @@ class PlaywrightBrowserRecorder:
 
     # -------------------------------------------------------- Playwright fallback
     def _handle_response(self, response: Response) -> None:
-        """Capture a Playwright response when CDP is unavailable.
+        """Capture Playwright responses; always keep mutations CDP may drop on nav.
 
         Args:
             response: Completed Playwright response.
         """
-        if self._cdp_session is not None:
-            # CDP path is primary; skip duplicate Playwright entries
-            return
         try:
             req = response.request
+            method = (req.method or "GET").upper()
             url = response.url
             resource_type = req.resource_type or ""
+
+            # When CDP is primary, still capture Document/XHR mutations — form
+            # login POSTs are frequently lost when the page navigates away.
+            if self._cdp_session is not None:
+                if method not in ("POST", "PUT", "PATCH", "DELETE"):
+                    return
+                if any(
+                    e.get("url") == url and (e.get("method") or "").upper() == method
+                    for e in self.network_logs
+                ):
+                    return
+
             if not _should_keep_url(url, resource_type):
                 return
             if resource_type in ["stylesheet", "image", "media", "font", "texttrack", "manifest"]:
@@ -333,7 +349,7 @@ class PlaywrightBrowserRecorder:
 
             self.network_logs.append({
                 "url": url,
-                "method": req.method,
+                "method": method,
                 "headers": req_headers,
                 "cookies": req_cookies,
                 "post_data": post_data,
@@ -1250,6 +1266,11 @@ class PlaywrightBrowserRecorder:
                         if self.step_timeline:
                             self.step_timeline[-1]["url_before"] = prev
                             self.step_timeline[-1]["url_after"] = new_url
+                        # Re-bind CDP after document navigations (login form POST).
+                        try:
+                            self._attach_cdp(page)
+                        except Exception:
+                            pass
                     _sync_overlay_state()
                 except Exception as nav_err:
                     logger.debug("Watch-me navigation hook error: %s", nav_err)

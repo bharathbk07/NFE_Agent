@@ -79,6 +79,9 @@ async def route_intent(state: AgentState) -> Dict[str, Any]:
     if decision.intent == "watch_me":
         updates["recording_mode"] = "watch_me"
         updates["watch_me_status"] = "requested"
+    elif decision.intent == "reuse_recording":
+        updates["recording_mode"] = "reuse"
+        updates["watch_me_status"] = "requested"
     else:
         updates["recording_mode"] = None
         updates["watch_me_status"] = None
@@ -92,7 +95,12 @@ async def route_intent(state: AgentState) -> Dict[str, Any]:
 
 def after_intent_router(
     state: AgentState,
-) -> Literal["respond_conversation", "answer_analysis_question", "orchestrate_journey"]:
+) -> Literal[
+    "respond_conversation",
+    "answer_analysis_question",
+    "orchestrate_journey",
+    "load_saved_recording",
+]:
     """Select the node that handles the classified intent.
 
     Args:
@@ -104,6 +112,8 @@ def after_intent_router(
     intent = state.get("intent", "conversation")
     if intent == "analysis_qa":
         return "answer_analysis_question"
+    if intent == "reuse_recording":
+        return "load_saved_recording"
     if intent in ("performance_analysis", "follow_up_analysis", "watch_me"):
         return "orchestrate_journey"
     return "respond_conversation"
@@ -441,16 +451,39 @@ async def watch_me_record(state: AgentState) -> Dict[str, Any]:
         "screenshot_paths": [],
     }]
 
+    recording_meta: Dict[str, str] = {}
+    try:
+        from src.utils.recording_store import save_watch_me_recording
+
+        recording_meta = save_watch_me_recording(
+            target_url=url,
+            user_journey_steps=recorded_steps,
+            run_records=run_records,
+            credentials=state.get("credentials") or {},
+            sub_tasks=state.get("sub_tasks") or [],
+        )
+    except Exception as save_err:
+        logger.warning("Failed to save Watch-me recording: %s", save_err)
+
+    saved_note = ""
+    if recording_meta.get("relative_path"):
+        saved_note = (
+            f" Saved to `{recording_meta['relative_path']}` "
+            "(reuse later with **analyse saved recording**)."
+        )
+
     return {
         "user_journey_steps": recorded_steps,
         "run_records": run_records,
         "recording_mode": "watch_me",
         "watch_me_status": "recorded",
+        "recording_file": recording_meta.get("path") or "",
         "error_log": [],
         "messages": [
             AIMessage(
                 content=(
-                    f"Recording finished — **{len(recorded_steps)}** step(s) captured. "
+                    f"Recording finished — **{len(recorded_steps)}** step(s) captured."
+                    f"{saved_note} "
                     "Replaying headless for correlation (Run 2)…"
                 )
             )
@@ -520,10 +553,124 @@ async def replay_recorded_journey(state: AgentState) -> Dict[str, Any]:
         logger.error("Watch-me replay failed: %s", e)
         error_log.append(f"Run 2 (replay) failed: {e}")
 
+    # Refresh on-disk recording with Run 1 + Run 2 for full reuse.
+    try:
+        from src.utils.recording_store import save_watch_me_recording
+
+        save_watch_me_recording(
+            target_url=url,
+            user_journey_steps=steps,
+            run_records=run_records,
+            credentials=state.get("credentials") or {},
+            sub_tasks=state.get("sub_tasks") or [],
+        )
+    except Exception as save_err:
+        logger.warning("Failed to update Watch-me recording after replay: %s", save_err)
+
     return {
         "run_records": run_records,
         "error_log": error_log,
         "watch_me_status": "replayed",
+    }
+
+
+async def load_saved_recording(state: AgentState) -> Dict[str, Any]:
+    """Load a disk-saved Watch-me capture for analysis without re-recording.
+
+    Chat examples:
+    - ``list recordings``
+    - ``analyse saved recording``
+    - ``analyse saved recording opensource-demo.orangehrmlive.com``
+    """
+    from src.utils.recording_store import (
+        format_recordings_list,
+        list_recordings,
+        load_watch_me_recording,
+        resolve_recording_path,
+    )
+
+    logger.info("Node: load_saved_recording starting...")
+    text = get_latest_human_text(state.get("messages"))
+    cleaned = (text or "").strip()
+
+    if re.search(r"\blist\s+recordings\b|\bsaved\s+recordings\b", cleaned, re.I):
+        rows = list_recordings()
+        return {
+            "watch_me_status": "listed",
+            "messages": [AIMessage(content=format_recordings_list(rows))],
+        }
+
+    # Strip command words to leave host/path hint
+    hint = re.sub(
+        r"\b(reuse|analyse|analyze|load|use|from|saved|recording|recordings|"
+        r"the|last|previous|rerun|replay)\b",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    hint = re.sub(r"\s+", " ", hint).strip()
+
+    path = resolve_recording_path(hint)
+    if path is None:
+        rows = list_recordings()
+        return {
+            "error_log": ["No saved Watch-me recording found."],
+            "watch_me_status": "missing_recording",
+            "messages": [
+                AIMessage(
+                    content=(
+                        "No saved recording found.\n\n"
+                        + format_recordings_list(rows)
+                    )
+                )
+            ],
+        }
+
+    try:
+        loaded = load_watch_me_recording(path)
+    except Exception as exc:
+        return {
+            "error_log": [f"Failed to load recording: {exc}"],
+            "watch_me_status": "load_failed",
+            "messages": [
+                AIMessage(content=f"Could not load recording `{path}`: {exc}")
+            ],
+        }
+
+    runs = loaded.get("run_records") or []
+    steps = loaded.get("user_journey_steps") or []
+    rel = loaded.get("recording_file") or str(path)
+    try:
+        from pathlib import Path as _P
+
+        root = _P(__file__).resolve().parents[1]
+        p = _P(path)
+        try:
+            rel = str(p.relative_to(root))
+        except ValueError:
+            rel = str(p)
+    except Exception:
+        pass
+
+    next_msg = (
+        f"Loaded `{rel}` — **{len(steps)}** step(s), **{len(runs)}** run(s). "
+    )
+    if len(runs) >= 2:
+        next_msg += "Running analysis (skipping browser record/replay)…"
+        status = "ready_analyse"
+    elif steps:
+        next_msg += "Replaying headless for Run 2, then analysis…"
+        status = "ready_replay"
+    else:
+        next_msg += "Recording has no steps to replay."
+        status = "empty"
+
+    return {
+        **loaded,
+        "error_log": [],
+        "intent": "reuse_recording",
+        "watch_me_status": status,
+        "messages": [AIMessage(content=next_msg)],
     }
 
 
@@ -828,8 +975,24 @@ Please verify the user journey steps or selectors. If credentials are required, 
         from src.utils.k6_mcp import run_k6_smoke_preferred
         from src.utils.k6_healer import heal_load_test_ir, format_smoke_section
 
-        k6_file = save_k6_script(k6_script, target_url=state["target_url"])
-        save_load_test_ir(load_test_ir, target_url=state["target_url"])
+        names = None
+        try:
+            from src.utils.artifacts import stable_artifact_names
+
+            names = stable_artifact_names(state["target_url"])
+        except Exception:
+            names = None
+
+        k6_file = save_k6_script(
+            k6_script,
+            target_url=state["target_url"],
+            filename=(names or {}).get("script"),
+        )
+        save_load_test_ir(
+            load_test_ir,
+            target_url=state["target_url"],
+            filename=(names or {}).get("ir"),
+        )
 
         smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
         max_heals = 2
@@ -852,8 +1015,17 @@ Please verify the user journey steps or selectors. If credentials are required, 
                 network_requests=run1.get("network_requests") or [],
                 ir=load_test_ir,
             )
-            k6_file = save_k6_script(k6_script, target_url=state["target_url"])
-            save_load_test_ir(load_test_ir, target_url=state["target_url"])
+            # Overwrite the same script/IR for this flow (no extra artifacts).
+            k6_file = save_k6_script(
+                k6_script,
+                target_url=state["target_url"],
+                filename=k6_file.get("filename") or (names or {}).get("script"),
+            )
+            save_load_test_ir(
+                load_test_ir,
+                target_url=state["target_url"],
+                filename=(names or {}).get("ir"),
+            )
             smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
             if smoke_result.get("ok"):
                 heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
@@ -889,6 +1061,8 @@ Please verify the user journey steps or selectors. If credentials are required, 
             "skipped": smoke_result.get("skipped"),
             "summary": smoke_result.get("summary"),
             "heal_notes": heal_notes,
+            "html_report": smoke_result.get("html_report") or "",
+            "summary_json": smoke_result.get("summary_json") or "",
         }
 
     summary_markdown = format_correlation_report(
@@ -906,14 +1080,10 @@ Please verify the user journey steps or selectors. If credentials are required, 
         cookie_notes=cookie_notes,
         correlation_advice_summary=advice.summary or "",
         extra_run_note="",  # never expose LLM/process internals in chat
+        smoke_result=smoke_result,
+        heal_notes=heal_notes,
+        brief=True,
     )
-    try:
-        from src.utils.k6_healer import format_smoke_section
-
-        if smoke_result:
-            summary_markdown += "\n" + format_smoke_section(smoke_result, heal_notes)
-    except Exception:
-        pass
 
     return {
         "run_records": records,
@@ -968,6 +1138,25 @@ def after_watch_me_record(
     return "__end__"
 
 
+def after_load_saved_recording(
+    state: AgentState,
+) -> Literal["analyse_traffic", "replay_recorded_journey", "__end__"]:
+    """Route a loaded recording to analysis, replay, or end.
+
+    Args:
+        state: State after :func:`load_saved_recording`.
+
+    Returns:
+        Next node or END for list/missing/empty recordings.
+    """
+    status = state.get("watch_me_status") or ""
+    if status == "ready_analyse":
+        return "analyse_traffic"
+    if status == "ready_replay":
+        return "replay_recorded_journey"
+    return "__end__"
+
+
 # Node updates merge into AgentState; conditional edges choose lightweight or full flow.
 workflow = StateGraph(AgentState)
 
@@ -978,6 +1167,7 @@ workflow.add_node("orchestrate_journey", orchestrate_journey)
 workflow.add_node("plan_navigator_steps", plan_navigator_steps)
 workflow.add_node("watch_me_record", watch_me_record)
 workflow.add_node("replay_recorded_journey", replay_recorded_journey)
+workflow.add_node("load_saved_recording", load_saved_recording)
 workflow.add_node("run_automation", run_automation)
 workflow.add_node("analyse_traffic", analyse_traffic)
 
@@ -989,6 +1179,7 @@ workflow.add_conditional_edges(
         "respond_conversation": "respond_conversation",
         "answer_analysis_question": "answer_analysis_question",
         "orchestrate_journey": "orchestrate_journey",
+        "load_saved_recording": "load_saved_recording",
     },
 )
 workflow.add_edge("respond_conversation", END)
@@ -1006,6 +1197,15 @@ workflow.add_conditional_edges(
     "watch_me_record",
     after_watch_me_record,
     {
+        "replay_recorded_journey": "replay_recorded_journey",
+        "__end__": END,
+    },
+)
+workflow.add_conditional_edges(
+    "load_saved_recording",
+    after_load_saved_recording,
+    {
+        "analyse_traffic": "analyse_traffic",
         "replay_recorded_journey": "replay_recorded_journey",
         "__end__": END,
     },

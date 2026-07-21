@@ -1,7 +1,7 @@
 """Render correlation analysis as Markdown and structured performance-test output."""
 
 import re
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Optional, Set
 from urllib.parse import urlparse
 
 from src.utils.correlation_noise import (
@@ -596,15 +596,33 @@ def format_correlation_report(
     cookie_notes: List[Any] = None,
     correlation_advice_summary: str = "",
     extra_run_note: str = "",
+    smoke_result: Optional[Dict[str, Any]] = None,
+    heal_notes: Optional[List[str]] = None,
+    brief: bool = True,
 ) -> str:
     """Build the user-facing Markdown performance analysis report.
 
-    Default product shape: playbook → params → correlations → session → TXNs → k6.
+    When ``brief`` is True (default), return a short summary + next script
+    enhancements. Full playbook/tables are omitted from chat (details live in
+    the k6 / IR / HTML artifacts).
     """
     correlations = correlations or []
     transactions = transactions or []
     k6_file = k6_file or {}
     cookie_notes = cookie_notes or []
+    heal_notes = heal_notes or []
+    smoke_result = smoke_result or {}
+
+    if brief:
+        return format_analysis_brief(
+            transactions=transactions,
+            parameterizable_candidates=parameterizable_candidates,
+            dependencies=dependencies,
+            cookie_notes=cookie_notes,
+            k6_file=k6_file,
+            smoke_result=smoke_result,
+            heal_notes=heal_notes,
+        )
 
     summary_markdown = "## Performance Test Analysis\n\n"
     summary_markdown += (
@@ -613,7 +631,6 @@ def format_correlation_report(
         "**Session** = cookie jar after login._\n\n"
     )
 
-    # Playbook first — the product users judge
     summary_markdown += build_scripting_playbook(
         transactions=transactions,
         parameterizable_candidates=parameterizable_candidates,
@@ -622,7 +639,6 @@ def format_correlation_report(
     )
     summary_markdown += "\n"
 
-    # Optional short peer summary — never LLM process chatter
     advice = (correlation_advice_summary or "").strip()
     if advice and not re.search(
         r"\b(LLM|deterministic cookie-diff|fallback|extra run)\b",
@@ -665,6 +681,149 @@ def format_correlation_report(
         )
 
     return summary_markdown
+
+
+def format_analysis_brief(
+    *,
+    transactions: List[Dict[str, Any]],
+    parameterizable_candidates: List[Dict[str, Any]],
+    dependencies: List[Dict[str, Any]],
+    cookie_notes: List[Any],
+    k6_file: Dict[str, str],
+    smoke_result: Dict[str, Any],
+    heal_notes: List[str],
+) -> str:
+    """Short chat summary: what ran + what to improve next in the script."""
+    txn_names = [
+        str(t.get("name"))
+        for t in (transactions or [])
+        if t.get("name") and t.get("name") != "Launch"
+    ]
+    csv_cols: List[str] = []
+    seen: Set[str] = set()
+    for cand in parameterizable_candidates or []:
+        var = str(cand.get("variable_name") or "").strip()
+        if var and var not in seen:
+            seen.add(var)
+            csv_cols.append(var)
+
+    corr_vars: List[str] = []
+    seen_c: Set[str] = set()
+    for dep in dependencies or []:
+        var = str(dep.get("variable") or dep.get("var") or "").strip()
+        if var and var not in seen_c:
+            seen_c.add(var)
+            corr_vars.append(var)
+
+    cookies: List[str] = []
+    for n in cookie_notes or []:
+        if isinstance(n, dict):
+            name = n.get("cookie_name")
+            must = n.get("must_correlate", True)
+        else:
+            name = getattr(n, "cookie_name", None)
+            must = getattr(n, "must_correlate", True)
+        if name and must:
+            cookies.append(str(name))
+    cookies = list(dict.fromkeys(cookies))
+
+    script_rel = (
+        k6_file.get("relative_path")
+        or k6_file.get("filename")
+        or k6_file.get("path")
+        or "(not saved)"
+    )
+    html_report = smoke_result.get("html_report") or ""
+    smoke_ok = smoke_result.get("ok")
+    smoke_skipped = smoke_result.get("skipped")
+    fail_rate = smoke_result.get("http_fail_rate")
+    if fail_rate is None and smoke_result.get("metrics"):
+        try:
+            fail_rate = float(
+                ((smoke_result.get("metrics") or {}).get("http_req_failed") or {}).get(
+                    "value", 0
+                )
+            )
+        except Exception:
+            fail_rate = None
+    if smoke_skipped:
+        smoke_line = f"skipped — {smoke_result.get('summary') or 'k6 unavailable'}"
+    elif smoke_ok:
+        smoke_line = "passed (1 VU × 2 iterations)"
+    elif smoke_result:
+        fails = smoke_result.get("failed_checks") or []
+        extra = f" — e.g. `{fails[0]}`" if fails else ""
+        rate_bit = ""
+        if isinstance(fail_rate, (int, float)) and fail_rate > 0:
+            rate_bit = f", ~{fail_rate * 100:.0f}% HTTP failed"
+        smoke_line = (
+            f"**not production-ready** (`{smoke_result.get('summary') or 'k6'}`"
+            f"{rate_bit}){extra}"
+        )
+    else:
+        smoke_line = "not run"
+
+    journey = " → ".join(f"`{n}`" for n in txn_names[:10]) or "_no TXNs_"
+
+    lines = [
+        "## Analysis complete",
+        "",
+        f"- **Journey:** {journey}",
+        f"- **k6 script:** `{script_rel}`",
+        f"- **Smoke:** {smoke_line}",
+    ]
+    if html_report:
+        lines.append(f"- **HTML report:** `{html_report}`")
+    if not smoke_ok and not smoke_skipped and smoke_result:
+        lines.append(
+            "- **Status:** draft only — fix auth/correlations until smoke is green "
+            "before treating this as a load script."
+        )
+    lines.append("")
+    lines.append("### What we did")
+    lines.append(
+        f"- Built {len(txn_names)} user TXNs, "
+        f"{len(csv_cols)} CSV params, "
+        f"{len(corr_vars)} correlations"
+        + (f", session cookie(s) {', '.join(f'`{c}`' for c in cookies)}" if cookies else "")
+        + "."
+    )
+    lines.append(
+        "- Emitted deterministic k6 (assertions + metrics) and ran smoke with heal."
+    )
+    if heal_notes:
+        lines.append(f"- Heal applied: {heal_notes[0]}")
+    lines.append("")
+    lines.append("### Enhance the script next")
+    enh: List[str] = []
+    if csv_cols:
+        enh.append(
+            "Drive CSV columns: " + ", ".join(f"`{c}`" for c in csv_cols) + "."
+        )
+    if corr_vars:
+        enh.append(
+            "Wire extracts (do not hardcode IDs): "
+            + ", ".join(f"`{c}`" for c in corr_vars)
+            + "."
+        )
+    if cookies:
+        enh.append(
+            "Keep "
+            + ", ".join(f"`{c}`" for c in cookies)
+            + " in the cookie jar after login."
+        )
+    fails = list(smoke_result.get("failed_checks") or [])[:5]
+    if fails:
+        enh.append("Fix failing checks: " + ", ".join(f"`{f}`" for f in fails) + ".")
+    if not smoke_ok and not smoke_skipped and smoke_result:
+        enh.append(
+            "Re-run smoke after correlations; open the HTML report for URL/status failures."
+        )
+    enh.append("Scale VUs / iterations only after smoke is green.")
+    for i, item in enumerate(enh, 1):
+        lines.append(f"{i}. {item}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def format_transactions_section(transactions: List[Dict[str, Any]]) -> str:
