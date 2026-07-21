@@ -21,7 +21,21 @@ IntentName = Literal[
     "analysis_qa",
     "performance_analysis",
     "follow_up_analysis",
+    "watch_me",
 ]
+
+WATCH_ME_KEYWORDS = re.compile(
+    r"\b("
+    r"watch\s+me|"
+    r"record\s+while\s+i|"
+    r"i('?ll| will)\s+click|"
+    r"interactive\s+record|"
+    r"record\s+my\s+(clicks|actions|flow)|"
+    r"i\s+will\s+(drive|navigate)|"
+    r"open\s+(a\s+)?browser\s+(and\s+)?(i|let\s+me)"
+    r")\b",
+    re.IGNORECASE,
+)
 
 ANALYSIS_KEYWORDS = re.compile(
     r"\b("
@@ -80,6 +94,7 @@ class IntentDecision(BaseModel):
         description=(
             "conversation = casual chat / math / greetings unrelated to prior analysis; "
             "analysis_qa = question about prior analysis results in this chat (tokens, correlations, params); "
+            "watch_me = user will click in a headed browser the bot opens; "
             "performance_analysis = new URL/journey to run the full pipeline; "
             "follow_up_analysis = explicitly rerun the previous journey"
         )
@@ -149,12 +164,19 @@ def _heuristic_intent(
     has_structured = bool(STRUCTURED_KEYS_RE.search(cleaned))
     has_analysis_kw = bool(ANALYSIS_KEYWORDS.search(cleaned))
     has_result_qa = bool(RESULT_QA_KEYWORDS.search(cleaned))
+    wants_watch_me = bool(WATCH_ME_KEYWORDS.search(cleaned))
 
     looks_like_recording = (
         '"type":' in cleaned
         and '"steps"' in cleaned
         and any(tok in cleaned for tok in ('"click"', '"change"', '"navigate"', '"setViewport"'))
     )
+
+    # Interactive Watch-me recording beats automated performance_analysis
+    if wants_watch_me:
+        if has_url:
+            return "watch_me", 0.96, "Watch-me recording requested with URL"
+        return "watch_me", 0.9, "Watch-me recording requested (URL may come from extract)"
 
     # New journey payload always wins
     if has_url or has_structured or looks_like_recording:
@@ -283,7 +305,9 @@ def _default_conversation_reply(text: str, has_prior: bool = False) -> str:
             "Hi! I’m the NFE performance-testing agent.\n\n"
             "I can analyze a browser user journey for **parameterization** and **correlation** "
             "(dynamic values between requests).\n\n"
-            "To start, send a target URL plus journey steps (or a recording JSON)."
+            "To start:\n"
+            "- Send a target URL plus journey steps, **or**\n"
+            "- Say **watch me** with a URL — I’ll open a browser; click through, then **Done recording**."
         )
 
     math = re.search(r"(\d+)\s*([\+\-\*/])\s*(\d+)", cleaned)
@@ -304,7 +328,8 @@ def _default_conversation_reply(text: str, has_prior: bool = False) -> str:
 
     return (
         "I can chat about performance testing here. "
-        "To run the specialized agents, provide a **target URL** and **user journey**."
+        "Provide a **target URL** and **user journey**, or say **watch me** with a URL "
+        "so you can click through in a browser I open."
     )
 
 

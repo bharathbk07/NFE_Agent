@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 from src.utils.model_router import TaskType, get_model_router
 from src.utils.perf_test_classification import (
     is_placeholder_value,
+    looks_like_person_name,
+    looks_like_server_id,
     suggest_correlation_var_name,
 )
 from src.utils.prompt_loader import load_prompt_text
@@ -438,12 +440,25 @@ def apply_correlation_advice(
         A tuple of retained parameters, correlations, and dependencies.
     """
     promote: Dict[str, FillClassification] = {}
+    step_value_by_sel: Dict[str, str] = {}
+    for step in user_steps or []:
+        if isinstance(step, dict) and step.get("action") in ("fill", "select"):
+            sel = str(step.get("selector") or "").strip()
+            if sel:
+                step_value_by_sel[sel] = str(step.get("value") or "")
+
     for fc in advice.fill_classifications or []:
         if fc.classification != "correlation":
             continue
         key = (fc.selector or "").strip()
-        if key:
-            promote[key] = fc
+        if not key:
+            continue
+        val = step_value_by_sel.get(key, "")
+        if looks_like_person_name(val):
+            continue
+        if val and not is_placeholder_value(val) and not looks_like_server_id(val):
+            continue
+        promote[key] = fc
 
     if not promote:
         return parameterizable_candidates, correlations, dependencies
@@ -472,12 +487,16 @@ def apply_correlation_advice(
         if sel not in promote:
             continue
         fc = promote[sel]
+        value = str(step.get("value") or "")
         var = (
             fc.variable_name
-            or suggest_correlation_var_name(sel, "correlated_value")
+            or suggest_correlation_var_name(sel, "reference_id")
         )
-        var = re.sub(r"[^a-zA-Z0-9_]", "_", var).strip("_") or "correlated_value"
-        value = str(step.get("value") or "")
+        if (var or "").lower() in ("referenceid", "reference_id", "ref_id") and not (
+            looks_like_server_id(value) or is_placeholder_value(value)
+        ):
+            continue
+        var = re.sub(r"[^a-zA-Z0-9_]", "_", var).strip("_") or "reference_id"
         if is_placeholder_value(value):
             value = ""
         dep_key = (var, sel)
@@ -522,47 +541,40 @@ def apply_correlation_advice(
 
 
 def format_cookie_notes_section(notes: List[CookieRelationNote] | List[Dict]) -> str:
-    """Render cookie guidance as a Markdown report section.
+    """Render plain-English session/cookie guidance for scripting.
 
     Args:
         notes: Cookie note models or equivalent dictionaries.
 
     Returns:
-        A Markdown table, or default cookie-jar advice when no notes exist.
+        Short bullet guidance, not an analyst confidence table.
     """
     if not notes:
         return (
-            "_No explicit cookie correlation notes. "
-            "Still enable the HTTP cookie jar in load scripts after login._\n"
+            "- After login, keep the HTTP **cookie jar** enabled so session cookies "
+            "are sent on later APIs automatically.\n"
         )
-    lines = [
-        "| Cookie | Must correlate? | Confidence | Extract / Pass | Note |",
-        "| --- | --- | --- | --- | --- |",
-    ]
+    lines: List[str] = []
     for n in notes:
         if isinstance(n, CookieRelationNote):
             data = n.model_dump()
         else:
             data = n
-        extract_pass = (
-            f"{data.get('extract_hint') or '—'} → {data.get('pass_to_hint') or '—'}"
-        )
-        lines.append(
-            "| "
-            + " | ".join(
-                [
-                    f"`{data.get('cookie_name', '')}`",
-                    "yes" if data.get("must_correlate") else "verify",
-                    str(data.get("confidence") or "uncertain"),
-                    extract_pass.replace("|", "\\|"),
-                    str(data.get("note") or "").replace("|", "\\|")[:200],
-                ]
+        name = data.get("cookie_name") or "?"
+        must = bool(data.get("must_correlate"))
+        note = (data.get("note") or "").strip()
+        if must:
+            lines.append(
+                f"- After login, keep cookie `{name}` in the jar for all later APIs"
+                + (f" — {note}" if note else ".")
             )
-            + " |"
+        else:
+            lines.append(
+                f"- Verify whether cookie `{name}` is required for authenticated APIs"
+                + (f" — {note}" if note else ".")
+            )
+    if not lines:
+        lines.append(
+            "- After login, keep the HTTP **cookie jar** enabled for session continuity."
         )
-    lines.append("")
-    lines.append(
-        "_If confidence is **uncertain**, keep cookie jar auto-handling enabled "
-        "and confirm which cookie names your app requires for auth._"
-    )
     return "\n".join(lines) + "\n"

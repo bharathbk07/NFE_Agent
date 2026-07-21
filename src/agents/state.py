@@ -113,4 +113,6 @@ class AgentState(TypedDict):
     performance_test_output: NotRequired[Dict[str, Any]]
     correlation_advice: NotRequired[Dict[str, Any]]
     cookie_correlation_notes: NotRequired[List[Dict[str, Any]]]
+    recording_mode: NotRequired[str]  # "watch_me" | unset
+    watch_me_status: NotRequired[str]
     error_log: NotRequired[List[str]]

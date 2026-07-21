@@ -123,6 +123,60 @@ def _param_placeholders(
     return body
 
 
+def _substitute_url_values(url: str, vars_by_value: Dict[str, str]) -> str:
+    """Replace known correlation/parameter literals in a URL with ``${var}``.
+
+    Longer values are applied first so partial overlaps prefer the full ID.
+    Digit-only IDs are replaced only as path segments or query values so
+    ``22`` cannot corrupt ``222``.
+    """
+    if not url or not vars_by_value:
+        return url
+    out = url
+    for literal, var in sorted(
+        vars_by_value.items(), key=lambda kv: len(kv[0] or ""), reverse=True
+    ):
+        if not literal:
+            continue
+        placeholder = f"${{{var}}}"
+        if literal.isdigit():
+            # Path segment: /{id}/ or /{id}? or /{id}$
+            out = re.sub(
+                rf"(?<=/)({re.escape(literal)})(?=/|\?|$)",
+                placeholder,
+                out,
+            )
+            # Query value: ={id}& or ={id}$
+            out = re.sub(
+                rf"(=)({re.escape(literal)})(?=&|$)",
+                rf"\1{placeholder}",
+                out,
+            )
+            continue
+        if len(literal) < 2:
+            continue
+        if literal in out:
+            out = out.replace(literal, placeholder)
+    return out
+
+
+def _substitute_headers(
+    headers: Dict[str, str], vars_by_value: Dict[str, str]
+) -> Dict[str, str]:
+    """Replace known literals in header values with ``${var}`` placeholders."""
+    out: Dict[str, str] = {}
+    for k, v in (headers or {}).items():
+        s = str(v)
+        replaced = s
+        for literal, var in sorted(
+            vars_by_value.items(), key=lambda kv: len(kv[0] or ""), reverse=True
+        ):
+            if literal and literal in replaced:
+                replaced = replaced.replace(literal, f"${{{var}}}")
+        out[k] = replaced
+    return out
+
+
 def _headers_for_ir(headers: Dict[str, Any]) -> Dict[str, str]:
     """Filter captured headers to stable replay-safe IR headers.
 
@@ -152,21 +206,13 @@ def _headers_for_ir(headers: Dict[str, Any]) -> Dict[str, str]:
 def _infer_txn_mode(txn: Dict[str, Any], requests: List[Dict[str, Any]]) -> str:
     """Choose protocol or browser replay from transaction evidence.
 
-    Args:
-        txn: Transaction containing optional UI steps.
-        requests: Normalized protocol requests associated with the transaction.
-
-    Returns:
-        ``browser`` for UI-dependent flows, otherwise ``protocol``.
+    Prefer protocol when meaningful HTTP exists (API apps like OrangeHRM).
+    Browser only when the phase is UI-only with little/no HTTP.
     """
     ui_steps = txn.get("ui_steps") or []
-    interactive = any(
-        (s.get("action") or "") in ("click", "fill", "select") for s in ui_steps
-    )
-    urls = {(r.get("url") or "").rstrip("/") for r in requests}
-    if not requests and ui_steps:
-        return "browser"
-    if interactive and len(ui_steps) >= 2 and len(urls) <= 1:
+    if requests:
+        return "protocol"
+    if ui_steps:
         return "browser"
     return "protocol"
 
@@ -194,20 +240,32 @@ def build_load_test_ir(
     """
     network_requests = network_requests or []
 
-    # Excluding observed correlation values prevents server output from becoming
-    # static load-test data.
+    # Excluding observed correlation values from *parameter* vars prevents
+    # server output from becoming static CSV data. Correlation literals are
+    # tracked separately so they can be substituted into URL/body/headers.
     vars_list: List[Dict[str, Any]] = []
     seen_vars: Set[str] = set()
     vars_by_value: Dict[str, str] = {}
     corr_values: Set[str] = set()
     corr_var_names: Set[str] = set()
+    corr_by_value: Dict[str, str] = {}
     for dep in dependencies or []:
-        if dep.get("run1_value"):
-            corr_values.add(str(dep["run1_value"]))
-        if dep.get("run2_value"):
-            corr_values.add(str(dep["run2_value"]))
+        var = _safe_ident(str(dep.get("value_key") or "token"), "token")
         if dep.get("value_key"):
-            corr_var_names.add(_safe_ident(str(dep["value_key"]), "token"))
+            corr_var_names.add(var)
+        for key in ("run1_value", "run2_value"):
+            if dep.get(key):
+                lit = str(dep[key])
+                corr_values.add(lit)
+                # Prefer longer / first-seen mapping for substitution
+                if lit and lit not in corr_by_value:
+                    # Skip person-name literals
+                    if " " in lit and not lit.isdigit():
+                        continue
+                    # Allow short digit IDs (path segments); skip other 1-char noise
+                    if len(lit) < 2 and not lit.isdigit():
+                        continue
+                    corr_by_value[lit] = var
 
     for cand in parameterizable_candidates or []:
         name = _safe_ident(cand.get("variable_name") or "input")
@@ -228,6 +286,12 @@ def build_load_test_ir(
         )
         if value and value not in vars_by_value:
             vars_by_value[value] = name
+
+    # Combined map: params + correlations for URL/body/header substitution
+    subst_by_value: Dict[str, str] = dict(vars_by_value)
+    for lit, var in corr_by_value.items():
+        if lit not in subst_by_value:
+            subst_by_value[lit] = var
 
     # Stable first-seen deduplication keeps downstream emitter output reproducible.
     corr_list: List[Dict[str, Any]] = []
@@ -278,8 +342,15 @@ def build_load_test_ir(
 
     # Transaction order follows analysis order, as execution order is meaningful.
     txn_list: List[Dict[str, Any]] = []
+    used_txn_names: Set[str] = set()
     for txn in transactions or []:
-        name = _safe_ident(txn.get("name") or "Txn", "Txn")
+        base_name = _safe_ident(txn.get("name") or "Txn", "Txn")
+        name = base_name
+        suffix = 2
+        while name in used_txn_names:
+            name = f"{base_name}_{suffix}"
+            suffix += 1
+        used_txn_names.add(name)
         step_indices = txn.get("step_indices")
         entries = txn.get("http_entries") or []
         requests_ir: List[Dict[str, Any]] = []
@@ -317,7 +388,10 @@ def build_load_test_ir(
                 else:
                     body = raw_body
                 headers = _headers_for_ir(full.get("headers") or {})
-            body = _param_placeholders(body, vars_by_value)
+            # Params + correlations into body/URL/headers (extract→pass)
+            body = _param_placeholders(body, subst_by_value)
+            url = _substitute_url_values(url, subst_by_value)
+            headers = _substitute_headers(headers, subst_by_value)
 
             requests_ir.append(
                 {

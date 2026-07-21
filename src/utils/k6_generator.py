@@ -62,6 +62,20 @@ def _resolve_var_expr(value: Any) -> str:
     return _js_string(s)
 
 
+def _template_js(text: str) -> str:
+    """Emit a JS string or template literal when ``${var}`` placeholders exist."""
+    s = str(text or "")
+    if "${" not in s:
+        return _js_string(s)
+
+    def repl(match: re.Match) -> str:
+        return f"${{vars.{match.group(1)}}}"
+
+    tmpl = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, s)
+    tmpl = tmpl.replace("\\", "\\\\").replace("`", "\\`")
+    return f"`{tmpl}`"
+
+
 def _body_to_js(body: Any, body_type: str) -> Tuple[str, Optional[str]]:
     """Render an IR body as a JavaScript expression.
 
@@ -101,45 +115,71 @@ def _body_to_js(body: Any, body_type: str) -> Tuple[str, Optional[str]]:
     return _resolve_var_expr(body), None
 
 
+def _url_path_signature(url: str) -> str:
+    """Path signature with ``${var}`` and numeric ID segments wildcarded."""
+    try:
+        path = urlparse(url or "").path
+    except Exception:
+        path = url or ""
+    segs = []
+    for s in path.split("/"):
+        if not s:
+            continue
+        if s.isdigit() or re.fullmatch(r"\$\{[^}]+\}", s):
+            segs.append("{id}")
+        else:
+            segs.append(s)
+    return "/" + "/".join(segs)
+
+
+def _url_loose_match(a: str, b: str) -> bool:
+    """Match URLs ignoring trailing slashes, query, ``${var}``, and path IDs."""
+    if not a or not b:
+        return False
+    if a.rstrip("/") == b.rstrip("/"):
+        return True
+    # Strip query for structural compare; correlated IDs live in path/query.
+    try:
+        pa = urlparse(re.sub(r"\$\{[^}]+\}", "X", a))
+        pb = urlparse(re.sub(r"\$\{[^}]+\}", "X", b))
+        if pa.netloc == pb.netloc and pa.path.rstrip("/") == pb.path.rstrip("/"):
+            return True
+        # Path IDs: /employees/88 vs /employees/${employees}
+        if pa.netloc == pb.netloc and _url_path_signature(a) == _url_path_signature(b):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def _extract_snippets_for_txn(
     txn_name: str,
     correlations: List[Dict[str, Any]],
     request_urls: List[str],
+    *,
+    res_var: str = "res",
 ) -> List[str]:
-    """Generate extraction statements for matching response sources.
-
-    Args:
-        txn_name: Transaction name retained for emitter context.
-        correlations: IR correlation definitions.
-        request_urls: URLs represented by the current transaction or response.
-
-    Returns:
-        Ordered JavaScript lines for applicable extractions and notes.
-    """
+    """Generate extraction statements for matching response sources."""
     lines: List[str] = []
-    url_set = set(request_urls)
     for c in correlations:
         if c.get("auto_cookie"):
             continue
         src = c.get("extract") or {}
         from_req = src.get("from_request") or ""
-        if from_req and from_req not in url_set:
-            # Also match if any request URL equals or shares path
-            if not any(from_req.rstrip("/") == u.rstrip("/") for u in url_set):
-                continue
+        if not from_req:
+            continue
+        if not any(_url_loose_match(from_req, u) for u in request_urls):
+            continue
         var = _safe_ident(c.get("var") or "token", "token")
         loc = str(src.get("from_location") or "")
         if loc.startswith("body.$") or loc.startswith("body."):
             path = loc[len("body.") :] if loc.startswith("body.") else loc
-            # k6 json path: $.token → 'token' or nested
             jp = path.lstrip("$.").replace(".", ".")
             if jp.startswith("$"):
                 jp = jp[1:].lstrip(".")
+            lines.append(f"    // Correlation extract `{var}` from {loc}")
             lines.append(
-                f"    // Correlation extract `{var}` from {loc}"
-            )
-            lines.append(
-                f"    vars.{var} = res.json({_js_string(jp)}) || vars.{var};"
+                f"    vars.{var} = {res_var}.json({_js_string(jp)}) || vars.{var};"
             )
         elif "set-cookie" in loc.lower():
             lines.append(
@@ -147,8 +187,7 @@ def _extract_snippets_for_txn(
             )
         elif "ui." in loc.lower():
             lines.append(
-                f"    // UI correlation `{var}`: read from page after submit/create "
-                f"(see browser TXN before this request)"
+                f"    // UI correlation `{var}`: read from page after submit/create"
             )
         else:
             lines.append(
@@ -180,14 +219,17 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
 
     for i, r in enumerate(reqs):
         method = (r.get("method") or "GET").upper()
-        url_js = _js_string(r.get("url"))
+        url_js = _template_js(r.get("url") or "")
         var = "res" if i == 0 else f"res{i}"
         body_js, ct = _body_to_js(r.get("body"), r.get("body_type") or "empty")
         headers = dict(r.get("headers") or {})
         if ct and "content-type" not in {h.lower() for h in headers}:
             headers["Content-Type"] = ct
 
-        header_parts = [f"{_js_string(k)}: {_js_string(v)}" for k, v in headers.items()]
+        header_parts = [
+            f"{_js_string(k)}: {_template_js(v) if '${' in str(v) else _js_string(v)}"
+            for k, v in headers.items()
+        ]
         headers_js = "{ " + ", ".join(header_parts) + " }" if header_parts else "{}"
 
         params_obj = (
@@ -216,23 +258,28 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
             body_lines.append(
                 f"    const {var} = http.request({_js_string(method)}, {url_js}, {body_js}, {params_obj});"
             )
-        body_lines.append(
-            f"    check({var}, {{ '{name} {method} {i+1} is 2xx': "
-            f"(r) => r.status >= 200 && r.status < 300 }});"
-        )
-
-        # Extract correlations after the last matching source response
-        if i == len(reqs) - 1 or (r.get("url") in {
-            (c.get("extract") or {}).get("from_request") for c in correlations
-        }):
-            body_lines.extend(
-                _extract_snippets_for_txn(name, correlations, [r.get("url") or ""])
+        if r.get("soft_check"):
+            body_lines.append(
+                f"    check({var}, {{ '{name} {method} {i+1} soft': "
+                f"(r) => r.status > 0 && r.status < 500 }});"
             )
+        else:
+            body_lines.append(
+                f"    check({var}, {{ '{name} {method} {i+1} is 2xx': "
+                f"(r) => r.status >= 200 && r.status < 300 }});"
+            )
+
+        # Extract after this response when it matches a correlation source URL
+        # (compare without ${} placeholders — use path presence)
+        raw_url = r.get("url") or ""
+        body_lines.extend(
+            _extract_snippets_for_txn(
+                name, correlations, [raw_url], res_var=var
+            )
+        )
 
     if not body_lines:
         body_lines.append("    // No protocol HTTP for this TXN — check browser mode")
-
-    extracts_note = _extract_snippets_for_txn(name, correlations, urls)
 
     return f"""
 export function {name}() {{
@@ -328,14 +375,17 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
         f"  {v['name']}: {_js_string(v.get('value'))}" for v in vars_list
     ) or "  // no parameters detected"
 
-    # Mutable bag for runtime correlation extracts
+    # Mutable bag for runtime correlation extracts (unique names only)
     corr_var_decls = []
+    seen_var_names = {v["name"] for v in vars_list}
     for c in correlations:
         if c.get("auto_cookie"):
             continue
         var = _safe_ident(c.get("var") or "token", "token")
-        if var not in {v["name"] for v in vars_list}:
-            corr_var_decls.append(f"  {var}: '', // filled by correlation extract")
+        if var in seen_var_names:
+            continue
+        seen_var_names.add(var)
+        corr_var_decls.append(f"  {var}: '', // filled by correlation extract")
 
     if corr_var_decls:
         if param_block.startswith("  //"):
@@ -445,16 +495,17 @@ import {{ check, group, sleep }} from 'k6';
 
 export const options = {{
   scenarios: {{
-    ui: {{
+    smoke: {{
       executor: 'shared-iterations',
       vus: 1,
-      iterations: 1,
+      iterations: 2,
+      maxDuration: '2m',
       options: {{ browser: {{ type: 'chromium' }} }},
     }},
   }},
   thresholds: {{
     http_req_failed: ['rate<0.01'],
-    http_req_duration: ['p(95)<2000'],
+    checks: ['rate>0.99'],
   }},
 }};
 
@@ -491,11 +542,17 @@ import {{ check, group, sleep }} from 'k6';
  */
 
 export const options = {{
-  vus: 1,
-  duration: '30s',
+  scenarios: {{
+    smoke: {{
+      executor: 'shared-iterations',
+      vus: 1,
+      iterations: 2,
+      maxDuration: '2m',
+    }},
+  }},
   thresholds: {{
     http_req_failed: ['rate<0.01'],
-    http_req_duration: ['p(95)<2000'],
+    checks: ['rate>0.99'],
   }},
 }};
 

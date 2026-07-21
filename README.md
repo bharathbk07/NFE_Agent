@@ -67,9 +67,41 @@ The agent is fully compatible with **LangGraph Studio**, providing a visual inte
 Ensure you have the LangGraph CLI installed, then start the development server:
 ```bash
 pip install langgraph-cli
-langgraph dev
+langgraph dev --allow-blocking
 ```
 Once started, the CLI will output a local URL (typically `http://localhost:2024` or similar). Open this URL in your web browser or load the directory in the desktop version of **LangGraph Studio** to interact with the graph.
+
+`--allow-blocking` is required for Playwright (and Watch-me headed capture) under the LangGraph runtime.
+
+---
+
+## Watch-me mode (interactive recording)
+
+Stay in one product: chat plus a browser window the agent opens. No DevTools, no HAR export.
+
+1. In Studio chat, send a URL (credentials optional) and say **watch me** / **record while I click**.
+2. The agent opens a **headed** Chromium window at that URL.
+3. Click through your journey. Use the overlay like commercial recorders:
+   - **Start TXN** — type a name (e.g. `Login`, `Assign_Claim`) then confirm before that phase
+   - **End TXN** — close the current transaction (optional; starting another TXN auto-ends the previous)
+   - **Pause** / **Resume**, **Done**, or **Cancel**; drag the handle to move the panel
+4. Click **Done** when finished (or **Cancel** to abort without analysis).
+5. The agent saves your steps + network as Run 1, **auto-replays** headless as Run 2, then runs analysis and emits a **k6 smoke script** (`1 VU` × `2 iterations`).
+6. If `k6` is on your `PATH`, the agent **runs the smoke** and applies deterministic self-heal (drop chrome GETs, relax optional checks, retarget extracts) up to twice before delivering the file.
+
+Correlation focuses on cookies, body/query tokens, and auth/CSRF headers — not generic request headers (Accept, User-Agent, sec-fetch-*, etc.).
+
+Install k6 for smoke validation: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). The bot loads Grafana’s **k6 MCP** from [`config/mcp_servers.json`](config/mcp_servers.json) (`k6 x mcp`) to validate/run scripts during heal; CLI `k6 run` is the fallback. Optionally also wire Cursor with `k6 x agent init cursor` ([docs](https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/)).
+
+**Requirements:** a local display (macOS/Linux desktop). Remote or headless-only Studio hosts without a display are unsupported for Watch-me — use local `langgraph dev --allow-blocking`.
+
+**Example prompt:**
+```text
+watch me https://www.saucedemo.com/
+username=standard_user password=secret_sauce
+```
+
+Natural-language journey analysis (bot plans and clicks for you) still works as before — omit “watch me” and include journey steps.
 
 ---
 

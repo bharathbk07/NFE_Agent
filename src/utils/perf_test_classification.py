@@ -21,6 +21,10 @@ from src.utils.http_body import (
     flatten_body_fields,
     parse_post_data,
 )
+from src.utils.correlation_noise import (
+    is_login_field_selector,
+    is_static_asset_url,
+)
 
 # Field labels / selectors that indicate server-generated lookup values
 CORRELATION_FIELD_RE = re.compile(
@@ -47,8 +51,50 @@ GENERATED_NUMERIC_ID_RE = re.compile(r"^\d{10,}$")
 UUID_PREFIX_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-", re.IGNORECASE
 )
+# OrangeHRM-style claim refs and similar opaque server IDs
+SERVER_ID_RE = re.compile(
+    r"^(?:\d{12,}|[A-Z]{1,5}-?\d{6,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
+PERSON_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z\s.'\-]{2,60}$")
 
 CREATE_URL_HINTS = ("claim", "order", "submit", "create", "checkout", "invoice")
+
+
+def looks_like_server_id(value: str) -> bool:
+    """Return True for opaque server-issued IDs (not names or remarks)."""
+    v = str(value or "").strip()
+    if not v or is_placeholder_value(v):
+        return False
+    if is_generated_id_value(v):
+        return True
+    if " " in v:
+        return False
+    return bool(SERVER_ID_RE.match(v))
+
+
+def looks_like_person_name(value: str) -> bool:
+    """Return True for human names that must stay parameters."""
+    v = str(value or "").strip()
+    if not v or looks_like_server_id(v):
+        return False
+    if " " not in v:
+        return False
+    return bool(PERSON_NAME_RE.match(v))
+
+
+def leaf_name_from_location(location: str, fallback: str = "dynamic_value") -> str:
+    """Prefer ``referenceId`` from ``body.$.data.referenceId`` over generic names."""
+    loc = str(location or "")
+    parts = [
+        p
+        for p in re.split(r"[.\[]", loc)
+        if p and p not in ("$", "]", "body", "header", "query", "ui", "fill", "raw")
+    ]
+    if not parts:
+        return fallback
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", parts[-1]).strip("_")
+    return cleaned or fallback
 
 
 def is_placeholder_value(value: str) -> bool:
@@ -339,31 +385,49 @@ def should_treat_fill_as_correlation(
         if cred_val and str(cred_val).lower() in val_lower:
             return None
 
-    # Explicit correlation field (Reference Id, order id, etc.)
-    if is_correlation_field_selector(selector):
-        return suggest_correlation_var_name(selector, "reference_id")
+    # Login credentials are always parameters — never promote because "Admin"
+    # also appears in an i18n dictionary response.
+    if is_login_field_selector(selector):
+        return None
 
-    # Value appears in a prior HTTP response → server generated
-    for req in run1_requests or []:
-        try:
-            req_step = int(req.get("step_index", 999))
-        except Exception:
-            req_step = 999
-        if req_step >= step_index:
-            continue
-        origin = find_value_in_response(
-            value,
-            req.get("response_body") or "",
-            req.get("response_headers") or {},
-        )
-        if origin:
-            return suggest_correlation_var_name(selector, "extracted_value")
+    # Person names / free text the user typed are parameters (employee search, etc.)
+    if looks_like_person_name(value):
+        return None
+
+    # Explicit correlation field (Reference Id, order id, etc.) — only if the
+    # value looks like a server ID or is an explicit placeholder.
+    if is_correlation_field_selector(selector):
+        if is_placeholder_value(value) or looks_like_server_id(value):
+            return suggest_correlation_var_name(selector, "reference_id")
+        return None
+
+    # Value appears in a prior create/API response AND looks server-issued.
+    # Do not treat autocomplete echoes of typed names as correlations.
+    if looks_like_server_id(value):
+        for req in run1_requests or []:
+            if is_static_asset_url(req.get("url") or ""):
+                continue
+            try:
+                req_step = int(req.get("step_index", 999))
+            except Exception:
+                req_step = 999
+            if req_step >= step_index:
+                continue
+            origin = find_value_in_response(
+                value,
+                req.get("response_body") or "",
+                req.get("response_headers") or {},
+            )
+            if origin:
+                return leaf_name_from_location(
+                    origin, suggest_correlation_var_name(selector, "reference_id")
+                )
 
     # Long numeric / UUID after create-submit flow
     if is_generated_id_value(value) and step_index > 0:
         prior_sub = _prior_submit_step_index(user_steps, step_index)
         if prior_sub < step_index:
-            return suggest_correlation_var_name(selector, "generated_id")
+            return suggest_correlation_var_name(selector, "reference_id")
 
     return None
 
@@ -489,6 +553,7 @@ def trace_fill_correlations(
             and source_req
             else "ui_extract"
         )
+        var_name = leaf_name_from_location(source_location, var_name)
         dep = {
             "source_request": (source_req or {}).get("url") or "",
             "source_location": source_location,
@@ -635,4 +700,24 @@ def reconcile_analysis(
         run1_requests,
         credentials,
     )
+    from src.utils.correlation_noise import (
+        is_actionable_correlation,
+        is_actionable_dependency,
+    )
+
+    correlations = [c for c in correlations if is_actionable_correlation(c)]
+    dependencies = [d for d in dependencies if is_actionable_dependency(d)]
+    # Drop person-name false correlations that slipped through earlier stages.
+    from src.utils.perf_test_classification import looks_like_person_name
+
+    dependencies = [
+        d
+        for d in dependencies
+        if not looks_like_person_name(str(d.get("run1_value") or ""))
+    ]
+    correlations = [
+        c
+        for c in correlations
+        if not looks_like_person_name(str(c.get("run1_value") or ""))
+    ]
     return params, correlations, dependencies

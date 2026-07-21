@@ -258,6 +258,21 @@ async def extract_inputs_from_message(
             credentials = parsed_creds
         if parsed_journey:
             journey = parsed_journey
+
+        # Plain-text credential hints (common with Watch-me chat prompts)
+        if not credentials:
+            for key, pattern in (
+                ("username", r"(?i)\b(?:username|user)\s*[:=]\s*(\S+)"),
+                ("password", r"(?i)\b(?:password|pass)\s*[:=]\s*(\S+)"),
+            ):
+                m = re.search(pattern, latest)
+                if m:
+                    credentials[key] = m.group(1).rstrip(".,;")
+
+        # Watch-me: URL (+ optional credentials) is enough; journey is recorded live.
+        if state.get("intent") == "watch_me" and url:
+            return url, credentials, ""
+
         if ok and url:
             return url, credentials, journey
 
@@ -268,5 +283,8 @@ async def extract_inputs_from_message(
             dict(state.get("credentials") or {}),
             journey or get_latest_human_text(state.get("messages")),
         )
+
+    if state.get("intent") == "watch_me" and url:
+        return url, credentials, ""
 
     return url, credentials, journey

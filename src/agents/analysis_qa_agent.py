@@ -239,8 +239,8 @@ class AnalysisQAAgent:
                     note = ""
                     if any(t.get("http_entries") for t in txns):
                         note = (
-                            "_Built from captured network traffic (METHOD+URL per phase). "
-                            "UI-only SPA phases may also appear._\n\n"
+                            "_Business phases — user actions only "
+                            "(HTTP detail is in k6/IR, not listed here)._\n\n"
                         )
                     parts.append(note + format_transactions_section(txns))
 

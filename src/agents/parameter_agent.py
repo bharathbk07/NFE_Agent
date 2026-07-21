@@ -3,13 +3,17 @@
 import json
 import logging
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs
 
 from src.utils.http_body import (
     content_type_from_headers,
     flatten_body_fields,
     parse_post_data,
+)
+from src.utils.correlation_noise import (
+    is_login_field_selector,
+    is_static_asset_url,
 )
 from src.utils.perf_test_classification import (
     is_correlation_field_selector,
@@ -80,8 +84,18 @@ class ParameterAgent:
 
             propagations = self._find_propagations(val, val_lower, run1_requests)
             variable_name = (
-                cred_name if is_credential else self._suggest_variable_name(selector, val)
+                cred_name
+                if is_credential
+                else self._suggest_variable_name(selector, val, propagations)
             )
+            from src.utils.perf_test_classification import looks_like_person_name
+
+            if looks_like_person_name(val) and variable_name in (
+                "input_value",
+                "input",
+                "field",
+            ):
+                variable_name = "employee_name"
 
             parameterizable_candidates.append({
                 "selector": selector,
@@ -94,16 +108,40 @@ class ParameterAgent:
 
         return parameterizable_candidates
 
-    def _suggest_variable_name(self, selector: str, value: str) -> str:
+    def _suggest_variable_name(
+        self,
+        selector: str,
+        value: str,
+        propagations: Optional[List[str]] = None,
+    ) -> str:
         """Derive a stable load-test variable name.
+
+        Prefers network field names from observed propagation (e.g. ``remarks``,
+        ``nameOrId``) over fragile CSS paths or raw typed values.
 
         Args:
             selector: Playwright selector associated with the input.
             value: Literal input value used as a final naming fallback.
+            propagations: Optional human-readable propagation strings.
 
         Returns:
             A sanitized variable name suitable for generated scripts.
         """
+        # Prefer the first body/query field seen on the wire.
+        for prop in propagations or []:
+            for pattern in (
+                r"Body field `([^`]+)`",
+                r"Query `([^`]+)`",
+            ):
+                match = re.search(pattern, prop)
+                if match:
+                    field = match.group(1)
+                    # Use last path segment for nested JSON: data.remarks → remarks
+                    leaf = field.split(".")[-1].split("/")[-1]
+                    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", leaf).strip("_").lower()
+                    if cleaned and not cleaned.isdigit() and cleaned not in ("raw", "body"):
+                        return cleaned
+
         if is_correlation_field_selector(selector):
             return suggest_correlation_var_name(selector, "input_value")
         for pattern in [
@@ -112,6 +150,7 @@ class ParameterAgent:
             r'id=["\']?(\w+)',
             r'placeholder\*?=["\']?(\w+)',
             r'#(\w+)',
+            r'data-testid=["\']?([\w-]+)',
         ]:
             match = re.search(pattern, selector, re.IGNORECASE)
             if match:
@@ -119,7 +158,13 @@ class ParameterAgent:
                 cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", label).strip("_")
                 if cleaned and not cleaned.isdigit():
                     return cleaned
-        return re.sub(r"[^a-zA-Z0-9_]", "_", value[:20].lower()).strip("_") or "input_value"
+
+        # Avoid childish names from raw typed text ("john_michael_doe", "12300").
+        if is_login_field_selector(selector):
+            if re.search(r'password|passwd|\[type\s*=\s*["\']?password', selector, re.I):
+                return "password"
+            return "username"
+        return "input_value"
 
     def _find_propagations(
         self, val: str, val_lower: str, requests: List[Dict[str, Any]]

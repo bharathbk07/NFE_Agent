@@ -1,20 +1,37 @@
 {
-  "mcpServers": {
-    "playwright": {
-      "enabled": false,
-      "description": "Optional Playwright MCP for interactive browser tools. Pipeline uses in-process Playwright+CDP by default.",
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"],
-      "env": {}
-    },
-    "chrome-devtools": {
-      "enabled": false,
-      "description": "Optional Chrome DevTools MCP for live network/perf traces. Not used as the capture layer.",
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp@latest"],
-      "env": {}
+    "mcpServers": {
+        "k6": {
+            "enabled": true,
+            "description": "Grafana k6 MCP (k6 x mcp). Validates and runs scripts for smoke/heal. Requires k6 v2+ on PATH.",
+            "transport": "stdio",
+            "command": "k6",
+            "args": [
+                "x",
+                "mcp"
+            ],
+            "env": {}
+        },
+        "playwright": {
+            "enabled": false,
+            "description": "Optional Playwright MCP for interactive browser tools. Pipeline uses in-process Playwright+CDP by default.",
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "@playwright/mcp@latest"
+            ],
+            "env": {}
+        },
+        "chrome-devtools": {
+            "enabled": false,
+            "description": "Optional Chrome DevTools MCP for live network/perf traces. Not used as the capture layer.",
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "chrome-devtools-mcp@latest"
+            ],
+            "env": {}
+        }
     }
-  }
 }
