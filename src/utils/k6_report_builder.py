@@ -89,8 +89,13 @@ def load_k6_json_points(path: Path) -> List[Dict[str, Any]]:
 def _aggregate_points(
     points: Iterable[Dict[str, Any]],
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str, str], Dict[str, Any]], List[Dict[str, Any]]]:
-    """Build TXN trends, request rows, and failed request rows from points."""
+    """Build TXN trends, request rows, and failed request rows from points.
+
+    TXN ``failed`` is iteration-level (``nfe_txn_fail``) so it never exceeds
+    ``count``. Request-level failures stay on the request / failed-URL tables.
+    """
     txn_durs: Dict[str, List[float]] = defaultdict(list)
+    txn_fail: Dict[str, int] = defaultdict(int)
     req_durs: Dict[Tuple[str, str, str], List[float]] = defaultdict(list)
     req_count: Dict[Tuple[str, str, str], int] = defaultdict(int)
     req_fail: Dict[Tuple[str, str, str], int] = defaultdict(int)
@@ -108,6 +113,8 @@ def _aggregate_points(
 
         if metric == "nfe_txn_duration" and isinstance(value, (int, float)):
             txn_durs[txn or "unknown"].append(float(value))
+        elif metric == "nfe_txn_fail" and isinstance(value, (int, float)):
+            txn_fail[txn or "unknown"] += int(value)
         elif metric == "nfe_req_duration" and isinstance(value, (int, float)):
             key = (txn, method, url)
             req_durs[key].append(float(value))
@@ -139,16 +146,25 @@ def _aggregate_points(
     txns: Dict[str, Dict[str, Any]] = {}
     for name, vals in txn_durs.items():
         vals_sorted = sorted(vals)
-        failed = sum(
-            req_fail[k] for k in req_fail if k[0] == name
-        )
+        count = len(vals_sorted)
+        # Prefer dedicated TXN-fail counter (failed <= count). Fall back to
+        # "any request failed in TXN" estimated as min(count, req_fails) for
+        # older scripts that did not emit nfe_txn_fail.
+        failed = txn_fail.get(name, 0)
+        req_fails = sum(req_fail[k] for k in req_fail if k[0] == name)
+        if failed == 0 and req_fails > 0 and name not in txn_fail:
+            # Legacy points: clamp so the TXN table never shows failed > count.
+            failed = min(count, req_fails) if count else req_fails
+        elif failed > count > 0:
+            failed = count
         txns[name] = {
             "name": name,
             "min": vals_sorted[0],
             "max": vals_sorted[-1],
             "avg": sum(vals_sorted) / len(vals_sorted),
-            "count": len(vals_sorted),
+            "count": count,
             "failed": failed,
+            "req_fails": req_fails,
             "p50": _pct(vals_sorted, 50),
             "p90": _pct(vals_sorted, 90),
             "p95": _pct(vals_sorted, 95),
@@ -248,6 +264,8 @@ def build_html_report(
             f"<td class='num'>{_ms(r['avg'])}</td>"
             f"<td class='num'>{_num(r['count'], 0)}</td>"
             f"<td class='num{' bad' if r['failed'] else ''}'>{_num(r['failed'], 0)}</td>"
+            f"<td class='num{' bad' if r.get('req_fails') else ''}'>"
+            f"{_num(r.get('req_fails'), 0)}</td>"
             f"<td class='num'>{_ms(r['p50'])}</td>"
             f"<td class='num'>{_ms(r['p90'])}</td>"
             f"<td class='num'>{_ms(r['p95'])}</td>"
@@ -256,7 +274,7 @@ def build_html_report(
         )
     if not txn_rows:
         txn_rows.append(
-            "<tr><td colspan='11' class='muted'>No transaction samples recorded.</td></tr>"
+            "<tr><td colspan='12' class='muted'>No transaction samples recorded.</td></tr>"
         )
 
     req_rows = []
@@ -408,12 +426,12 @@ footer {{ text-align:center; color:var(--muted); font-size:.8rem; margin-top:18p
 
   <section>
     <h2>3. Full transaction table</h2>
-    <p class="note">Si.No · TXN name · min · max · avg · count · failed count · perc 50 · perc 90 · perc 95 · perc 99</p>
+    <p class="note">Count = TXN iterations. Failed iters = iterations where ≥1 request failed (≤ count). Req fails = raw request failures inside the TXN.</p>
     <div class="scroll"><table>
       <thead><tr>
         <th class="num">Si.No</th><th>TXN name</th>
         <th class="num">Min</th><th class="num">Max</th><th class="num">Avg</th>
-        <th class="num">Count</th><th class="num">Failed count</th>
+        <th class="num">Count</th><th class="num">Failed iters</th><th class="num">Req fails</th>
         <th class="num">Perc 50</th><th class="num">Perc 90</th>
         <th class="num">Perc 95</th><th class="num">Perc 99</th>
       </tr></thead>

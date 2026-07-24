@@ -375,6 +375,7 @@ class PlaywrightBrowserRecorder:
         url: str,
         steps: List[Dict[str, Any]],
         clear_context: bool = True,
+        randomization: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Execute a user journey and capture browser state and traffic.
 
@@ -383,11 +384,15 @@ class PlaywrightBrowserRecorder:
             steps: Action dictionaries accepted by the journey dispatcher.
             clear_context: Whether the caller requests an isolated context. A fresh
                 context is currently created for every invocation.
+            randomization: Optional ``DataRandomizationMiddleware`` that rewrites
+                outgoing HTTP payloads via ``page.route()`` (Run 2 replay). Operates
+                on raw request URL/body only — not UI locators.
 
         Returns:
             A dictionary containing network requests, step timeline, cookies, and
             local/session storage. On failure it also contains ``error``,
-            ``failed_step``, and ``failed_action``.
+            ``failed_step``, and ``failed_action``. When ``randomization`` is
+            provided, also includes ``randomization_ledger``.
 
         Raises:
             Exception: Browser launch or context creation failures that occur before
@@ -404,6 +409,20 @@ class PlaywrightBrowserRecorder:
             browser = p.chromium.launch(headless=not self.debug_mode)
             context = browser.new_context(viewport={"width": 1280, "height": 720})
             page = context.new_page()
+
+            # Attach payload randomization *before* CDP so rewritten egress is what
+            # Network.requestWillBeSent observes during Run 2.
+            if randomization is not None:
+                try:
+                    if hasattr(randomization, "attach_route"):
+                        randomization.attach_route(page)
+                    else:
+                        handler = getattr(randomization, "make_route_handler", None)
+                        if callable(handler):
+                            page.route("**/*", handler())
+                    logger.info("Data randomization page.route attached for journey.")
+                except Exception as route_err:
+                    logger.warning("Failed to attach data-randomization route: %s", route_err)
 
             self._attach_cdp(page)
             page.on("response", self._handle_response)
@@ -586,7 +605,7 @@ class PlaywrightBrowserRecorder:
             except Exception as e:
                 logger.error(f"Error during journey execution at step: {e}")
                 self._finalize_cdp_pending()
-                return {
+                err_payload = {
                     "error": str(e),
                     "failed_step": self.current_step_index,
                     "failed_action": self.current_step_action,
@@ -596,6 +615,17 @@ class PlaywrightBrowserRecorder:
                     "local_storage": local_storage,
                     "session_storage": session_storage,
                 }
+                if randomization is not None:
+                    try:
+                        err_payload["randomization_ledger"] = (
+                            randomization.ledger_entries()
+                            if hasattr(randomization, "ledger_entries")
+                            else []
+                        )
+                        err_payload["randomization_state"] = randomization.to_dict()
+                    except Exception:
+                        pass
+                return err_payload
             finally:
                 try:
                     if self._cdp_session:
@@ -605,13 +635,24 @@ class PlaywrightBrowserRecorder:
                 context.close()
                 browser.close()
 
-        return {
+        result = {
             "network_requests": self.network_logs,
             "step_timeline": self.step_timeline,
             "cookies": cookies,
             "local_storage": local_storage,
             "session_storage": session_storage,
         }
+        if randomization is not None:
+            try:
+                result["randomization_ledger"] = (
+                    randomization.ledger_entries()
+                    if hasattr(randomization, "ledger_entries")
+                    else []
+                )
+                result["randomization_state"] = randomization.to_dict()
+            except Exception:
+                pass
+        return result
 
     # -------------------------------------------------------- Watch-me recording
     _WATCH_ME_INIT_JS = r"""

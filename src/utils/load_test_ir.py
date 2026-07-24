@@ -8,6 +8,7 @@ No LLM is involved. Same IR always produces the same k6 script.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -334,7 +335,12 @@ def _ensure_auth_csrf(
     *,
     origin: str,
 ) -> None:
-    """No-op for browser-mode login; keep CSRF only when protocol auth/validate exists."""
+    """Wire login CSRF extract → ``auth/validate`` body ``_token``.
+
+    Always replaces captured/stale ``_token`` literals with ``${csrf_token}``.
+    Leaving a Run-1 CSRF value in the script causes silent login failure and
+    cascading 401s on every authenticated API call.
+    """
     has_browser_login = any(
         (t.get("mode") == "browser" and "login" in str(t.get("name") or "").lower())
         or t.get("synthesized") == "browser_login"
@@ -354,19 +360,15 @@ def _ensure_auth_csrf(
             if method == "POST" and "/auth/validate" in url.lower():
                 validate_url = url
                 body = r.get("body")
-                if isinstance(body, dict):
-                    token_val = body.get("_token")
-                    needs = token_val is None or (
-                        isinstance(token_val, str)
-                        and "csrf_token" not in token_val
-                        and token_val in ("", "${_token}", "${token}")
-                    )
-                    if needs or token_val is None:
-                        body = dict(body)
-                        body["_token"] = f"${{{csrf_var}}}"
-                        r["body"] = body
-                    if not r.get("body_type") or r.get("body_type") == "empty":
-                        r["body_type"] = "form"
+                if not isinstance(body, dict):
+                    body = {}
+                else:
+                    body = dict(body)
+                # Always correlate — never ship a captured CSRF literal.
+                body["_token"] = f"${{{csrf_var}}}"
+                r["body"] = body
+                if not r.get("body_type") or r.get("body_type") == "empty":
+                    r["body_type"] = "form"
     if not login_url and origin:
         login_url = f"{origin}/web/index.php/auth/login"
     if not validate_url:
@@ -394,6 +396,21 @@ def _ensure_auth_csrf(
                 "synthesized": True,
             }
         )
+    else:
+        # Ensure existing csrf_token correlation targets auth/validate body._token
+        for c in correlations:
+            if str(c.get("var") or "") != csrf_var:
+                continue
+            ps = dict(c.get("pass") or {})
+            if "body._token" not in str(ps.get("to_location") or ""):
+                ps["to_location"] = "body._token"
+                ps["to_request"] = validate_url
+                c["pass"] = ps
+            ex = dict(c.get("extract") or {})
+            if not ex.get("from_request") and login_url:
+                ex["from_request"] = login_url
+                ex["from_location"] = f"body.regex:{CSRF_TOKEN_REGEX}"
+                c["extract"] = ex
 
 
 def _inject_missing_auth(
@@ -561,6 +578,173 @@ def _retarget_create_id_extracts(correlations: List[Dict[str, Any]]) -> List[Dic
                 item["retargeted"] = True
         out.append(item)
     return out
+
+
+def _ensure_create_resource_ids(
+    transactions: List[Dict[str, Any]],
+    correlations: List[Dict[str, Any]],
+    *,
+    network_requests: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Wire create-POST ``data.id`` into downstream ``/requests/{id}`` paths.
+
+    Captured scripts hardcode the Run-1 claim/request id (e.g. ``/requests/8``).
+    Replaying that literal after a new create yields 403/404 — a script bug, not
+    an application fault. Per Grafana k6 correlation guidance we extract the
+    JSON id from the create response and substitute every matching path segment.
+    """
+    notes: List[str] = []
+    create_posts: List[Dict[str, Any]] = []
+    for txn in transactions or []:
+        for r in txn.get("requests") or []:
+            method = str(r.get("method") or "").upper()
+            url = str(r.get("url") or "")
+            if method != "POST":
+                continue
+            # POST .../employees/{emp}/requests  or POST .../requests (no trailing id)
+            if re.search(r"/requests/?(\?|$)", url) and not re.search(
+                r"/requests/\d+", url
+            ):
+                create_posts.append(r)
+            elif re.search(r"/requests/?$", urlparse(url).path or ""):
+                create_posts.append(r)
+
+    if not create_posts:
+        return notes
+
+    # Prefer id observed in capture response bodies when available
+    captured_ids: Set[str] = set()
+    for req in network_requests or []:
+        method = str(req.get("method") or "").upper()
+        url = str(req.get("url") or "")
+        if method != "POST" or "/requests" not in url.lower():
+            continue
+        if re.search(r"/requests/\d+", url):
+            continue
+        body = req.get("response_body") or ""
+        if not body:
+            continue
+        try:
+            data = json.loads(body) if isinstance(body, str) else body
+            rid = None
+            if isinstance(data, dict):
+                inner = data.get("data")
+                if isinstance(inner, dict) and inner.get("id") is not None:
+                    rid = inner.get("id")
+                elif data.get("id") is not None:
+                    rid = data.get("id")
+            if rid is not None:
+                captured_ids.add(str(rid))
+        except Exception:
+            continue
+
+    # Also harvest numeric ids already embedded in downstream URLs
+    path_id_re = re.compile(r"/requests/(\d+)(?:/|\?|$)")
+    ui_id_re = re.compile(r"/assignClaim/id/(\d+)(?:/|\?|$)")
+    for txn in transactions or []:
+        for r in txn.get("requests") or []:
+            url = str(r.get("url") or "")
+            for m in path_id_re.finditer(url):
+                captured_ids.add(m.group(1))
+            for m in ui_id_re.finditer(url):
+                captured_ids.add(m.group(1))
+
+    if not captured_ids:
+        # Still add extract even without known literal — emitter needs the var
+        captured_ids = set()
+
+    var = "requestId"
+    create_url = str(create_posts[0].get("url") or "")
+    # Ensure correlation extract exists
+    has_corr = any(str(c.get("var") or "") == var for c in correlations)
+    if not has_corr:
+        correlations.append(
+            {
+                "var": var,
+                "extract": {
+                    "from_request": create_url,
+                    "from_location": "body.$.data.id",
+                    "from_step": create_posts[0].get("step_index"),
+                },
+                "pass": {
+                    "to_request": "",
+                    "to_location": "path.requests",
+                    "to_step": None,
+                },
+                "correlation_type": "response_extract",
+                "confidence": "high",
+                "auto_cookie": False,
+                "synthesized": True,
+                "reason": "create-resource id for downstream /requests/{id} paths",
+            }
+        )
+        notes.append(
+            f"Added `{var}` extract from create POST (`body.$.data.id`) for path correlation."
+        )
+    else:
+        for c in correlations:
+            if str(c.get("var") or "") != var:
+                continue
+            ex = dict(c.get("extract") or {})
+            if "data.id" not in str(ex.get("from_location") or ""):
+                ex["from_location"] = "body.$.data.id"
+                c["extract"] = ex
+            if not ex.get("from_request"):
+                ex["from_request"] = create_url
+                c["extract"] = ex
+
+    # Substitute hardcoded ids in all request URLs (+ Referer headers)
+    replaced = 0
+    header_hits = 0
+    for txn in transactions or []:
+        for r in txn.get("requests") or []:
+            url = str(r.get("url") or "")
+            if url and f"${{{var}}}" not in url:
+                new_url = url
+                new_url = re.sub(
+                    r"(/requests/)(\d+)(?=/|\?|$)",
+                    rf"\1${{{var}}}",
+                    new_url,
+                )
+                new_url = re.sub(
+                    r"(/assignClaim/id/)(\d+)(?=/|\?|$)",
+                    rf"\1${{{var}}}",
+                    new_url,
+                )
+                if new_url != url:
+                    r["url"] = new_url
+                    replaced += 1
+            headers = r.get("headers")
+            if isinstance(headers, dict):
+                new_headers = dict(headers)
+                changed = False
+                for hk, hv in list(new_headers.items()):
+                    s = str(hv or "")
+                    ns = re.sub(
+                        r"(/requests/)(\d+)(?=/|\?|$)",
+                        rf"\1${{{var}}}",
+                        s,
+                    )
+                    ns = re.sub(
+                        r"(/assignClaim/id/)(\d+)(?=/|\?|$)",
+                        rf"\1${{{var}}}",
+                        ns,
+                    )
+                    if ns != s:
+                        new_headers[hk] = ns
+                        changed = True
+                        header_hits += 1
+                if changed:
+                    r["headers"] = new_headers
+    if replaced:
+        notes.append(
+            f"Replaced hardcoded create-resource id in {replaced} request URL(s) with `${{{var}}}`."
+        )
+    if header_hits:
+        notes.append(
+            f"Replaced hardcoded create-resource id in {header_hits} header value(s)."
+        )
+    return notes
 
 
 def build_load_test_ir(
@@ -803,6 +987,11 @@ def build_load_test_ir(
         correlations=corr_list,
     )
     _ensure_auth_csrf(txn_list, corr_list, origin=origin)
+    _ensure_create_resource_ids(
+        txn_list,
+        corr_list,
+        network_requests=network_requests,
+    )
 
     return {
         "version": 1,

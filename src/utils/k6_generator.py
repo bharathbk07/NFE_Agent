@@ -27,6 +27,49 @@ def _js_string(value: Any) -> str:
     return json.dumps("" if value is None else str(value))
 
 
+def _randomized_var_js(var: Dict[str, Any]) -> str:
+    """Emit a per-VU unique JS expression for IR vars marked ``randomize``.
+
+    Strategies mirror ``data_randomization.generate_random_value`` / IR
+    ``randomization_strategy`` so load-test iterations avoid unique-constraint
+    collisions the same way Run 2 replay does.
+    """
+    strategy = str(
+        var.get("randomization_strategy")
+        or var.get("randomize_strategy")
+        or "epoch_suffix"
+    )
+    base = "" if var.get("value") is None else str(var.get("value"))
+    if strategy in ("email_epoch", "email_timestamp"):
+        if "@" in base:
+            local, _, domain = base.partition("@")
+            local = re.sub(r"[+._-]?(?:nfe)?\d+$", "", local, flags=re.I) or "user"
+            local_esc = local.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+            domain_esc = domain.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+            return f"`{local_esc}+nfe${{Date.now()}}_${{__VU}}@{domain_esc}`"
+        return "`user+nfe${Date.now()}_${__VU}@example.test`"
+    if strategy == "uuid":
+        return "`${__VU}-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`"
+    if strategy in ("int_suffix", "numeric_timestamp"):
+        return f"String(Date.now()).slice(-8)"
+    if strategy in ("phone_epoch", "phone_timestamp"):
+        digits = re.sub(r"\D", "", base) or "5550000000"
+        prefix = digits[: max(3, len(digits) - 4)]
+        prefix_esc = prefix.replace("\\", "\\\\").replace("`", "\\`")
+        return f"`{prefix_esc}${{String(Date.now()).slice(-4)}}`"
+    cleaned = re.sub(r"_nfe[_+]?\d+.*$", "", base, flags=re.I) or base or "val"
+    cleaned_esc = cleaned.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    return f"`{cleaned_esc}_nfe_${{Date.now()}}_${{__VU}}`"
+
+
+def _var_js_assignment(var: Dict[str, Any]) -> str:
+    """Render one IR var as a ``name: expr`` pair for the k6 ``vars`` object."""
+    name = var["name"]
+    if var.get("randomize"):
+        return f"  {name}: {_randomized_var_js(var)}"
+    return f"  {name}: {_js_string(var.get('value'))}"
+
+
 def _safe_ident(name: str, fallback: str = "value") -> str:
     """Normalize arbitrary text into a JavaScript identifier.
 
@@ -187,7 +230,9 @@ def _extract_snippets_for_txn(
                 jp = jp[1:].lstrip(".")
             lines.append(f"    // Correlation extract `{var}` from {loc}")
             lines.append(
-                f"    vars.{var} = {res_var}.json({_js_string(jp)}) || vars.{var};"
+                f"    try {{ if ({res_var} && {res_var}.body) "
+                f"vars.{var} = {res_var}.json({_js_string(jp)}) || vars.{var}; }} "
+                f"catch (e) {{ /* empty/error body — leave vars.{var} */ }}"
             )
         elif "set-cookie" in loc.lower():
             lines.append(
@@ -208,6 +253,19 @@ def _runtime_helpers_js() -> str:
     """Inline NFE metrics + assertion helpers (no external imports)."""
     path = Path(__file__).with_name("k6_runtime_helpers.js")
     return path.read_text(encoding="utf-8").strip()
+
+
+def _response_callback_js() -> str:
+    """Treat 2xx–3xx and application 5xx as expected; 4xx remains a script failure.
+
+    See https://grafana.com/docs/k6/latest/javascript-api/k6-http/expected-statuses/
+    """
+    return (
+        "// 4xx = script/correlation bug (fail). 5xx = application fault (allowed).\n"
+        "http.setResponseCallback(\n"
+        "  http.expectedStatuses({ min: 200, max: 399 }, { min: 500, max: 599 })\n"
+        ");"
+    )
 
 
 def _expect_json(headers: Dict[str, Any], body_type: str) -> bool:
@@ -242,6 +300,7 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
 
     body_lines: List[str] = [
         f"    const __nfeTxnStart = Date.now();",
+        f"    let __nfeTxnFailed = false;",
     ]
     urls = [r.get("url") or "" for r in reqs]
 
@@ -278,6 +337,34 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
             params_bits.append("redirects: 5")
         params_obj = "{ " + ", ".join(params_bits) + " }"
 
+        # Non-randomizable / payment endpoints flagged in IR: mock instead of live call
+        # so the deterministic compiler does not hit third-party limits during load.
+        if (
+            r.get("mock_in_load_test")
+            or r.get("requires_manual_data")
+            or r.get("ir_flag") == "manual_test_data_or_mock"
+        ):
+            reason = r.get("manual_data_reason") or r.get("ir_flag") or "requires_manual_data"
+            body_lines.append(
+                f"    // IR flag: {reason} — mocked (provision CSV / stub before load)"
+            )
+            mock_body = '{"status":"ok","mocked":true,"nfe":"requires_manual_data"}'
+            body_lines.append(
+                f"    const {var} = {{"
+                f" status: 200,"
+                f" body: {_js_string(mock_body)},"
+                f" url: {url_js},"
+                f" timings: {{ duration: 0 }},"
+                f" json() {{ return JSON.parse(this.body); }}"
+                f" }};"
+            )
+            body_lines.append(
+                f"    if (nfeAssertResponse({var}, {_js_string(name)}, {_js_string(method)}, "
+                f"{{ soft: true, expectJson: true, label: {url_js} }})) "
+                f"__nfeTxnFailed = true;"
+            )
+            continue
+
         if method == "GET":
             body_lines.append(f"    const {var} = http.get({url_js}, {params_obj});")
         elif method == "POST":
@@ -303,9 +390,15 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
 
         soft = "true" if r.get("soft_check") else "false"
         expect_json = "true" if _expect_json(headers, str(r.get("body_type") or "")) else "false"
+        # Auth validate: 2xx alone is insufficient — SPA often returns 200 login HTML
+        # when CSRF/session is wrong, then every API call 401s.
+        auth_ok = ""
+        if method == "POST" and "/auth/validate" in str(r.get("url") or "").lower():
+            auth_ok = ", requireAuthSession: true"
         body_lines.append(
-            f"    nfeAssertResponse({var}, {_js_string(name)}, {_js_string(method)}, "
-            f"{{ soft: {soft}, expectJson: {expect_json}, label: {url_js} }});"
+            f"    if (nfeAssertResponse({var}, {_js_string(name)}, {_js_string(method)}, "
+            f"{{ soft: {soft}, expectJson: {expect_json}, label: {url_js}{auth_ok} }})) "
+            f"__nfeTxnFailed = true;"
         )
 
         raw_url = r.get("url") or ""
@@ -315,13 +408,15 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
             )
         )
 
-    body_lines.append(f"    nfeMarkTxn({_js_string(name)}, __nfeTxnStart);")
+    body_lines.append(
+        f"    nfeMarkTxn({_js_string(name)}, __nfeTxnStart, __nfeTxnFailed);"
+    )
     body_lines.append(f"    sleep({think});")
 
-    if len(body_lines) <= 2:
+    if len(body_lines) <= 3:
         body_lines = [
             "    // No protocol HTTP for this TXN — check browser mode",
-            f"    nfeMarkTxn({_js_string(name)}, Date.now());",
+            f"    nfeMarkTxn({_js_string(name)}, Date.now(), false);",
             f"    sleep({think});",
         ]
 
@@ -383,6 +478,16 @@ def _emit_browser_txn(txn: Dict[str, Any], target_url: str) -> str:
         for s in ui_steps[:20]
     ) or "    // (no UI)"
 
+    # After browser login, wait until we leave /auth/login when possible.
+    post_login_wait = ""
+    if "login" in name.lower():
+        post_login_wait = (
+            "\n  try {\n"
+            "    await page.waitForURL(u => !String(u).includes('/auth/login'), "
+            "{ timeout: 15000 });\n"
+            "  } catch (e) { /* stay — sync will warn if no session cookie */ }"
+        )
+
     return f"""
 export async function {name}(page) {{
   // TXN: {desc}
@@ -390,11 +495,12 @@ export async function {name}(page) {{
 {comments}
   // Note: k6 group() does not support async callbacks — mark TXN timing manually.
   const __nfeTxnStart = Date.now();
+  let __nfeTxnFailed = false;
   if (!page.url() || page.url() === 'about:blank') {{
     await page.goto({_js_string(seed)});
   }}
-{body}
-  nfeMarkTxn({_js_string(name)}, __nfeTxnStart);
+{body}{post_login_wait}
+  nfeMarkTxn({_js_string(name)}, __nfeTxnStart, __nfeTxnFailed);
   await sleep({think});
 }}""".rstrip()
 
@@ -416,7 +522,7 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
 
     # Preserve IR insertion order so identical IR emits byte-for-byte.
     param_block = ",\n".join(
-        f"  {v['name']}: {_js_string(v.get('value'))}" for v in vars_list
+        _var_js_assignment(v) for v in vars_list
     ) or "  // no parameters detected"
 
     # Mutable bag for runtime correlation extracts (unique names only)
@@ -512,11 +618,12 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
 export function Launch() {{
   group('Launch', function () {{
     const __nfeTxnStart = Date.now();
+    let __nfeTxnFailed = false;
     const res = http.get({_js_string(target_url or f'https://{host}/')}, {{
       tags: {{ txn: 'Launch', method: 'GET', name: 'GET launch' }},
     }});
-    nfeAssertResponse(res, 'Launch', 'GET', {{ soft: false, expectJson: false }});
-    nfeMarkTxn('Launch', __nfeTxnStart);
+    if (nfeAssertResponse(res, 'Launch', 'GET', {{ soft: false, expectJson: false }})) __nfeTxnFailed = true;
+    nfeMarkTxn('Launch', __nfeTxnStart, __nfeTxnFailed);
     sleep(1);
   }});
 }}""".rstrip()
@@ -524,23 +631,58 @@ export function Launch() {{
         txn_meta.append(("Launch", False))
 
     if needs_browser:
+        origin = ir.get("origin") or ""
+        if not origin and target_url:
+            try:
+                p = urlparse(target_url)
+                origin = f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else ""
+            except Exception:
+                origin = ""
+        origin_js = _js_string(origin or target_url or "https://example.com")
         call_lines = []
         for name, is_browser in txn_meta:
+            # Skip redundant protocol Launch (GET /auth/login) when browser Login
+            # will navigate there — avoids a second cookie jar fighting the session.
+            if (
+                not is_browser
+                and name.lower() == "launch"
+                and any(
+                    n.lower() == "login" and b for n, b in txn_meta
+                )
+            ):
+                call_lines.append(
+                    f"  // Skipped protocol `{name}` — browser Login opens the app."
+                )
+                continue
             if is_browser:
                 call_lines.append(f"  await {name}(page);")
-                # After browser login, copy cookies into the http module jar
                 txn_obj = next((t for t in transactions if t.get("name") == name), {})
                 if txn_obj.get("sync_cookies_to_http") or name.lower() == "login":
                     call_lines.append(
                         "  // Sync browser session cookies → http jar for protocol TXNs\n"
                         "  {\n"
+                        f"    const origin = {origin_js};\n"
                         "    const jar = http.cookieJar();\n"
                         "    const cookies = await page.context().cookies();\n"
+                        "    let synced = 0;\n"
                         "    for (const c of cookies) {\n"
-                        "      const host = (c.domain || '').replace(/^\\./, '');\n"
-                        "      if (!host || !c.name) continue;\n"
-                        "      const base = `${c.secure ? 'https' : 'http'}://${host}${c.path || '/'}`;\n"
-                        "      try { jar.set(base, c.name, c.value); } catch (e) {}\n"
+                        "      if (!c || !c.name) continue;\n"
+                        "      try {\n"
+                        "        jar.set(origin + '/', c.name, String(c.value || ''), {\n"
+                        "          domain: (c.domain || '').replace(/^\\./, '') || undefined,\n"
+                        "          path: c.path || '/',\n"
+                        "          secure: !!c.secure,\n"
+                        "          http_only: !!c.httpOnly,\n"
+                        "        });\n"
+                        "        synced += 1;\n"
+                        "      } catch (e) {\n"
+                        "        try { jar.set(origin + '/', c.name, String(c.value || '')); synced += 1; } catch (e2) {}\n"
+                        "      }\n"
+                        "    }\n"
+                        "    if (synced < 1) {\n"
+                        "      console.warn('NFE: browser login produced 0 cookies — API calls will 401');\n"
+                        "    } else {\n"
+                        "      console.log(`NFE: synced ${synced} browser cookie(s) → http jar`);\n"
                         "    }\n"
                         "  }"
                     )
@@ -559,6 +701,8 @@ import {{ Trend, Counter }} from 'k6/metrics';
  * Hybrid: browser login (SPA CSRF) + protocol API TXNs.
  */
 
+{_response_callback_js()}
+
 export const options = {{
   scenarios: {{
     smoke: {{
@@ -570,7 +714,7 @@ export const options = {{
     }},
   }},
   summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
-  // SLA thresholds (k6-learn): error rate, p95 response time, checks
+  // Fail the smoke only on script bugs (4xx / failed checks). App 5xx is allowed.
   thresholds: {{
     http_req_failed: ['rate<0.01'],
     http_req_duration: ['p(95)<2000'],
@@ -617,6 +761,8 @@ import {{ Trend, Counter }} from 'k6/metrics';
  * into tagged metrics for the HTML report tables.
  */
 
+{_response_callback_js()}
+
 export const options = {{
   scenarios: {{
     smoke: {{
@@ -627,7 +773,7 @@ export const options = {{
     }},
   }},
   summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
-  // SLA thresholds (k6-learn): error rate, p95 response time, checks
+  // Fail the smoke only on script bugs (4xx / failed checks). App 5xx is allowed.
   thresholds: {{
     http_req_failed: ['rate<0.01'],
     http_req_duration: ['p(95)<2000'],

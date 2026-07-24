@@ -36,6 +36,8 @@ def heal_load_test_ir(
     if smoke_result.get("skipped") or smoke_result.get("ok"):
         return healed, notes
 
+    has_401 = _smoke_indicates_401(smoke_result)
+
     # 1) Drop SPA chrome GETs that are still present
     chrome_dropped = 0
     for txn in healed["transactions"]:
@@ -116,6 +118,29 @@ def heal_load_test_ir(
                 f"Dropped {before_n - after_n} typeahead intermediate GET(s) in `{txn.get('name')}`."
             )
 
+    # 5a) 401 ⇒ force CSRF correlation (replace stale captured `_token` literals)
+    csrf_already_wired = _auth_validate_uses_csrf_var(healed["transactions"])
+    if has_401:
+        before_bodies = _auth_validate_tokens(healed["transactions"])
+        _ensure_auth_csrf(
+            healed["transactions"],
+            healed["correlations"],
+            origin=str(healed.get("origin") or ""),
+        )
+        after_bodies = _auth_validate_tokens(healed["transactions"])
+        if before_bodies != after_bodies:
+            notes.append(
+                "401 detected: forced CSRF correlation — "
+                "`auth/validate` `_token` now uses `${csrf_token}` extracted from login HTML."
+            )
+        elif csrf_already_wired:
+            notes.append(
+                "401 detected with CSRF already correlated — "
+                "protocol login is not establishing an API session."
+            )
+        else:
+            notes.append("401 detected: re-applied CSRF extract → auth/validate wiring.")
+
     before_auth = _has_auth_post_local(healed["transactions"])
     healed["transactions"] = _inject_missing_auth(
         healed["transactions"],
@@ -132,7 +157,38 @@ def heal_load_test_ir(
     if not before_auth and _has_auth_post_local(healed["transactions"]):
         notes.append("Injected missing login POST + CSRF token extract.")
     elif any(str(c.get("var")) == "csrf_token" for c in healed["correlations"]):
-        notes.append("Ensured login CSRF `csrf_token` extract → auth/validate.")
+        if not has_401:
+            notes.append("Ensured login CSRF `csrf_token` extract → auth/validate.")
+
+    # 5b) Persistent 401 after CSRF is wired ⇒ SPA session; switch Login to browser
+    # Attempt 1 with already-wired CSRF, or any attempt ≥2.
+    if has_401 and (attempt >= 2 or csrf_already_wired):
+        converted = _force_browser_login(
+            healed,
+            origin=str(healed.get("origin") or ""),
+            target_url=str(healed.get("target_url") or ""),
+        )
+        if converted:
+            notes.append(
+                "401 persisted: converted Login to browser mode "
+                "(SPA CSRF/session cannot be established via protocol-only HTTP)."
+            )
+
+    # 5c) Always wire create-resource path ids; also react to 403/404 smoke signals
+    from src.utils.load_test_ir import _ensure_create_resource_ids
+
+    id_notes = _ensure_create_resource_ids(
+        healed["transactions"],
+        healed["correlations"],
+        network_requests=None,
+    )
+    if id_notes:
+        notes.extend(id_notes)
+    elif _smoke_indicates_stale_resource_id(smoke_result):
+        notes.append(
+            "4xx on /requests/{id}: create-resource id correlation already present — "
+            "verify extract `body.$.data.id` runs before downstream calls."
+        )
 
     if not notes:
         notes.append(
@@ -141,6 +197,166 @@ def heal_load_test_ir(
     healed["heal_notes"] = list(healed.get("heal_notes") or []) + notes
     healed["heal_attempt"] = attempt
     return healed, notes
+
+
+def _smoke_indicates_401(smoke_result: Dict[str, Any]) -> bool:
+    """Return True when smoke output shows auth/session failure (401/Forbidden)."""
+    counts = smoke_result.get("status_counts") or {}
+    try:
+        if int(counts.get("401") or 0) > 0:
+            return True
+    except Exception:
+        pass
+    blob = " ".join(
+        [
+            str(smoke_result.get("stdout") or ""),
+            str(smoke_result.get("stderr") or ""),
+            " ".join(str(x) for x in (smoke_result.get("failed_urls") or [])),
+            " ".join(str(x) for x in (smoke_result.get("failed_checks") or [])),
+            str(smoke_result.get("summary") or ""),
+        ]
+    ).lower()
+    if re.search(r"\b401\b", blob) or "unauthorized" in blob:
+        return True
+    # Cloudflare / WAF / empty session often surfaces as Forbidden on /api/
+    if "forbidden" in blob and ("/api/" in blob or "auth/validate" in blob):
+        return True
+    if "status=401" in blob or "status\": \"401\"" in blob or "status': '401'" in blob:
+        return True
+    return False
+
+
+def _smoke_indicates_stale_resource_id(smoke_result: Dict[str, Any]) -> bool:
+    """Return True when smoke shows 403/404 on create-resource path ids."""
+    counts = smoke_result.get("status_counts") or {}
+    try:
+        if int(counts.get("403") or 0) > 0 or int(counts.get("404") or 0) > 0:
+            blob_urls = " ".join(str(x) for x in (smoke_result.get("failed_urls") or []))
+            if re.search(r"/requests/\d+", blob_urls) or re.search(
+                r"/assignClaim/id/\d+", blob_urls
+            ):
+                return True
+            # Even without URL detail, 403 after a create-flow smoke is usually stale id
+            if int(counts.get("403") or 0) > 0:
+                return True
+    except Exception:
+        pass
+    blob = " ".join(
+        [
+            str(smoke_result.get("stdout") or ""),
+            str(smoke_result.get("stderr") or ""),
+            " ".join(str(x) for x in (smoke_result.get("failed_urls") or [])),
+            str(smoke_result.get("summary") or ""),
+        ]
+    )
+    if re.search(r"/requests/\d+", blob) and re.search(r"\b(403|404)\b", blob):
+        return True
+    return False
+
+
+def _auth_validate_tokens(transactions: List[Dict[str, Any]]) -> List[str]:
+    """Snapshot `_token` values on auth/validate bodies for heal diffs."""
+    out: List[str] = []
+    for txn in transactions or []:
+        for r in txn.get("requests") or []:
+            url = str(r.get("url") or "").lower()
+            if (r.get("method") or "").upper() != "POST" or "/auth/validate" not in url:
+                continue
+            body = r.get("body")
+            if isinstance(body, dict):
+                out.append(str(body.get("_token") or ""))
+            else:
+                out.append(str(body or ""))
+    return out
+
+
+def _auth_validate_uses_csrf_var(transactions: List[Dict[str, Any]]) -> bool:
+    """Return True when auth/validate already posts ``${csrf_token}``."""
+    for token in _auth_validate_tokens(transactions):
+        if "csrf_token" in token:
+            return True
+    return False
+
+
+def _force_browser_login(
+    ir: Dict[str, Any],
+    *,
+    origin: str,
+    target_url: str,
+) -> bool:
+    """Convert protocol Login TXN to browser fill/submit when SPA CSRF blocks HTTP."""
+    from src.utils.load_test_ir import _credential_vars
+
+    user_var, pwd_var = _credential_vars(list(ir.get("vars") or []))
+    if not user_var or not pwd_var or not origin:
+        return False
+
+    login_path = "/web/index.php/auth/login"
+    try:
+        tp = urlparse(target_url or "")
+        if "/auth/" in (tp.path or ""):
+            login_path = tp.path
+    except Exception:
+        pass
+    login_url = f"{origin}{login_path}"
+
+    txns = list(ir.get("transactions") or [])
+    login_idx = next(
+        (
+            i
+            for i, t in enumerate(txns)
+            if "login" in str(t.get("name") or "").lower()
+        ),
+        None,
+    )
+    if login_idx is None:
+        return False
+    existing = dict(txns[login_idx])
+    if existing.get("mode") == "browser" and existing.get("sync_cookies_to_http"):
+        return False
+
+    ui_steps = [
+        {"action": "navigate", "url": login_url, "selector": "", "value": None},
+        {
+            "action": "fill",
+            "selector": 'input[name="username"]',
+            "value": f"${{{user_var}}}",
+            "url": "",
+        },
+        {
+            "action": "fill",
+            "selector": 'input[name="password"]',
+            "value": f"${{{pwd_var}}}",
+            "url": "",
+        },
+        {
+            "action": "click",
+            "selector": 'button[type="submit"]',
+            "value": None,
+            "url": "",
+        },
+        {"action": "wait_for_load", "selector": "", "value": None, "url": ""},
+    ]
+    existing["mode"] = "browser"
+    existing["ui_steps"] = ui_steps
+    existing["requests"] = []
+    existing["sync_cookies_to_http"] = True
+    existing["synthesized"] = "browser_login"
+    existing["description"] = (
+        existing.get("description")
+        or "Browser login (heal: SPA CSRF / session after 401)"
+    )
+    txns[login_idx] = existing
+    ir["transactions"] = txns
+
+    # Drop protocol CSRF correlations — browser handles login
+    ir["correlations"] = [
+        c
+        for c in (ir.get("correlations") or [])
+        if str(c.get("var") or "") not in ("csrf_token", "_token", "token")
+        or not c.get("synthesized")
+    ]
+    return True
 
 
 def json_dumps_safe(obj: Any) -> str:

@@ -494,11 +494,17 @@ async def watch_me_record(state: AgentState) -> Dict[str, Any]:
 async def replay_recorded_journey(state: AgentState) -> Dict[str, Any]:
     """Replay Watch-me steps headless as Run 2 (no navigator planning).
 
+    Harvests state-mutating HTTP payload literals from Run 1, then rewrites
+    matching egress on Run 2 via protocol-level ``page.route`` randomization
+    so unique-constraint collisions do not pollute differential correlation.
+
     Args:
         state: State with ``user_journey_steps`` and Run 1 already populated.
 
     Returns:
         Updated ``run_records`` including Run 2, or errors if replay fails.
+        Also returns ``randomization_ledger`` / ``randomization_state`` for the
+        Correlation Engine.
     """
     import asyncio
 
@@ -527,13 +533,28 @@ async def replay_recorded_journey(state: AgentState) -> Dict[str, Any]:
             ],
         }
 
+    from src.utils.data_randomization import build_middleware_from_run1
+
+    randomization = None
+    if run_records:
+        randomization = build_middleware_from_run1(
+            run_records[0].get("network_requests") or []
+        )
+        logger.info(
+            "Run 1 payload harvest: %s transform(s), %s non-randomizable route(s)",
+            len(randomization.transforms),
+            len(randomization.non_randomizable_routes()),
+        )
+
     recorder = PlaywrightBrowserRecorder(debug_mode=False)
     from src.utils.model_router import allow_blocking_io
 
     def _execute():
-        """Headless replay of recorded steps."""
+        """Headless replay of recorded steps with HTTP payload randomization."""
         with allow_blocking_io():
-            return recorder.execute_journey(url, steps, clear_context=True)
+            return recorder.execute_journey(
+                url, steps, clear_context=True, randomization=randomization
+            )
 
     try:
         logger.info("Watch-me replay RUN 2 (%s steps)...", len(steps))
@@ -549,6 +570,12 @@ async def replay_recorded_journey(state: AgentState) -> Dict[str, Any]:
         })
         if run2_data.get("error"):
             error_log.append(f"Run 2 (replay) incomplete: {run2_data['error']}")
+        if run2_data.get("randomization_state"):
+            from src.utils.data_randomization import DataRandomizationMiddleware
+
+            randomization = DataRandomizationMiddleware.from_dict(
+                run2_data["randomization_state"]
+            )
     except Exception as e:
         logger.error("Watch-me replay failed: %s", e)
         error_log.append(f"Run 2 (replay) failed: {e}")
@@ -567,10 +594,17 @@ async def replay_recorded_journey(state: AgentState) -> Dict[str, Any]:
     except Exception as save_err:
         logger.warning("Failed to update Watch-me recording after replay: %s", save_err)
 
+    rand_state = randomization.to_dict() if randomization else {}
+    ledger_list = rand_state.get("ledger") or []
+    if isinstance(ledger_list, dict):
+        ledger_list = ledger_list.get("entries") or []
     return {
         "run_records": run_records,
         "error_log": error_log,
         "watch_me_status": "replayed",
+        "randomization_state": rand_state,
+        "randomization_ledger": list(ledger_list),
+        "non_randomizable_endpoints": list(rand_state.get("non_randomizable") or []),
     }
 
 
@@ -677,11 +711,16 @@ async def load_saved_recording(state: AgentState) -> Dict[str, Any]:
 async def run_automation(state: AgentState) -> Dict[str, Any]:
     """Capture two independent executions of the planned journey.
 
+    Run 1 records protocol traffic as-is. Before Run 2, state-mutating HTTP
+    payload fields harvested from Run 1 are rewritten via route interception
+    so duplicate-key errors do not pollute correlation.
+
     Args:
         state: State containing the target URL and planned browser steps.
 
     Returns:
-        A partial state with run-record dictionaries and accumulated error strings.
+        A partial state with run-record dictionaries, randomization ledger, and
+        accumulated error strings.
     """
     import asyncio
 
@@ -698,23 +737,32 @@ async def run_automation(state: AgentState) -> Dict[str, Any]:
     error_log = list(state.get("error_log", []))
 
     from src.utils.model_router import allow_blocking_io
+    from src.utils.data_randomization import (
+        DataRandomizationMiddleware,
+        build_middleware_from_run1,
+    )
 
-    def _execute_run(capture_storage: bool):
+    randomization = None
+
+    def _execute_run(capture_storage: bool, mw=None):
         """Execute one synchronous capture in a worker thread.
 
         Args:
             capture_storage: Whether to create a fresh browser context.
+            mw: Optional ``DataRandomizationMiddleware`` for Run 2 payload rewrite.
 
         Returns:
             Recorder output containing network, timeline, cookie, and storage data.
         """
         # Playwright + optional self-heal LLM use sync I/O; allow under blockbuster.
         with allow_blocking_io():
-            return recorder.execute_journey(url, steps, capture_storage)
+            return recorder.execute_journey(
+                url, steps, capture_storage, randomization=mw
+            )
 
     try:
         logger.info("Executing RUN 1...")
-        run1_data = await asyncio.to_thread(_execute_run, True)
+        run1_data = await asyncio.to_thread(_execute_run, True, None)
         run_records.append({
             "run_id": 1,
             "network_requests": run1_data.get("network_requests") or [],
@@ -726,14 +774,21 @@ async def run_automation(state: AgentState) -> Dict[str, Any]:
         })
         if run1_data.get("error"):
             error_log.append(f"Run 1 incomplete: {run1_data['error']}")
+        randomization = build_middleware_from_run1(
+            run1_data.get("network_requests") or []
+        )
+        logger.info(
+            "Run 1 payload harvest: %s transform(s)",
+            len(randomization.transforms),
+        )
     except Exception as e:
         logger.error(f"Error during RUN 1: {e}")
         error_log.append(f"Run 1 failed: {str(e)}")
 
     if run_records and not (run_records[0].get("network_requests") is None):
         try:
-            logger.info("Executing RUN 2...")
-            run2_data = await asyncio.to_thread(_execute_run, True)
+            logger.info("Executing RUN 2 (with HTTP payload randomization)...")
+            run2_data = await asyncio.to_thread(_execute_run, True, randomization)
             run_records.append({
                 "run_id": 2,
                 "network_requests": run2_data.get("network_requests") or [],
@@ -745,11 +800,25 @@ async def run_automation(state: AgentState) -> Dict[str, Any]:
             })
             if run2_data.get("error"):
                 error_log.append(f"Run 2 incomplete: {run2_data['error']}")
+            if run2_data.get("randomization_state"):
+                randomization = DataRandomizationMiddleware.from_dict(
+                    run2_data["randomization_state"]
+                )
         except Exception as e:
             logger.error(f"Error during RUN 2: {e}")
             error_log.append(f"Run 2 failed: {str(e)}")
 
-    return {"run_records": run_records, "error_log": error_log}
+    rand_state = randomization.to_dict() if randomization else {}
+    ledger_list = rand_state.get("ledger") or []
+    if isinstance(ledger_list, dict):
+        ledger_list = ledger_list.get("entries") or []
+    return {
+        "run_records": run_records,
+        "error_log": error_log,
+        "randomization_state": rand_state,
+        "randomization_ledger": list(ledger_list),
+        "non_randomizable_endpoints": list(rand_state.get("non_randomizable") or []),
+    }
 
 
 async def analyse_traffic(state: AgentState) -> Dict[str, Any]:
@@ -830,6 +899,41 @@ Please verify the user journey steps or selectors. If credentials are required, 
     run2 = records[1]
     parameterizable_candidates, correlations, dependencies = _analyze_pair(run1, run2)
 
+    # Protocol value-mapping ledger: deliberate test-data randomization must not
+    # be treated as server-generated correlation tokens (CSRF / session / IDs).
+    from src.utils.data_randomization import (
+        apply_randomization_to_ir,
+        build_middleware_from_run1,
+        filter_correlations_against_ledger,
+        filter_dependencies_against_ledger,
+    )
+
+    randomization_state = state.get("randomization_state") or {}
+    randomization_ledger = list(state.get("randomization_ledger") or [])
+    non_randomizable_endpoints = list(state.get("non_randomizable_endpoints") or [])
+    if randomization_state.get("ledger") and not randomization_ledger:
+        raw_ledger = randomization_state["ledger"]
+        if isinstance(raw_ledger, list):
+            randomization_ledger = list(raw_ledger)
+        elif isinstance(raw_ledger, dict):
+            randomization_ledger = list(raw_ledger.get("entries") or [])
+    if randomization_state.get("non_randomizable") and not non_randomizable_endpoints:
+        non_randomizable_endpoints = list(randomization_state.get("non_randomizable") or [])
+    if not randomization_ledger and run1.get("network_requests"):
+        # Reuse / navigator paths that skipped live Run-2 mutation still need a
+        # harvest so IR can flag vars + non-randomizable routes.
+        _mw = build_middleware_from_run1(run1.get("network_requests") or [])
+        randomization_state = _mw.to_dict()
+        randomization_ledger = _mw.ledger_entries()
+        non_randomizable_endpoints = _mw.non_randomizable_routes()
+
+    correlations = filter_correlations_against_ledger(
+        correlations, randomization_ledger
+    )
+    dependencies = filter_dependencies_against_ledger(
+        dependencies, randomization_ledger
+    )
+
     classifier = CorrelationClassifierAgent()
     advice = await classifier.classify(
         target_url=state["target_url"],
@@ -849,6 +953,8 @@ Please verify the user journey steps or selectors. If credentials are required, 
         correlations=correlations,
         dependencies=dependencies,
     )
+    correlations = filter_correlations_against_ledger(correlations, randomization_ledger)
+    dependencies = filter_dependencies_against_ledger(dependencies, randomization_ledger)
 
     extra_run_note = ""
     if advice.needs_extra_run and len(records) < 3:
@@ -912,6 +1018,12 @@ Please verify the user journey steps or selectors. If credentials are required, 
                     dependencies=dependencies,
                 )
             )
+            correlations = filter_correlations_against_ledger(
+                correlations, randomization_ledger
+            )
+            dependencies = filter_dependencies_against_ledger(
+                dependencies, randomization_ledger
+            )
         except Exception as e:
             logger.warning("Extra correlation run failed: %s", e)
             error_log.append(f"Run 3 failed: {e}")
@@ -958,6 +1070,12 @@ Please verify the user journey steps or selectors. If credentials are required, 
     # Attach cookie advice into IR for emitters / QA
     load_test_ir["cookie_notes"] = cookie_notes
     load_test_ir["correlation_advice_summary"] = advice.summary
+    # Flag non-randomizable HTTP nodes + mark randomized vars for the k6 compiler
+    load_test_ir = apply_randomization_to_ir(
+        load_test_ir,
+        ledger=randomization_ledger,
+        non_randomizable=non_randomizable_endpoints,
+    )
 
     k6_script = generate_k6_script(
         target_url=state["target_url"],
@@ -1095,6 +1213,9 @@ Please verify the user journey steps or selectors. If credentials are required, 
         "correlation_advice": advice.model_dump(),
         "cookie_correlation_notes": cookie_notes,
         "error_log": error_log,
+        "randomization_state": randomization_state,
+        "randomization_ledger": randomization_ledger,
+        "non_randomizable_endpoints": non_randomizable_endpoints,
         "messages": [AIMessage(content=summary_markdown)],
     }
 

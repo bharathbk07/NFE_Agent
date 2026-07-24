@@ -36,6 +36,23 @@ class RunRecord(TypedDict):
     step_timeline: NotRequired[List[Dict[str, Any]]]
 
 
+class RandomizationLedgerEntry(TypedDict):
+    """One HTTP payload rewrite mapping Run 1 → Run 2 for correlation filtering."""
+
+    run1_value: str
+    run2_value: str
+    field_path: str
+    location: NotRequired[str]  # body | query | header
+    surface: NotRequired[str]  # alias of location
+    method: NotRequired[str]
+    url_path: NotRequired[str]
+    request_url: NotRequired[str]
+    request_key: NotRequired[str]
+    strategy: NotRequired[str]
+    kind: NotRequired[str]
+    source: NotRequired[str]
+
+
 class CorrelationItem(TypedDict):
     """A request value observed to vary across repeated journey runs."""
 
@@ -117,3 +134,7 @@ class AgentState(TypedDict):
     watch_me_status: NotRequired[str]
     recording_file: NotRequired[str]
     error_log: NotRequired[List[str]]
+    # Protocol-level HTTP payload randomization (Run 1 harvest → Run 2 mutate)
+    randomization_state: NotRequired[Dict[str, Any]]
+    randomization_ledger: NotRequired[List[RandomizationLedgerEntry]]
+    non_randomizable_endpoints: NotRequired[List[Dict[str, Any]]]

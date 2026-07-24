@@ -123,8 +123,35 @@ def run_k6_smoke(
     combined = stdout + "\n" + stderr
     failed_checks = _parse_failed_checks(combined)
     failed_urls = _parse_failed_urls(combined)
+
+    # Enrich from JSON points — k6 often omits per-URL status from stdout when
+    # checks fail quietly (e.g. login 200 + cascading API 401).
+    status_counts: Dict[str, int] = {}
+    try:
+        from src.utils.k6_report_builder import load_k6_json_points
+
+        for pt in load_k6_json_points(Path(points_path)):
+            if pt.get("metric") != "nfe_req_fail":
+                continue
+            data = pt.get("data") or {}
+            tags = data.get("tags") or {}
+            status = str(tags.get("status") or "0")
+            status_counts[status] = status_counts.get(status, 0) + int(
+                data.get("value") or 0
+            )
+            url = str(tags.get("url") or "")
+            method = str(tags.get("method") or "")
+            if url and status not in ("", "200", "201", "204"):
+                label = f"{method} {url} status={status}".strip()
+                if label not in failed_urls:
+                    failed_urls.append(label)
+    except Exception as exc:
+        logger.debug("Could not enrich smoke from points: %s", exc)
+
     ok = proc.returncode == 0
     summary = "passed" if ok else f"failed (exit {proc.returncode})"
+    if status_counts.get("401"):
+        summary += f" · {status_counts['401']}× HTTP 401"
 
     html_report = ""
     try:
@@ -150,7 +177,8 @@ def run_k6_smoke(
         "stdout": stdout[-8000:],
         "stderr": stderr[-4000:],
         "failed_checks": failed_checks[:40],
-        "failed_urls": failed_urls[:40],
+        "failed_urls": failed_urls[:60],
+        "status_counts": status_counts,
         "summary": summary,
         "html_report": html_report,
         "summary_json": summary_json,
