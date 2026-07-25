@@ -2,7 +2,7 @@
 
 Chat-driven performance-test generator. You describe (or click through) a web journey; the agent captures protocol-level HTTP traffic, correlates dynamic values across runs, and emits a deterministic **k6** smoke script—without using an LLM to write the script.
 
-**Product surface:** LangGraph Studio chat (`langgraph dev --allow-blocking`) plus an optional headed Chromium window for Watch-me recording.
+**Product surface:** LangGraph Studio chat (`langgraph dev --allow-blocking`), an optional headed Chromium window for Watch-me recording, and chat-driven **Jira** story pickup (`work on SCRUM-1`).
 
 ---
 
@@ -14,6 +14,7 @@ Chat-driven performance-test generator. You describe (or click through) a web jo
 | Analyse | Parameters vs correlations, TXN grouping, auth/session fixes |
 | Emit | Load-Test IR → k6 JS (protocol and/or hybrid browser login) |
 | Validate | `k6 run` smoke (1 VU × 2 iterations) + HTML report + deterministic heal |
+| Deliver | Artifacts on disk; optional Jira ADF **Test Report** comment |
 
 Outputs land under `artifacts/k6/` (script, IR, HTML report) and `artifacts/recordings/` (reusable Watch-me captures).
 
@@ -31,10 +32,11 @@ Outputs land under `artifacts/k6/` (script, IR, HTML report) and `artifacts/reco
                          ┌────────────────┐
                          │  route_intent  │
                          └───────┬────────┘
-           ┌─────────────────────┼─────────────────────┐
-           ▼                     ▼                     ▼
-    conversation          analysis_qa           orchestrate /
-    (end)                 (end)                 reuse recording
+     ┌───────────┬───────────────┼───────────────┬──────────────┐
+     ▼           ▼               ▼               ▼              ▼
+ conversation  analysis_qa   run_jira_story  orchestrate /   reuse
+ (end)         (end)         (end)           Watch-me /      recording
+                                             Navigator
                                   │
               ┌───────────────────┼───────────────────┐
               ▼                   ▼                   ▼
@@ -53,7 +55,10 @@ Outputs land under `artifacts/k6/` (script, IR, HTML report) and `artifacts/reco
               └──────────┬──────────┘
                          ▼
               artifacts/k6 + chat summary
+              (+ Jira comment when via jira_perf)
 ```
+
+`src/graph.py` is a thin assembler (edges + compile). Node logic lives under [`src/nodes/`](src/nodes/).
 
 ### Repository layout
 
@@ -62,9 +67,11 @@ NFE_Agent/
 ├── src/
 │   ├── graph.py                 # Thin assembler: StateGraph edges + compile
 │   ├── main.py                  # CLI entry (imports compiled graph)
-│   ├── nodes/                   # Node implementations (routing, capture, analyse, …)
+│   ├── exceptions.py            # Typed errors; hard vs soft failure helpers
+│   ├── nodes/                   # route, capture, analyse, orchestrate, jira_story
 │   ├── security/                # URL/step policy, secrets, path jail
-│   ├── integrations/jira/       # Jira REST worker (label nfe-agent)
+│   ├── integrations/jira/       # REST client, ADF comments, labels, worker
+│   ├── integrations/jira_runner.py  # CLI debug (--check-auth, --issue)
 │   ├── agents/                  # Intent, orchestrator, navigator, analyst, …
 │   ├── tools/playwright_tool.py # CDP capture, Watch-me, journey replay
 │   └── utils/
@@ -78,6 +85,12 @@ NFE_Agent/
 │       └── correlation_noise.py   # Drop browser-header / cache-buster noise
 ├── prompts/                     # Versioned LLM prompts (local + optional Hub)
 ├── config/                      # Settings, observability, MCP registry
+├── docs/
+│   ├── jira-integration.md      # Jira setup, scopes, chat triggers
+│   ├── security.md              # Threat model + env knobs
+│   └── optional-mcps.md         # Optional k6 / Playwright / Atlassian MCP
+├── tests/                       # Security, Jira, exceptions, core unit tests
+├── .github/workflows/           # security-audit (pytest + pip-audit)
 ├── artifacts/k6/                # Generated scripts, IR, reports
 ├── artifacts/recordings/        # Saved Watch-me captures
 └── langgraph.json               # Studio entry: src/graph.py:graph
@@ -91,6 +104,7 @@ The chatbot keeps a typed LangGraph state across nodes, including:
 - **Captures:** `run_records` (Run 1 / Run 2 / optional Run 3)
 - **Analysis:** `parameterizable_candidates`, `correlations`, `dependencies`, `transactions`
 - **Randomization:** `randomization_ledger`, `randomization_state`, `non_randomizable_endpoints`
+- **Jira:** `jira_issue_key`, `jira_candidate_keys`, `jira_awaiting_clarity`
 - **Delivery:** `performance_test_output`, `recording_file`, chat `messages`
 
 ---
@@ -110,6 +124,7 @@ START → route_intent → …
 | `watch_me` | `orchestrate_journey` → Watch-me | You click; agent records |
 | `performance_analysis` / `follow_up_analysis` | `orchestrate_journey` → Navigator | Bot plans + clicks |
 | `reuse_recording` | `load_saved_recording` | Re-analyse disk capture |
+| `jira_perf` | `run_jira_story` | Process a labeled Jira issue via REST |
 
 ### 2. Watch-me (interactive record → replay → k6)
 
@@ -140,7 +155,7 @@ orchestrate_journey
   → END
 ```
 
-Selector failures can trigger LLM self-heal (accessibility snapshot + alternate selector).
+Selector failures can trigger LLM self-heal (accessibility snapshot + alternate selector). URL navigation and Playwright actions pass through [`src/security/`](src/security/) policy first.
 
 ### 4. Reuse a saved recording
 
@@ -157,7 +172,30 @@ Override store with `NFE_RECORDINGS_DIR`.
 
 ### 5. Analysis Q&A
 
-After a successful run in the same Studio thread, ask follow-ups (e.g. “which values are correlated?”). `answer_analysis_question` uses prior state; it does not re-capture.
+After a successful run in the same Studio thread, ask follow-ups (e.g. “which values are correlated?”). `answer_analysis_question` uses prior state; it does not re-capture. Mentions of TXN / k6 can rebuild script artifacts from existing captures.
+
+### 6. Jira story (chat-driven)
+
+```text
+route_intent (jira_perf)
+  → run_jira_story
+       ├─ resolve issue (key in message, or list nfe-agent To Do / In Progress)
+       ├─ parse description YAML/JSON (target_url, recording, workload, …)
+       ├─ gate on artifacts/recordings/<name>.json
+       ├─ run analyse pipeline (reuse recording → IR → k6 → smoke)
+       └─ post ADF Test Report comment + lifecycle labels
+  → END
+```
+
+```text
+work on SCRUM-1
+work on jira story
+run jira
+```
+
+- Issues need label **`nfe-agent`**. Credentials stay in env (`NFE_USER` / `NFE_PASS`), not in the story body.
+- Missing recording → `nfe-blocked` + instructions; after Watch-me, add **`nfe-recording-ready`** and retry (or say **force** / **re-run**).
+- Full setup, API token scopes, and troubleshooting: [`docs/jira-integration.md`](docs/jira-integration.md).
 
 ---
 
@@ -261,9 +299,9 @@ GEMINI_API_KEY=your-key
 GEMINI_MODEL=gemini-2.5-flash
 ```
 
-Optional: multi-model routing (`LLM_MODELS`), Cursor SDK (`CURSOR_API_KEY`), LangSmith, Dynatrace OTLP—see [`.env.example`](.env.example).
+Optional: multi-model routing (`LLM_MODELS`), Cursor SDK (`CURSOR_API_KEY`), LangSmith, Dynatrace OTLP, Jira, security policy—see [`.env.example`](.env.example).
 
-App MCP servers (not Cursor IDE): [`config/mcp_servers.json`](config/mcp_servers.json).
+App MCP servers (not Cursor IDE): [`config/mcp_servers.json`](config/mcp_servers.json). All stay **disabled** by default; npm packages are version-pinned (no `@latest`).
 
 ### Run the chatbot UI
 
@@ -290,17 +328,34 @@ python -m src.main config.json -o result.json
 
 ### Security
 
-Agent security controls (URL policy, credential placeholders for LLMs, artifact jails, redaction) live under [`src/security/`](src/security/). Full threat model and env knobs: [`docs/security.md`](docs/security.md).
+Controls live under [`src/security/`](src/security/). Full threat model: [`docs/security.md`](docs/security.md).
 
-k6 scripts read credentials from the environment by default:
+| Control | Default | Role |
+|---------|---------|------|
+| URL policy | deny private / metadata hosts | Blocks SSRF-style `page.goto` targets |
+| Step policy | allowlisted Playwright actions | Rejects unsafe browser actions |
+| Secrets | placeholders to LLMs | Credentials not sent as plaintext to planners |
+| Artifact redaction | on | Masks auth headers / cookies / password fields |
+| Path jail | on | Recordings + k6 filenames stay under `artifacts/` |
+| Credential store | off | Passwords not written into recordings/IR |
+
+Typed exceptions in [`src/exceptions.py`](src/exceptions.py):
+
+- **Fail closed:** `NFESecurityError`, `NFEConfigError`, `NFEAuthError`
+- **Soft-fail** (chat / `error_log`): pipeline / validation / most integration errors  
+  User-facing text and Jira comments are redacted (no passwords, tokens, or stack traces).
+
+k6 scripts read credentials from the environment at runtime:
 
 ```bash
 NFE_USER=Admin NFE_PASS=secret k6 run artifacts/k6/<host>.js
 ```
 
+CI: [`.github/workflows/security-audit.yml`](.github/workflows/security-audit.yml) runs unit tests (security, Jira, exceptions) and informational `pip-audit`.
+
 ### Jira
 
-Stories labeled **`nfe-agent`** can be processed from **Studio chat** (or CLI debug). Atlassian MCP is optional.
+Stories labeled **`nfe-agent`** are processed from **Studio chat** (primary) or CLI debug. Lifecycle labels: `nfe-queued` / `nfe-running` / `nfe-blocked` / `nfe-recording-ready` / `nfe-done`. Atlassian MCP is optional and unused by the worker (REST only).
 
 Setup, **API token scopes**, and troubleshooting: [`docs/jira-integration.md`](docs/jira-integration.md).
 
@@ -312,6 +367,17 @@ work on jira story
 ```bash
 .venv/bin/python -m src.integrations.jira_runner --check-auth
 .venv/bin/python -m src.integrations.jira_runner --issue SCRUM-1
+```
+
+Minimal Jira `.env` (prefer a classic / unscoped API token for site URL + Basic auth):
+
+```ini
+JIRA_BASE_URL=https://your-site.atlassian.net
+JIRA_EMAIL=bot@example.com
+JIRA_API_TOKEN=your_api_token_here
+NFE_JIRA_LABEL=nfe-agent
+NFE_USER=Admin
+NFE_PASS=secret
 ```
 
 ---
@@ -346,6 +412,14 @@ Prefer explicit selectors and credential injection:
 
 Or free-text journey steps in chat (omit “watch me”).
 
+### Jira
+
+```text
+work on SCRUM-1
+work on jira story
+work on SCRUM-1 force
+```
+
 ### Reuse / Q&A
 
 ```text
@@ -376,6 +450,16 @@ Script generation and healing do **not** use these prompts—only planning, clas
 
 ---
 
+## Tests
+
+```bash
+pytest tests/ -q --ignore=tests/test_run.py
+```
+
+Covers security policy, Jira chat/integration helpers, typed exceptions, and core pipeline unit tests.
+
+---
+
 ## Design principles
 
 1. **Protocol-first** — Capture and mutate at HTTP/CDP level; UI locators are for replay, not for load-test data.
@@ -383,3 +467,5 @@ Script generation and healing do **not** use these prompts—only planning, clas
 3. **Two-run differential** — Dynamic tokens are proven by Run1 vs Run2, then origin-traced to prior responses.
 4. **Heal script bugs, not the app** — Fix CSRF, session, and create-IDs that cause 4xx; allow application 5xx.
 5. **Stable artifacts** — One script/IR per host; heals overwrite in place so deliverables stay predictable.
+6. **Fail closed on security** — URL/step/fs-jail violations never bypass; secrets stay out of LLM prompts, logs, and Jira comments.
+7. **Thin graph, fat nodes** — `graph.py` wires edges only; capture, analyse, routing, and Jira live in `src/nodes/`.
