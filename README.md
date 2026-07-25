@@ -88,6 +88,7 @@ NFE_Agent/
 ├── docs/
 │   ├── jira-integration.md      # Jira setup, scopes, chat triggers
 │   ├── security.md              # Threat model + env knobs
+│   ├── smoke-and-self-heal.md   # k6 smoke gate + deterministic heal loop
 │   └── optional-mcps.md         # Optional k6 / Playwright / Atlassian MCP
 ├── tests/                       # Security, Jira, exceptions, core unit tests
 ├── .github/workflows/           # security-audit (pytest + pip-audit)
@@ -242,6 +243,8 @@ Noise dropped early: browser fingerprint headers, cache-busters (`rnd`, `timesta
 - Silent login failure (HTTP 200 + login form still present) is detected; persistent 401s convert Login to **browser mode** with cookie sync into the http jar.
 - Create POST `data.id` is correlated as `${requestId}` so downstream `/requests/8` paths do not 403/404.
 - Smoke treats **4xx as script failure**; **5xx is allowed** as application fault (`http.expectedStatuses` 2xx–3xx + 5xx).
+
+Full walkthrough of the smoke gate and heal loop (plain language + examples): [`docs/smoke-and-self-heal.md`](docs/smoke-and-self-heal.md).
 
 ### Protocol vs Chromium (why hybrid exists)
 
