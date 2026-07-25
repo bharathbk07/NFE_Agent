@@ -10,6 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from config.settings import settings
 from config.observability import get_diagnostics_callbacks
+from src.security.secrets import (
+    credentials_placeholders,
+    substitute_credential_placeholders,
+)
+from src.security.step_policy import filter_allowed_steps
+from src.security.url_policy import assert_url_allowed
 from src.utils.model_router import get_model_router, TaskType
 from src.utils.json_parsing import (
     RobustJsonOutputParser,
@@ -149,7 +155,7 @@ class NavigatorAgent:
         }
         inputs = {
             "url": url,
-            "credentials_json": json.dumps(credentials),
+            "credentials_json": json.dumps(credentials_placeholders(credentials)),
             "journey_description": journey_description,
         }
 
@@ -232,12 +238,17 @@ class NavigatorAgent:
             Planned steps, or minimal navigate/wait steps if planning fails.
         """
         logger.info("Requesting Gemini (via LangChain) to compile steps from user flow...")
+        assert_url_allowed(url)
 
         try:
             steps = await self._invoke_planner(url, credentials, journey_description)
             if not steps:
                 raise ValueError("Planner returned no steps")
-            logger.info(f"Successfully generated {len(steps)} steps.")
+            steps = substitute_credential_placeholders(steps, credentials)
+            steps = filter_allowed_steps(steps)
+            if not steps:
+                raise ValueError("Planner returned no policy-compliant steps")
+            logger.info("Successfully generated %s steps.", len(steps))
             return steps
         except Exception as e:
             logger.error("Failed to plan steps: %s", e)

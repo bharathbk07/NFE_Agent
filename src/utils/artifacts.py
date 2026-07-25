@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set
 from urllib.parse import urlparse
 
+from src.security.fs_jail import assert_under_jail, safe_artifact_filename
+from src.exceptions import ErrorCode, NFEValidationError
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -109,10 +112,14 @@ def save_k6_script(
         ``size_bytes``, and ``relative_path``.
 
     Raises:
-        ValueError: If ``script`` is empty.
+        NFEValidationError: If ``script`` is empty.
     """
     if not script:
-        raise ValueError("Cannot save empty k6 script")
+        raise NFEValidationError(
+            "Cannot save empty k6 script",
+            code=ErrorCode.VALIDATION,
+            user_message="Cannot save empty k6 script.",
+        )
 
     out_dir = artifacts_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -120,10 +127,10 @@ def save_k6_script(
     host = _slug_host(target_url)
     if not filename:
         filename = stable_artifact_names(target_url)["script"]
-    if not filename.endswith(".js"):
-        filename = f"{filename}.js"
+    filename = safe_artifact_filename(filename, default_suffix=".js")
 
     path = out_dir / filename
+    path = assert_under_jail(path, out_dir)
     path.write_text(script, encoding="utf-8")
     abs_path = str(path.resolve())
     logger.info("Saved k6 script → %s (%s bytes)", abs_path, path.stat().st_size)
@@ -171,7 +178,11 @@ def save_load_test_ir(
         ValueError: If ``ir`` is empty.
     """
     if not ir:
-        raise ValueError("Cannot save empty IR")
+        raise NFEValidationError(
+            "Cannot save empty IR",
+            code=ErrorCode.VALIDATION,
+            user_message="Cannot save empty IR.",
+        )
 
     out_dir = artifacts_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -179,10 +190,10 @@ def save_load_test_ir(
     host = _slug_host(target_url)
     if not filename:
         filename = stable_artifact_names(target_url)["ir"]
-    if not filename.endswith(".json"):
-        filename = f"{filename}.json"
+    filename = safe_artifact_filename(filename, default_suffix=".json")
 
     path = out_dir / filename
+    path = assert_under_jail(path, out_dir)
     path.write_text(json.dumps(ir, indent=2, default=str), encoding="utf-8")
     abs_path = str(path.resolve())
     logger.info("Saved load-test IR → %s", abs_path)

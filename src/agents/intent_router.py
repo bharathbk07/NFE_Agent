@@ -23,6 +23,7 @@ IntentName = Literal[
     "follow_up_analysis",
     "watch_me",
     "reuse_recording",
+    "jira_perf",
 ]
 
 WATCH_ME_KEYWORDS = re.compile(
@@ -50,6 +51,20 @@ REUSE_RECORDING_KEYWORDS = re.compile(
     r"saved\s+recordings|"
     r"rerun\s+(from\s+)?(saved\s+)?recording|"
     r"replay\s+saved"
+    r")\b",
+    re.IGNORECASE,
+)
+
+ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+JIRA_PERF_KEYWORDS = re.compile(
+    r"\b("
+    r"work\s+on\s+(a\s+)?(jira\s+)?(story|issue)|"
+    r"work\s+on\s+jira|"
+    r"jira\s+story|"
+    r"run\s+jira|"
+    r"process\s+(a\s+)?(jira\s+)?(issue|story)|"
+    r"work\s+on\s+[A-Z][A-Z0-9]+-\d+"
     r")\b",
     re.IGNORECASE,
 )
@@ -112,6 +127,8 @@ class IntentDecision(BaseModel):
             "conversation = casual chat / math / greetings unrelated to prior analysis; "
             "analysis_qa = question about prior analysis results in this chat (tokens, correlations, params); "
             "watch_me = user will click in a headed browser the bot opens; "
+            "reuse_recording = load/list a saved Watch-me recording; "
+            "jira_perf = process a Jira issue via REST (work on story / issue key); "
             "performance_analysis = new URL/journey to run the full pipeline; "
             "follow_up_analysis = explicitly rerun the previous journey"
         )
@@ -195,6 +212,9 @@ def _heuristic_intent(
             return "watch_me", 0.96, "Watch-me recording requested with URL"
         return "watch_me", 0.9, "Watch-me recording requested (URL may come from extract)"
 
+    if _wants_jira_perf(cleaned):
+        return "jira_perf", 0.95, "Jira story / issue processing requested"
+
     if REUSE_RECORDING_KEYWORDS.search(cleaned):
         return "reuse_recording", 0.95, "Reuse / list saved Watch-me recording"
 
@@ -228,6 +248,17 @@ def _heuristic_intent(
         return "analysis_qa", 0.8, "Follow-up with prior analysis available"
 
     return None
+
+
+def _wants_jira_perf(text: str) -> bool:
+    """True when the user asks to process a Jira story/issue via NFE."""
+    if JIRA_PERF_KEYWORDS.search(text):
+        return True
+    if ISSUE_KEY_RE.search(text) and re.search(
+        r"\b(jira|work\s+on|process|run)\b", text, re.IGNORECASE
+    ):
+        return True
+    return False
 
 
 async def classify_intent(

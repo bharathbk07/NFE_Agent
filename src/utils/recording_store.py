@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
+from src.security.fs_jail import assert_under_jail
+from src.security.secrets import credentials_for_storage, redact_run_records, redact_step
+from src.exceptions import ErrorCode, NFEValidationError
+from config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -63,16 +68,26 @@ def save_watch_me_recording(
     filename = f"{host}.json"
     path = out_dir / filename
 
+    known_secrets = [v for v in (credentials or {}).values() if v]
+    steps_out = list(user_journey_steps or [])
+    runs_out = list(run_records or [])
+    if settings.NFE_REDACT_ARTIFACTS:
+        steps_out = [
+            redact_step(s, known_secrets=known_secrets) if isinstance(s, dict) else s
+            for s in steps_out
+        ]
+        runs_out = redact_run_records(runs_out, known_secrets=known_secrets)
+
     payload = {
         "version": 1,
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "label": label or host,
         "source": "watch_me",
         "target_url": target_url,
-        "credentials": dict(credentials or {}),
-        "user_journey_steps": user_journey_steps or [],
+        "credentials": credentials_for_storage(credentials),
+        "user_journey_steps": steps_out,
         "sub_tasks": sub_tasks or [],
-        "run_records": run_records or [],
+        "run_records": runs_out,
     }
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     abs_path = str(path.resolve())
@@ -128,23 +143,35 @@ def list_recordings(limit: int = 20) -> List[Dict[str, Any]]:
 
 
 def resolve_recording_path(hint: str = "") -> Optional[Path]:
-    """Resolve a recording path from a user hint (path, host, or empty=latest)."""
+    """Resolve a recording path from a user hint (path, host, or empty=latest).
+
+    Only paths under ``recordings_dir()`` are accepted (path jail).
+    """
     out_dir = recordings_dir()
     text = (hint or "").strip().strip("`\"'")
+
+    def _jailed(candidate: Path) -> Optional[Path]:
+        try:
+            resolved = assert_under_jail(candidate, out_dir)
+        except Exception:
+            return None
+        return resolved if resolved.is_file() else None
 
     if text:
         direct = Path(text).expanduser()
         if direct.is_file():
-            return direct.resolve()
-        # relative to project or recordings dir
+            jailed = _jailed(direct)
+            if jailed is not None:
+                return jailed
+        # relative to recordings dir only (not arbitrary project paths)
         for candidate in (
-            _PROJECT_ROOT / text,
             out_dir / text,
             out_dir / f"{text}.json",
             out_dir / f"{_slug_host(text)}.json",
         ):
-            if candidate.is_file():
-                return candidate.resolve()
+            jailed = _jailed(candidate)
+            if jailed is not None:
+                return jailed
         # host substring match
         host = _slug_host(text) if "://" in text else text
         matches = [
@@ -171,22 +198,38 @@ def load_watch_me_recording(path: Union[Path, str]) -> Dict[str, Any]:
         Mapping suitable for merging into ``AgentState``.
 
     Raises:
-        FileNotFoundError: If the file does not exist.
-        ValueError: If JSON is invalid or missing required fields.
+        NFEValidationError: If the file is missing or JSON is invalid.
+        FsJailError: If the path escapes the recordings jail.
     """
-    file_path = Path(path).expanduser().resolve()
+    file_path = assert_under_jail(Path(path).expanduser(), recordings_dir())
     if not file_path.is_file():
-        raise FileNotFoundError(f"Recording not found: {file_path}")
+        raise NFEValidationError(
+            f"Recording not found: {file_path}",
+            code=ErrorCode.RECORDING_MISSING,
+            user_message=f"Recording not found: {file_path}",
+        )
     data = json.loads(file_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError("Recording JSON must be an object")
+        raise NFEValidationError(
+            "Recording JSON must be an object",
+            code=ErrorCode.VALIDATION,
+            user_message="Recording file is not valid JSON object.",
+        )
     target_url = str(data.get("target_url") or "").strip()
     steps = data.get("user_journey_steps") or []
     runs = data.get("run_records") or []
     if not target_url:
-        raise ValueError("Recording is missing target_url")
+        raise NFEValidationError(
+            "Recording is missing target_url",
+            code=ErrorCode.VALIDATION,
+            user_message="Recording is missing target_url.",
+        )
     if not steps and not runs:
-        raise ValueError("Recording has no steps or run_records")
+        raise NFEValidationError(
+            "Recording has no steps or run_records",
+            code=ErrorCode.VALIDATION,
+            user_message="Recording has no steps or run records.",
+        )
     return {
         "target_url": target_url,
         "credentials": dict(data.get("credentials") or {}),

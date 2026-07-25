@@ -805,15 +805,22 @@ def build_load_test_ir(
         if name in seen_vars:
             continue
         seen_vars.add(name)
-        vars_list.append(
-            {
-                "name": name,
-                "value": value,
-                "source": cand.get("selector") or "",
-                "is_credential": bool(cand.get("is_credential")),
-                "propagations": cand.get("propagations") or [],
-            }
-        )
+        entry: Dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "source": cand.get("selector") or "",
+            "is_credential": bool(cand.get("is_credential")),
+            "propagations": cand.get("propagations") or [],
+        }
+        if entry["is_credential"]:
+            from src.security.secrets import env_name_for_credential
+
+            entry["from_env"] = env_name_for_credential(name)
+            from config.settings import settings
+
+            if not settings.NFE_STORE_CREDENTIALS:
+                entry["value"] = ""
+        vars_list.append(entry)
         if value and value not in vars_by_value:
             vars_by_value[value] = name
 

@@ -83,6 +83,51 @@ class Settings:
     # Execution
     DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
+    # Security policy (see docs/security.md)
+    # Comma-separated host allowlist; empty = any non-blocked host
+    NFE_URL_ALLOWLIST: str = os.getenv("NFE_URL_ALLOWLIST", "")
+    NFE_URL_DENY_PRIVATE: bool = (
+        os.getenv("NFE_URL_DENY_PRIVATE", "true").lower() == "true"
+    )
+    NFE_ALLOW_LOCALHOST: bool = (
+        os.getenv("NFE_ALLOW_LOCALHOST", "false").lower() == "true"
+    )
+    NFE_REDACT_ARTIFACTS: bool = (
+        os.getenv("NFE_REDACT_ARTIFACTS", "true").lower() == "true"
+    )
+    NFE_STORE_CREDENTIALS: bool = (
+        os.getenv("NFE_STORE_CREDENTIALS", "false").lower() == "true"
+    )
+    NFE_SELF_HEAL_HTML_CHARS: int = int(
+        os.getenv("NFE_SELF_HEAL_HTML_CHARS", "15000") or "15000"
+    )
+    NFE_SELF_HEAL_A11Y_CHARS: int = int(
+        os.getenv("NFE_SELF_HEAL_A11Y_CHARS", "6000") or "6000"
+    )
+
+    # Jira Cloud integration (chat-driven — see docs/jira-integration.md)
+    JIRA_BASE_URL: str = os.getenv("JIRA_BASE_URL", "").rstrip("/")
+    JIRA_EMAIL: str = os.getenv("JIRA_EMAIL", "")
+    JIRA_API_TOKEN: str = os.getenv("JIRA_API_TOKEN", "")
+    NFE_JIRA_LABEL: str = os.getenv("NFE_JIRA_LABEL", "nfe-agent")
+    # Empty = auto-build from NFE_JIRA_LABEL + NFE_JIRA_ISSUE_TYPES
+    NFE_JIRA_POLL_JQL: str = os.getenv("NFE_JIRA_POLL_JQL", "")
+    # Comma-separated issue types; empty or * = any type
+    NFE_JIRA_ISSUE_TYPES: str = os.getenv(
+        "NFE_JIRA_ISSUE_TYPES", "Story,Task,Bug,Issue"
+    )
+    # Comma-separated board statuses eligible for pickup
+    NFE_JIRA_STATUSES: str = os.getenv(
+        "NFE_JIRA_STATUSES", "To Do,In Progress"
+    )
+    # Status name to move into when starting work from To Do
+    NFE_JIRA_IN_PROGRESS_STATUS: str = os.getenv(
+        "NFE_JIRA_IN_PROGRESS_STATUS", "In Progress"
+    )
+    NFE_JIRA_ACCEPTANCE_FIELD: str = os.getenv(
+        "NFE_JIRA_ACCEPTANCE_FIELD", ""
+    )  # optional custom field id e.g. customfield_10000
+
     # Project MCP registry (single file for all MCP server definitions)
     # Default: <repo>/config/mcp_servers.json
     MCP_SERVERS_CONFIG: str = os.getenv("MCP_SERVERS_CONFIG", "")

@@ -9,6 +9,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.exceptions import ErrorCode
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,8 +36,8 @@ def run_k6_smoke(
 
     Returns:
         Dictionary with ``ok``, ``skipped``, ``exit_code``, ``stdout``,
-        ``stderr``, ``failed_checks``, ``failed_urls``, ``summary``, and
-        optional ``html_report`` / ``summary_json`` paths.
+        ``stderr``, ``failed_checks``, ``failed_urls``, ``summary``, ``code``,
+        and optional ``html_report`` / ``summary_json`` paths.
     """
     path = Path(script_path)
     if not path.is_file():
@@ -48,6 +50,7 @@ def run_k6_smoke(
             "failed_checks": [],
             "failed_urls": [],
             "summary": "script missing",
+            "code": ErrorCode.K6_SCRIPT_MISSING,
         }
 
     if not k6_available():
@@ -60,6 +63,7 @@ def run_k6_smoke(
             "failed_checks": [],
             "failed_urls": [],
             "summary": "k6 missing",
+            "code": ErrorCode.K6_SMOKE_FAILED,
         }
 
     from src.utils.k6_html_report import find_html_report, report_paths_for_script
@@ -182,6 +186,7 @@ def run_k6_smoke(
         "summary": summary,
         "html_report": html_report,
         "summary_json": summary_json,
+        "code": ErrorCode.K6_SMOKE_FAILED if not ok else "",
     }
 
 

@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Generator, List, Optional
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from config.settings import settings
+from src.exceptions import ErrorCode, NFEConfigError, NFEIntegrationError
 from src.utils.llm_registry import (
     DEFAULT_LLM_TIMEOUT_SECONDS,
     ModelSpec,
@@ -186,8 +187,12 @@ class ModelRouter:
         self._spec_by_ref: Dict[str, ModelSpec] = {s.ref: s for s in self._specs}
 
         if not self._specs:
-            raise RuntimeError(
-                "No LLM models configured. Set LLM_MODELS or GEMINI_MODEL in .env"
+            raise NFEConfigError(
+                "No LLM models configured. Set LLM_MODELS or GEMINI_MODEL in .env",
+                code=ErrorCode.CONFIG_MISSING,
+                user_message=(
+                    "No LLM models configured. Set LLM_MODELS or GEMINI_MODEL in .env."
+                ),
             )
 
         if len(self._specs) == 1:
@@ -452,7 +457,14 @@ class ModelRouter:
                 )
 
         assert last_error is not None
-        raise last_error
+        if isinstance(last_error, (NFEConfigError, NFEIntegrationError)):
+            raise last_error
+        raise NFEIntegrationError(
+            str(last_error),
+            code=ErrorCode.LLM_PROVIDER,
+            user_message="All configured LLM providers failed for this task.",
+            cause=last_error,
+        )
 
     def invoke_with_failover_sync(
         self,
@@ -522,7 +534,14 @@ class ModelRouter:
                     break
 
         assert last_error is not None
-        raise last_error
+        if isinstance(last_error, (NFEConfigError, NFEIntegrationError)):
+            raise last_error
+        raise NFEIntegrationError(
+            str(last_error),
+            code=ErrorCode.LLM_PROVIDER,
+            user_message="All configured LLM providers failed for this task.",
+            cause=last_error,
+        )
 
     def routing_summary(self) -> Dict[str, str]:
         """Return selected primary model references keyed by task value."""

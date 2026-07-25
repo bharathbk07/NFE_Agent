@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from config.observability import get_diagnostics_callbacks
+from src.security.secrets import credentials_placeholders
 from src.utils.model_router import get_model_router, TaskType
 from src.utils.json_parsing import RobustJsonOutputParser, normalize_sub_task_list
 from src.utils.prompt_loader import load_prompt_text
@@ -83,7 +84,7 @@ class OrchestratorAgent:
         }
         inputs = {
             "url": url,
-            "credentials_json": json.dumps(credentials),
+            "credentials_json": json.dumps(credentials_placeholders(credentials)),
             "journey_description": journey_description,
         }
 

@@ -118,6 +118,9 @@ class AgentState(TypedDict):
     """Type-safe state exchanged among NFE LangGraph pipeline nodes."""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     intent: NotRequired[str]
+    jira_issue_key: NotRequired[str]
+    jira_candidate_keys: NotRequired[List[str]]
+    jira_awaiting_clarity: NotRequired[bool]
     target_url: NotRequired[str]
     credentials: NotRequired[Dict[str, str]]
     user_journey_steps: NotRequired[List[Any]]

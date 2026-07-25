@@ -9,6 +9,9 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, Page, Response, Request
 
+from config.settings import settings
+from src.security.step_policy import StepPolicyError, assert_step_allowed
+from src.security.url_policy import UrlPolicyError, assert_url_allowed
 from src.utils.http_body import content_type_from_headers, parse_post_data
 from src.utils.prompt_loader import render_prompt
 
@@ -429,7 +432,8 @@ class PlaywrightBrowserRecorder:
 
             try:
                 if url:
-                    logger.info(f"Navigating to initial URL: {url}")
+                    assert_url_allowed(url)
+                    logger.info("Navigating to initial URL: %s", url)
                     self.current_step_index = -1
                     self.current_step_action = "initial_navigation"
                     page.goto(url, wait_until="networkidle")
@@ -451,15 +455,26 @@ class PlaywrightBrowserRecorder:
                     })
 
                 for step_idx, step in enumerate(steps):
+                    try:
+                        step = assert_step_allowed(step)
+                    except StepPolicyError as policy_err:
+                        logger.error("Blocked step %s: %s", step_idx + 1, policy_err)
+                        raise
                     action = step.get("action")
                     selector = step.get("selector", "")
                     self.current_step_index = step_idx
                     self.current_step_action = action
                     url_before = page.url
-                    logger.info(f"Executing step {step_idx + 1}: {action} -> {step}")
+                    logger.info(
+                        "Executing step %s: %s selector=%s",
+                        step_idx + 1,
+                        action,
+                        selector or "",
+                    )
 
                     try:
                         if action == "navigate":
+                            assert_url_allowed(step["url"])
                             page.goto(step["url"], wait_until="networkidle")
                         elif action == "click":
                             page.click(selector, timeout=8000)
@@ -473,19 +488,27 @@ class PlaywrightBrowserRecorder:
                             page.wait_for_selector(selector, timeout=step.get("timeout", 5000))
                         elif action == "wait_for_load":
                             page.wait_for_load_state("networkidle")
+                    except (UrlPolicyError, StepPolicyError):
+                        raise
                     except Exception as step_error:
+                        from src.exceptions import NFESecurityError
+
+                        if isinstance(step_error, NFESecurityError):
+                            raise
                         if action in ["click", "fill", "select", "wait_for_selector"] and selector:
                             logger.warning(
                                 f"Step action '{action}' failed with selector '{selector}': {step_error}. "
                                 "Attempting self-healing..."
                             )
                             try:
-                                html_content = page.content()[:35000]
+                                html_limit = settings.NFE_SELF_HEAL_HTML_CHARS
+                                a11y_limit = settings.NFE_SELF_HEAL_A11Y_CHARS
+                                html_content = page.content()[:html_limit]
                                 current_url = page.url
                                 # Accessibility tree (same idea as Playwright MCP) for better selector healing
                                 try:
                                     snapshot = page.accessibility.snapshot() or {}
-                                    a11y_hint = json.dumps(snapshot)[:12000]
+                                    a11y_hint = json.dumps(snapshot)[:a11y_limit]
                                 except Exception:
                                     a11y_hint = "{}"
 
@@ -496,17 +519,23 @@ class PlaywrightBrowserRecorder:
 
                                 router = get_model_router()
 
-                                # Inject a11y snapshot into HTML context for the healer
+                                # Untrusted page content: delimited DATA, truncated
                                 heal_context = (
-                                    f"{html_content}\n\n"
-                                    f"--- Accessibility snapshot (JSON) ---\n{a11y_hint}"
+                                    f"<<<UNTRUSTED_PAGE_HTML>>>\n{html_content}\n"
+                                    f"<<<END_UNTRUSTED_PAGE_HTML>>>\n\n"
+                                    f"<<<UNTRUSTED_A11Y_JSON>>>\n{a11y_hint}\n"
+                                    f"<<<END_UNTRUSTED_A11Y_JSON>>>"
                                 )
+                                safe_details = {
+                                    "action": action,
+                                    "selector": selector,
+                                }
                                 self_heal_prompt = render_prompt(
                                     "browser_self_heal",
                                     action=action,
                                     selector=selector,
                                     current_url=current_url,
-                                    action_details=json.dumps(step),
+                                    action_details=json.dumps(safe_details),
                                     html_content=heal_context,
                                 )
 
@@ -534,6 +563,13 @@ class PlaywrightBrowserRecorder:
 
                                 new_selector = json.loads(resp_text).get("selector")
                                 if new_selector and new_selector != selector:
+                                    assert_step_allowed(
+                                        {
+                                            "action": action,
+                                            "selector": new_selector,
+                                            "value": step.get("value"),
+                                        }
+                                    )
                                     logger.info(
                                         f"Self-healed! Retrying action '{action}' with new selector: '{new_selector}'"
                                     )
@@ -1319,6 +1355,7 @@ class PlaywrightBrowserRecorder:
             page.on("framenavigated", _on_frame_navigated)
 
             try:
+                assert_url_allowed(url)
                 logger.info("Watch-me: opening headed browser at %s", url)
                 self.current_step_index = -1
                 self.current_step_action = "initial_navigation"

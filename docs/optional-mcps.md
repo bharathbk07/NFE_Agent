@@ -61,6 +61,7 @@ Requires: `pip install langchain-mcp-adapters` (listed in `requirements.txt`).
 | `k6` | `enabled: false` | Optional Grafana [`k6 x mcp`](https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/). Smoke/heal uses **CLI** `k6 run` (needed for HTML report JSON). Enable only if you want MCP tools in-bot. |
 | `playwright` | `enabled: false` | Pipeline already uses in-process Playwright + CDP |
 | `chrome-devtools` | `enabled: false` | Optional live DevTools traces — not the capture layer |
+| `atlassian` | `enabled: false` | Atlassian Rovo MCP via pinned `mcp-remote`. Interactive Studio only; Jira worker uses REST ([`docs/jira-integration.md`](jira-integration.md)). |
 
 Turn a server on only when a sub-agent should call that MCP at runtime.
 

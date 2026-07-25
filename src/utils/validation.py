@@ -164,11 +164,25 @@ async def _parse_journey_payload(content: str) -> Tuple[str, Dict[str, str], str
     # 4. LLM fallback for unstructured journey text that already has a URL signal
     if not parsed_successfully and ("http://" in content_cleaned or "https://" in content_cleaned):
                     try:
+                        from src.security.secrets import redact_text_for_llm
+
+                        # Harvest credentials locally before any LLM call
+                        if not credentials:
+                            for key, pattern in (
+                                ("username", r"(?i)\b(?:username|user)\s*[:=]\s*(\S+)"),
+                                ("password", r"(?i)\b(?:password|pass)\s*[:=]\s*(\S+)"),
+                            ):
+                                m = re.search(pattern, content_cleaned)
+                                if m:
+                                    credentials[key] = m.group(1).rstrip(".,;")
+
                         logger.info("Using LLM to extract target URL, credentials, and steps...")
                         router = get_model_router()
+                        # Prefer regex-extracted credentials; never send raw passwords to the LLM
+                        safe_message = redact_text_for_llm(content)
                         extract_prompt = render_prompt(
                             "input_extractor",
-                            input_message=content,
+                            input_message=safe_message,
                         )
 
                         def _build_extract(llm):
@@ -189,7 +203,7 @@ async def _parse_journey_payload(content: str) -> Tuple[str, Dict[str, str], str
                         extracted_url = extracted_data.get("target_url") or extracted_data.get("url") or ""
                         if extracted_url:
                             url = extracted_url
-                            credentials = extracted_data.get("credentials") or {}
+                            # Do not trust LLM-returned credential values
                             raw_journey = (
                                 extracted_data.get("user_journey_steps")
                                 or extracted_data.get("journey")

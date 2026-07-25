@@ -13,23 +13,35 @@
         },
         "playwright": {
             "enabled": false,
-            "description": "Optional Playwright MCP for interactive browser tools. Pipeline uses in-process Playwright+CDP by default.",
+            "description": "Optional Playwright MCP for interactive browser tools. Pipeline uses in-process Playwright+CDP by default. Pin version — do not use @latest.",
             "transport": "stdio",
             "command": "npx",
             "args": [
                 "-y",
-                "@playwright/mcp@latest"
+                "@playwright/mcp@0.0.39"
             ],
             "env": {}
         },
         "chrome-devtools": {
             "enabled": false,
-            "description": "Optional Chrome DevTools MCP for live network/perf traces. Not used as the capture layer.",
+            "description": "Optional Chrome DevTools MCP for live network/perf traces. Not used as the capture layer. Pin version — do not use @latest.",
             "transport": "stdio",
             "command": "npx",
             "args": [
                 "-y",
-                "chrome-devtools-mcp@latest"
+                "chrome-devtools-mcp@0.2.0"
+            ],
+            "env": {}
+        },
+        "atlassian": {
+            "enabled": false,
+            "description": "Atlassian Rovo MCP (Jira/Confluence). Interactive Studio use only — the NFE Jira worker uses REST. Pin mcp-remote; do not use @latest.",
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote@0.1.29",
+                "https://mcp.atlassian.com/v1/mcp"
             ],
             "env": {}
         }

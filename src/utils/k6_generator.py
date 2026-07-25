@@ -27,6 +27,78 @@ def _js_string(value: Any) -> str:
     return json.dumps("" if value is None else str(value))
 
 
+def _workload_options_js(ir: Dict[str, Any], *, browser: bool) -> str:
+    """Render k6 ``export const options`` from IR ``workload`` or default smoke."""
+    wl = ir.get("workload") or {}
+    thresholds = dict(wl.get("thresholds") or ir.get("thresholds") or {})
+    if not thresholds:
+        thresholds = {
+            "http_req_failed": ["rate<0.01"],
+            "http_req_duration": ["p(95)<2000"],
+            "checks": ["rate>0.99"],
+        }
+    thr_js = ",\n    ".join(
+        f"{json.dumps(k)}: {json.dumps(v)}" for k, v in thresholds.items()
+    )
+    browser_opts = (
+        "\n      options: { browser: { type: 'chromium' } }," if browser else ""
+    )
+
+    stages = wl.get("stages")
+    if isinstance(stages, list) and stages:
+        stages_js = json.dumps(stages)
+        return f"""export const options = {{
+  scenarios: {{
+    load: {{
+      executor: 'ramping-vus',
+      startVUs: 0,
+      stages: {stages_js},{browser_opts}
+    }},
+  }},
+  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
+  thresholds: {{
+    {thr_js}
+  }},
+}};"""
+
+    executor = str(wl.get("executor") or "shared-iterations")
+    vus = int(wl.get("vus") or 1)
+    iterations = int(wl.get("iterations") or 2)
+    max_duration = str(wl.get("maxDuration") or wl.get("duration") or "2m")
+    scenario_name = "load" if wl else "smoke"
+
+    if executor == "constant-vus":
+        duration = str(wl.get("duration") or max_duration)
+        return f"""export const options = {{
+  scenarios: {{
+    {scenario_name}: {{
+      executor: 'constant-vus',
+      vus: {vus},
+      duration: {json.dumps(duration)},{browser_opts}
+    }},
+  }},
+  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
+  thresholds: {{
+    {thr_js}
+  }},
+}};"""
+
+    return f"""export const options = {{
+  scenarios: {{
+    {scenario_name}: {{
+      executor: 'shared-iterations',
+      vus: {vus},
+      iterations: {iterations},
+      maxDuration: {json.dumps(max_duration)},{browser_opts}
+    }},
+  }},
+  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
+  thresholds: {{
+    {thr_js}
+  }},
+}};"""
+
+
 def _randomized_var_js(var: Dict[str, Any]) -> str:
     """Emit a per-VU unique JS expression for IR vars marked ``randomize``.
 
@@ -67,6 +139,15 @@ def _var_js_assignment(var: Dict[str, Any]) -> str:
     name = var["name"]
     if var.get("randomize"):
         return f"  {name}: {_randomized_var_js(var)}"
+    # Credentials: read from process env so scripts do not embed secrets
+    if var.get("is_credential") or var.get("from_env"):
+        from config.settings import settings
+        from src.security.secrets import env_name_for_credential
+
+        env_key = str(var.get("from_env") or env_name_for_credential(str(name)))
+        if settings.NFE_STORE_CREDENTIALS and var.get("value") not in (None, ""):
+            return f"  {name}: __ENV.{env_key} || {_js_string(var.get('value'))}"
+        return f"  {name}: __ENV.{env_key} || ''"
     return f"  {name}: {_js_string(var.get('value'))}"
 
 
@@ -703,24 +784,7 @@ import {{ Trend, Counter }} from 'k6/metrics';
 
 {_response_callback_js()}
 
-export const options = {{
-  scenarios: {{
-    smoke: {{
-      executor: 'shared-iterations',
-      vus: 1,
-      iterations: 2,
-      maxDuration: '2m',
-      options: {{ browser: {{ type: 'chromium' }} }},
-    }},
-  }},
-  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
-  // Fail the smoke only on script bugs (4xx / failed checks). App 5xx is allowed.
-  thresholds: {{
-    http_req_failed: ['rate<0.01'],
-    http_req_duration: ['p(95)<2000'],
-    checks: ['rate>0.99'],
-  }},
-}};
+{_workload_options_js(ir, browser=True)}
 
 {_runtime_helpers_js()}
 
@@ -763,23 +827,7 @@ import {{ Trend, Counter }} from 'k6/metrics';
 
 {_response_callback_js()}
 
-export const options = {{
-  scenarios: {{
-    smoke: {{
-      executor: 'shared-iterations',
-      vus: 1,
-      iterations: 2,
-      maxDuration: '2m',
-    }},
-  }},
-  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
-  // Fail the smoke only on script bugs (4xx / failed checks). App 5xx is allowed.
-  thresholds: {{
-    http_req_failed: ['rate<0.01'],
-    http_req_duration: ['p(95)<2000'],
-    checks: ['rate>0.99'],
-  }},
-}};
+{_workload_options_js(ir, browser=False)}
 
 {_runtime_helpers_js()}
 
