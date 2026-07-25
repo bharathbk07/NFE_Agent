@@ -459,7 +459,9 @@ Script generation and healing do **not** use these prompts—only planning, clas
 pytest tests/ -q --ignore=tests/test_run.py
 ```
 
-Covers security policy, Jira chat/integration helpers, typed exceptions, and core pipeline unit tests.
+`pytest.ini` sets `pythonpath = .` so `import src...` works without installing the package. Covers security policy, Jira helpers, typed exceptions, and core unit tests.
+
+Optional CI: [`.github/workflows/security-audit.yml`](.github/workflows/security-audit.yml) runs the same tests + informational `pip-audit` on push/PR. Safe to delete that workflow if you prefer local-only checks during MVP.
 
 ---
 
