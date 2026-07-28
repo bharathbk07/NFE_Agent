@@ -85,17 +85,21 @@ NFE_Agent/
 │       └── correlation_noise.py   # Drop browser-header / cache-buster noise
 ├── prompts/                     # Versioned LLM prompts (local + optional Hub)
 ├── config/                      # Settings, observability, MCP registry
-├── docs/
-│   ├── jira-integration.md      # Jira setup, scopes, chat triggers
-│   ├── security.md              # Threat model + env knobs
-│   ├── smoke-and-self-heal.md   # k6 smoke gate + deterministic heal loop
-│   └── optional-mcps.md         # Optional k6 / Playwright / Atlassian MCP
-├── tests/                       # Security, Jira, exceptions, core unit tests
+├── docs/                        # See docs/README.md for full index
+│   ├── README.md                # Documentation index
+│   ├── agents/                  # Planning/analysis agent guides
+│   ├── workers/                 # Jira + Confluence workers and setup guides
+│   ├── pipeline/                # Smoke + self-heal
+│   ├── security/                # Threat model + policy
+│   └── mcp/                     # Optional MCP servers
+├── tests/                       # Security, Jira, Confluence, exceptions, core unit tests
 ├── .github/workflows/           # security-audit (pytest + pip-audit)
 ├── artifacts/k6/                # Generated scripts, IR, reports
 ├── artifacts/recordings/        # Saved Watch-me captures
 └── langgraph.json               # Studio entry: src/graph.py:graph
 ```
+
+**Documentation:** full index at [`docs/README.md`](docs/README.md). Agents: [`docs/agents/overview.md`](docs/agents/overview.md). Workers: [`docs/workers/overview.md`](docs/workers/overview.md).
 
 ### Shared state (`AgentState`)
 
@@ -126,6 +130,9 @@ START → route_intent → …
 | `performance_analysis` / `follow_up_analysis` | `orchestrate_journey` → Navigator | Bot plans + clicks |
 | `reuse_recording` | `load_saved_recording` | Re-analyse disk capture |
 | `jira_perf` | `run_jira_story` | Process a labeled Jira issue via REST |
+
+How each agent works (intent, orchestrator, navigator, analysts, QA): [`docs/agents/overview.md`](docs/agents/overview.md).  
+Jira / Confluence workers: [`docs/workers/overview.md`](docs/workers/overview.md).
 
 ### 2. Watch-me (interactive record → replay → k6)
 
@@ -196,7 +203,7 @@ run jira
 
 - Issues need label **`nfe-agent`**. Credentials stay in env (`NFE_USER` / `NFE_PASS`), not in the story body.
 - Missing recording → `nfe-blocked` + instructions; after Watch-me, add **`nfe-recording-ready`** and retry (or say **force** / **re-run**).
-- Full setup, API token scopes, and troubleshooting: [`docs/jira-integration.md`](docs/jira-integration.md).
+- Full setup, API token scopes, and troubleshooting: [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md). Worker deep-dive: [`docs/workers/jira-story-worker.md`](docs/workers/jira-story-worker.md).
 
 ---
 
@@ -244,7 +251,7 @@ Noise dropped early: browser fingerprint headers, cache-busters (`rnd`, `timesta
 - Create POST `data.id` is correlated as `${requestId}` so downstream `/requests/8` paths do not 403/404.
 - Smoke treats **4xx as script failure**; **5xx is allowed** as application fault (`http.expectedStatuses` 2xx–3xx + 5xx).
 
-Full walkthrough of the smoke gate and heal loop (plain language + examples): [`docs/smoke-and-self-heal.md`](docs/smoke-and-self-heal.md).
+Full walkthrough of the smoke gate and heal loop (plain language + examples): [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md).
 
 ### Protocol vs Chromium (why hybrid exists)
 
@@ -281,7 +288,7 @@ k6 is primarily a **protocol** load tool (`k6/http`). It is **not** “a browser
 | `artifacts/k6/summary.json` | k6 handleSummary metrics |
 | `artifacts/recordings/<host>.json` | Watch-me steps + run records |
 
-Install k6 for smoke: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). Smoke uses **CLI** `k6 run` (needed for JSON points + HTML). Grafana k6 MCP is optional and off by default (`NFE_K6_MCP=mcp`); see [`docs/optional-mcps.md`](docs/optional-mcps.md).
+Install k6 for smoke: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). Smoke uses **CLI** `k6 run` (needed for JSON points + HTML). Grafana k6 MCP is optional and off by default (`NFE_K6_MCP=mcp`); see [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md).
 
 ---
 
@@ -331,7 +338,7 @@ python -m src.main config.json -o result.json
 
 ### Security
 
-Controls live under [`src/security/`](src/security/). Full threat model: [`docs/security.md`](docs/security.md).
+Controls live under [`src/security/`](src/security/). Full threat model: [`docs/security/security.md`](docs/security/security.md).
 
 | Control | Default | Role |
 |---------|---------|------|
@@ -360,7 +367,9 @@ CI: [`.github/workflows/security-audit.yml`](.github/workflows/security-audit.ym
 
 Stories labeled **`nfe-agent`** are processed from **Studio chat** (primary) or CLI debug. Lifecycle labels: `nfe-queued` / `nfe-running` / `nfe-blocked` / `nfe-recording-ready` / `nfe-done`. Atlassian MCP is optional and unused by the worker (REST only).
 
-Setup, **API token scopes**, and troubleshooting: [`docs/jira-integration.md`](docs/jira-integration.md).
+Setup, **API token scopes**, and troubleshooting: [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md). How the worker fits the graph: [`docs/workers/jira-story-worker.md`](docs/workers/jira-story-worker.md).
+
+Failed smoke/SLA runs get a **Why it failed / stopped** section on the Jira comment. When Confluence publish succeeds, the comment also links the run page.
 
 ```text
 work on SCRUM-1
@@ -381,6 +390,21 @@ JIRA_API_TOKEN=your_api_token_here
 NFE_JIRA_LABEL=nfe-agent
 NFE_USER=Admin
 NFE_PASS=secret
+```
+
+### Confluence
+
+Completed k6 runs (SLA pass, SLA fail, or no SLA) can publish under a fixed parent page with HTML + k6 attachments. Mid-run aborts are **not** published.
+
+Setup: [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md). Worker deep-dive: [`docs/workers/confluence-publisher-worker.md`](docs/workers/confluence-publisher-worker.md).
+
+```ini
+CONFLUENCE_SPACE_KEY=ENG
+# Optional — defaults to JIRA_* when empty:
+# CONFLUENCE_BASE_URL=https://your-site.atlassian.net
+# CONFLUENCE_EMAIL=
+# CONFLUENCE_API_TOKEN=
+NFE_CONFLUENCE_PUBLISH=true
 ```
 
 ---
@@ -450,6 +474,32 @@ LLM prompts live under [`prompts/`](prompts/) and are loaded via `src/utils/prom
 2. **Local files**: Git-tracked fallback for offline / default use (`USE_LANGSMITH_PROMPTS` defaults off to avoid blocking the event loop).
 
 Script generation and healing do **not** use these prompts—only planning, classification, and self-heal do.
+
+---
+
+## Documentation
+
+| Topic | Doc |
+|-------|-----|
+| Index | [`docs/README.md`](docs/README.md) |
+| Agents overview | [`docs/agents/overview.md`](docs/agents/overview.md) |
+| Intent router | [`docs/agents/intent-router.md`](docs/agents/intent-router.md) |
+| Orchestrator | [`docs/agents/orchestrator-agent.md`](docs/agents/orchestrator-agent.md) |
+| Navigator | [`docs/agents/navigator-agent.md`](docs/agents/navigator-agent.md) |
+| Traffic analyst | [`docs/agents/traffic-analyst-agent.md`](docs/agents/traffic-analyst-agent.md) |
+| Parameter agent | [`docs/agents/parameter-agent.md`](docs/agents/parameter-agent.md) |
+| Correlation classifier | [`docs/agents/correlation-classifier-agent.md`](docs/agents/correlation-classifier-agent.md) |
+| Transaction agent | [`docs/agents/transaction-agent.md`](docs/agents/transaction-agent.md) |
+| Analysis QA | [`docs/agents/analysis-qa-agent.md`](docs/agents/analysis-qa-agent.md) |
+| Shared state | [`docs/agents/agent-state.md`](docs/agents/agent-state.md) |
+| Workers overview | [`docs/workers/overview.md`](docs/workers/overview.md) |
+| Jira story worker | [`docs/workers/jira-story-worker.md`](docs/workers/jira-story-worker.md) |
+| Confluence publisher worker | [`docs/workers/confluence-publisher-worker.md`](docs/workers/confluence-publisher-worker.md) |
+| Jira setup & ops | [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md) |
+| Confluence setup & ops | [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md) |
+| Smoke + self-heal | [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md) |
+| Security | [`docs/security/security.md`](docs/security/security.md) |
+| Optional MCPs | [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md) |
 
 ---
 

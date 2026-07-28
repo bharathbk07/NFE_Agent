@@ -5,7 +5,7 @@ NFE Agent can pick up **Jira Cloud** stories labeled **`nfe-agent`**, check for 
 | Path | Role |
 |------|------|
 | **Studio chat** (`jira_perf` intent → `run_jira_story`) | Primary trigger: “work on SCRUM-1” / “work on jira story” |
-| **REST helpers** ([`src/integrations/jira/`](../src/integrations/jira/)) | Get issue, JQL search, comments, lifecycle labels (source of truth) |
+| **REST helpers** ([`src/integrations/jira/`](../../src/integrations/jira/)) | Get issue, JQL search, comments, lifecycle labels (source of truth) |
 | **CLI** (`jira_runner`) | Debug only: `--check-auth`, `--issue`, `--poll-once` |
 | **Atlassian MCP** | Optional Studio tooling (`config/mcp_servers.json` → `atlassian`, disabled by default) |
 
@@ -60,7 +60,7 @@ Optional: assign the bot to the project’s default role (e.g. Member) if that r
 
 ### 4. Configure `.env`
 
-Copy from [`.env.example`](../.env.example) and fill:
+Copy from [`.env.example`](../../.env.example) and fill:
 
 ```ini
 # Jira Cloud site (no trailing path)
@@ -167,6 +167,8 @@ Add **force** or **re-run** in the message to reprocess or confirm after a clari
 
 The agent replies in chat with a short summary. Jira gets a **Test Report** comment as **Atlassian Document Format (ADF)** headings/lists (Jira Cloud REST v3 does not render Markdown/wiki markup in API comments).
 
+When smoke/SLA fails or the run aborts mid-way, the comment leads with **Why it failed / stopped** (failed URLs, checks, thresholds, exit code). If Confluence publishing succeeded for a *completed* run, the comment also includes the Confluence run-page URL. See [`confluence-publishing.md`](confluence-publishing.md). Worker design: [`jira-story-worker.md`](jira-story-worker.md).
+
 ### 9. Optional CLI (debug)
 
 ```bash
@@ -249,7 +251,7 @@ Minimum granular scopes for NFE’s operations:
 
 MCP uses Atlassian’s remote MCP / OAuth flow (see [Atlassian Rovo MCP](https://www.atlassian.com/platform/rovo-mcp)). Enable only for interactive Studio use:
 
-1. Set `"enabled": true` on `atlassian` in [`config/mcp_servers.json`](../config/mcp_servers.json).
+1. Set `"enabled": true` on `atlassian` in [`config/mcp_servers.json`](../../config/mcp_servers.json).
 2. Complete OAuth when prompted.
 3. Keep REST env vars for the chat-driven pipeline — MCP is not used for processing stories.
 
@@ -264,10 +266,10 @@ If `artifacts/recordings/<name>.json` is missing, the worker comments instructio
 ## Security notes
 
 - Never put app passwords in the Jira description; use `credential_env` + `NFE_USER` / `NFE_PASS`.
-- Comments are sanitized ([`src/integrations/jira/security.py`](../src/integrations/jira/security.py)).
+- Comments are sanitized ([`src/integrations/jira/security.py`](../../src/integrations/jira/security.py)).
 - Parsed `target_url` goes through NFE URL policy.
 - Chat replies mirror Jira comments briefly and do not dump secrets.
-- See also [`docs/security.md`](security.md).
+- See also [`security.md`](../security/security.md).
 
 ---
 

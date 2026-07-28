@@ -2,7 +2,7 @@
 
 All MCP servers used by **NFE_Agent** (the LangGraph app) are defined in one file:
 
-**[`config/mcp_servers.json`](../config/mcp_servers.json)**
+**[`config/mcp_servers.json`](../../config/mcp_servers.json)**
 
 This is **not** Cursor IDE MCP (`.cursor/mcp.json`). It is the runtime registry the
 Python agents load via `src/tools/mcp_client.py`.
@@ -61,13 +61,13 @@ Requires: `pip install langchain-mcp-adapters` (listed in `requirements.txt`).
 | `k6` | `enabled: false` | Optional Grafana [`k6 x mcp`](https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/). Smoke/heal uses **CLI** `k6 run` (needed for HTML report JSON). Enable only if you want MCP tools in-bot. |
 | `playwright` | `enabled: false` | Pipeline already uses in-process Playwright + CDP |
 | `chrome-devtools` | `enabled: false` | Optional live DevTools traces — not the capture layer |
-| `atlassian` | `enabled: false` | Atlassian Rovo MCP via pinned `mcp-remote`. Interactive Studio only; Jira worker uses REST ([`docs/jira-integration.md`](jira-integration.md)). |
+| `atlassian` | `enabled: false` | Atlassian Rovo MCP via pinned `mcp-remote`. Interactive Studio only; Jira worker uses REST ([`jira-integration.md`](../workers/jira-integration.md)). |
 
 Turn a server on only when a sub-agent should call that MCP at runtime.
 
 ### k6 smoke (CLI)
 
-Analysis smoke/heal always runs ``k6 run --out json=...`` via [`src/utils/k6_runner.py`](../src/utils/k6_runner.py) so ``artifacts/k6/html-report.html`` gets full TXN/request tables.
+Analysis smoke/heal always runs ``k6 run --out json=...`` via [`src/utils/k6_runner.py`](../../src/utils/k6_runner.py) so ``artifacts/k6/html-report.html`` gets full TXN/request tables.
 
 | Env | Effect |
 | --- | --- |

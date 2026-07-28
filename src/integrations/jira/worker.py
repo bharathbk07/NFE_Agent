@@ -250,6 +250,12 @@ async def process_issue_key(
                 status_counts=result.get("status_counts") or {},
                 summary_json=str(result.get("summary_json") or ""),
                 exit_code=result.get("exit_code"),
+                skipped=bool(result.get("skipped")),
+                confluence_url=str(
+                    result.get("confluence_url")
+                    or (result.get("confluence") or {}).get("run_url")
+                    or ""
+                ),
             ),
         )
         jira.set_lifecycle(

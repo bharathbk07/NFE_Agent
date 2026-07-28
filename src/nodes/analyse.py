@@ -299,11 +299,11 @@ Please verify the user journey steps or selectors. If credentials are required, 
     k6_file: Dict[str, str] = {}
     smoke_result: Dict[str, Any] = {}
     heal_notes: List[str] = []
+    names = None
     try:
         from src.utils.k6_mcp import run_k6_smoke_preferred
         from src.utils.k6_healer import heal_load_test_ir, format_smoke_section
 
-        names = None
         try:
             from src.utils.artifacts import stable_artifact_names
 
@@ -391,7 +391,61 @@ Please verify the user journey steps or selectors. If credentials are required, 
             "heal_notes": heal_notes,
             "html_report": smoke_result.get("html_report") or "",
             "summary_json": smoke_result.get("summary_json") or "",
+            "exit_code": smoke_result.get("exit_code"),
+            "failed_checks": list(smoke_result.get("failed_checks") or []),
+            "failed_urls": list(smoke_result.get("failed_urls") or []),
+            "status_counts": dict(smoke_result.get("status_counts") or {}),
         }
+
+    # Resolve IR path for Confluence attachments
+    ir_path = ""
+    try:
+        from src.utils.artifacts import artifacts_dir, stable_artifact_names
+
+        ir_name = (names or stable_artifact_names(state.get("target_url") or "")).get(
+            "ir"
+        )
+        if ir_name:
+            candidate = artifacts_dir() / ir_name
+            if candidate.is_file():
+                ir_path = str(candidate)
+    except Exception:
+        ir_path = ""
+
+    confluence_info: Dict[str, Any] = {"published": False}
+    if not state.get("skip_confluence_publish"):
+        try:
+            from src.integrations.confluence import try_publish_run_results
+
+            confluence_info = try_publish_run_results(
+                {
+                    "target_url": state.get("target_url") or "",
+                    "recording_file": state.get("recording_file") or "",
+                    "jira_issue_key": state.get("jira_issue_key") or "",
+                    "k6_path": (k6_file or {}).get("path") or "",
+                    "ir_path": ir_path,
+                    "html_report": (smoke_result or {}).get("html_report") or "",
+                    "summary_json": (smoke_result or {}).get("summary_json") or "",
+                    "smoke_result": smoke_result,
+                    "smoke_ok": (smoke_result or {}).get("ok"),
+                    "smoke_summary": (smoke_result or {}).get("summary") or "",
+                    "heal_notes": heal_notes,
+                    "transactions": transactions,
+                    "failed_checks": list((smoke_result or {}).get("failed_checks") or []),
+                    "failed_urls": list((smoke_result or {}).get("failed_urls") or []),
+                    "status_counts": dict(
+                        (smoke_result or {}).get("status_counts") or {}
+                    ),
+                    "exit_code": (smoke_result or {}).get("exit_code"),
+                }
+            )
+        except Exception as conf_err:
+            logger.warning("Confluence publish skipped: %s", conf_err)
+            confluence_info = {
+                "published": False,
+                "skipped_reason": str(conf_err),
+            }
+    perf_output["confluence"] = confluence_info
 
     summary_markdown = format_correlation_report(
         user_steps=user_steps,
@@ -412,6 +466,16 @@ Please verify the user journey steps or selectors. If credentials are required, 
         heal_notes=heal_notes,
         brief=True,
     )
+    if confluence_info.get("published") and confluence_info.get("run_url"):
+        summary_markdown = (
+            f"{summary_markdown}\n\n"
+            f"**Confluence:** [{confluence_info.get('run_title') or 'Run report'}]"
+            f"({confluence_info['run_url']})"
+        )
+    elif confluence_info.get("skipped_reason"):
+        logger.info(
+            "Confluence not published: %s", confluence_info.get("skipped_reason")
+        )
 
     return {
         "run_records": records,

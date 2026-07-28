@@ -83,7 +83,7 @@ class Settings:
     # Execution
     DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-    # Security policy (see docs/security.md)
+    # Security policy (see docs/security/security.md)
     # Comma-separated host allowlist; empty = any non-blocked host
     NFE_URL_ALLOWLIST: str = os.getenv("NFE_URL_ALLOWLIST", "")
     NFE_URL_DENY_PRIVATE: bool = (
@@ -105,7 +105,7 @@ class Settings:
         os.getenv("NFE_SELF_HEAL_A11Y_CHARS", "6000") or "6000"
     )
 
-    # Jira Cloud integration (chat-driven — see docs/jira-integration.md)
+    # Jira Cloud integration (chat-driven — see docs/workers/jira-integration.md)
     JIRA_BASE_URL: str = os.getenv("JIRA_BASE_URL", "").rstrip("/")
     JIRA_EMAIL: str = os.getenv("JIRA_EMAIL", "")
     JIRA_API_TOKEN: str = os.getenv("JIRA_API_TOKEN", "")
@@ -127,6 +127,19 @@ class Settings:
     NFE_JIRA_ACCEPTANCE_FIELD: str = os.getenv(
         "NFE_JIRA_ACCEPTANCE_FIELD", ""
     )  # optional custom field id e.g. customfield_10000
+
+    # Confluence Cloud publishing (see docs/workers/confluence-publishing.md)
+    # Empty BASE/EMAIL/TOKEN fall back to JIRA_* values.
+    CONFLUENCE_BASE_URL: str = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
+    CONFLUENCE_EMAIL: str = os.getenv("CONFLUENCE_EMAIL", "")
+    CONFLUENCE_API_TOKEN: str = os.getenv("CONFLUENCE_API_TOKEN", "")
+    CONFLUENCE_SPACE_KEY: str = os.getenv("CONFLUENCE_SPACE_KEY", "")
+    CONFLUENCE_PARENT_TITLE: str = os.getenv(
+        "CONFLUENCE_PARENT_TITLE", "Performance Testing and Engineering"
+    )
+    NFE_CONFLUENCE_PUBLISH: bool = os.getenv(
+        "NFE_CONFLUENCE_PUBLISH", "true"
+    ).lower() in ("1", "true", "yes", "on")
 
     # Project MCP registry (single file for all MCP server definitions)
     # Default: <repo>/config/mcp_servers.json

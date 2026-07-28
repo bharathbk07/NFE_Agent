@@ -52,7 +52,7 @@ def comment_blocked(reason: str) -> str:
     )
 
 
-def _load_summary_metrics(summary_json_path: str) -> Dict[str, Any]:
+def _load_summary_data(summary_json_path: str) -> Dict[str, Any]:
     path = (summary_json_path or "").strip()
     if not path:
         return {}
@@ -60,8 +60,11 @@ def _load_summary_metrics(summary_json_path: str) -> Dict[str, Any]:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         return {}
-    if not isinstance(data, dict):
-        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_summary_metrics(summary_json_path: str) -> Dict[str, Any]:
+    data = _load_summary_data(summary_json_path)
     metrics = data.get("metrics") or {}
     state = data.get("state") or {}
     http_fail = (metrics.get("http_req_failed") or {}).get("values") or {}
@@ -80,6 +83,22 @@ def _load_summary_metrics(summary_json_path: str) -> Dict[str, Any]:
         "checks_fails": checks.get("fails"),
         "duration_ms": state.get("testRunDurationMs"),
     }
+
+
+def _threshold_rows(summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    metrics = summary.get("metrics") or {}
+    for name, metric in metrics.items():
+        thresholds = (metric or {}).get("thresholds") or {}
+        for rule, info in thresholds.items():
+            rows.append(
+                {
+                    "metric": name,
+                    "threshold": rule,
+                    "ok": bool((info or {}).get("ok")),
+                }
+            )
+    return rows
 
 
 def _fmt_num(value: Any, *, digits: int = 2) -> str:
@@ -112,6 +131,76 @@ def _fmt_ms(value: Any) -> str:
         return str(value)
 
 
+def _why_failed_section(
+    *,
+    smoke_ok: Optional[bool],
+    smoke_summary: str,
+    skipped: bool,
+    exit_code: Optional[int],
+    failed_checks: List[str],
+    failed_urls: List[str],
+    status_counts: Dict[str, Any],
+    summary_json: str,
+) -> List[str]:
+    """Build a leading 'Why it failed / stopped' section when not a clean pass."""
+    if smoke_ok:
+        return []
+
+    summary = _load_summary_data(summary_json)
+    thr = _threshold_rows(summary)
+    thr_fails = [r for r in thr if not r["ok"]]
+    summary_l = (smoke_summary or "").lower()
+    lines = ["## Why it failed / stopped", ""]
+
+    if skipped or "k6 missing" in summary_l or "k6 not found" in summary_l:
+        lines.append(
+            "* Run did **not** complete: k6 was skipped or unavailable "
+            f"(`{smoke_summary or 'skipped'}`)."
+        )
+    elif exit_code == -1 or any(
+        t in summary_l for t in ("timeout", "timed out", "spawn failed", "script missing")
+    ):
+        lines.append(
+            f"* Run **stopped mid-way** / did not finish "
+            f"(`{smoke_summary or exit_code}`)."
+        )
+    elif thr_fails:
+        lines.append("* Test **completed**, but **SLA / thresholds failed**:")
+        for r in thr_fails[:15]:
+            lines.append(
+                f"  * `{r['metric']}` → `{r['threshold']}`"
+            )
+        if failed_urls or failed_checks:
+            lines.append("* Additional script/check issues:")
+    elif smoke_ok is None:
+        lines.append("* Smoke status unknown (no conclusive pass/fail).")
+    else:
+        lines.append(
+            "* Test **completed** (or attempted), but smoke checks / script validation failed."
+        )
+
+    if failed_urls:
+        lines.append("* Top failed requests:")
+        for u in failed_urls[:10]:
+            lines.append(f"  * `{u}`")
+    if failed_checks:
+        lines.append("* Failed checks:")
+        for c in failed_checks[:10]:
+            lines.append(f"  * `{c}`")
+    if status_counts:
+        status_line = ", ".join(
+            f"{code}×{count}" for code, count in sorted(status_counts.items())
+        )
+        lines.append(f"* HTTP status counts: `{status_line}`")
+    if exit_code is not None:
+        lines.append(f"* Exit code: `{exit_code}`")
+    if smoke_summary and smoke_ok is False:
+        lines.append(f"* Run notes: {smoke_summary}")
+
+    lines.append("")
+    return lines
+
+
 def comment_results(
     *,
     issue_key: str,
@@ -131,6 +220,8 @@ def comment_results(
     status_counts: Optional[Dict[str, Any]] = None,
     summary_json: str = "",
     exit_code: Optional[int] = None,
+    skipped: bool = False,
+    confluence_url: str = "",
     extra: str = "",
 ) -> str:
     """Rich test report comment (converted to ADF when posted)."""
@@ -157,9 +248,21 @@ def comment_results(
     fail_check_lines = [f"* `{c}`" for c in (failed_checks or [])[:25]]
     heal_lines = [f"* {n}" for n in (heal_notes or [])[:15]]
 
+    why = _why_failed_section(
+        smoke_ok=smoke_ok,
+        smoke_summary=smoke_summary,
+        skipped=skipped,
+        exit_code=exit_code,
+        failed_checks=list(failed_checks or []),
+        failed_urls=list(failed_urls or []),
+        status_counts=status_counts,
+        summary_json=summary_json,
+    )
+
     parts = [
         f"*NFE Agent* — Test Report for `{issue_key}`",
         "",
+        *why,
         "## Test Summary",
         f"* Status: *{status}*",
         f"* Story: {story_summary or 'n/a'}",
@@ -205,6 +308,14 @@ def comment_results(
         "## Heal notes",
         ("\n".join(heal_lines) if heal_lines else "None"),
     ]
+    if confluence_url:
+        parts.extend(
+            [
+                "",
+                "## Confluence",
+                f"* Run report: {confluence_url}",
+            ]
+        )
     if extra:
         parts.extend(["", extra])
     return sanitize_comment("\n".join(parts))

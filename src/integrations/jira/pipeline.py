@@ -50,6 +50,8 @@ async def run_perf_for_request(
         "watch_me_status": "ready_analyse",
         "recording_file": str(path),
         "messages": [],
+        # Final workload smoke + Confluence publish happen below (avoid double publish).
+        "skip_confluence_publish": True,
     }
 
     analysis = await analyse_traffic(state)
@@ -93,6 +95,48 @@ async def run_perf_for_request(
         ir_meta = {}
 
     prior_k6 = artifacts.get("k6_file") if isinstance(artifacts.get("k6_file"), dict) else {}
+
+    confluence_info: Dict[str, Any] = {"published": False}
+    try:
+        from src.integrations.confluence import try_publish_run_results
+
+        confluence_info = try_publish_run_results(
+            {
+                "target_url": target_url,
+                "recording_file": str(path),
+                "recording_hint": request.recording_hint or "",
+                "jira_issue_key": getattr(request, "issue_key", "") or "",
+                "k6_path": k6_file.get("path") or prior_k6.get("path") or "",
+                "ir_path": ir_meta.get("path") or "",
+                "html_report": smoke.get("html_report")
+                or (perf.get("k6_smoke") or {}).get("html_report")
+                or "",
+                "summary_json": str(
+                    smoke.get("summary_json")
+                    or (perf.get("k6_smoke") or {}).get("summary_json")
+                    or ""
+                ),
+                "smoke_result": smoke or (perf.get("k6_smoke") or {}),
+                "smoke_ok": smoke.get("ok") if smoke else (perf.get("k6_smoke") or {}).get("ok"),
+                "smoke_summary": str(
+                    smoke.get("summary")
+                    or (perf.get("k6_smoke") or {}).get("summary")
+                    or ""
+                ),
+                "heal_notes": heal_notes,
+                "transactions": analysis.get("transactions")
+                or perf.get("transactions")
+                or [],
+                "failed_checks": list(smoke.get("failed_checks") or []),
+                "failed_urls": list(smoke.get("failed_urls") or []),
+                "status_counts": dict(smoke.get("status_counts") or {}),
+                "exit_code": smoke.get("exit_code"),
+            }
+        )
+    except Exception as exc:
+        logger.warning("Confluence publish soft-failed in Jira pipeline: %s", exc)
+        confluence_info = {"published": False, "skipped_reason": str(exc)}
+
     return {
         "ok": bool(smoke.get("ok")) if smoke else False,
         "blocked": False,
@@ -112,4 +156,6 @@ async def run_perf_for_request(
         "status_counts": dict(smoke.get("status_counts") or {}),
         "summary_json": str(smoke.get("summary_json") or ""),
         "exit_code": smoke.get("exit_code"),
+        "confluence": confluence_info,
+        "confluence_url": confluence_info.get("run_url") or "",
     }

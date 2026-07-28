@@ -52,7 +52,7 @@ Analyse traffic → Build Load-Test IR → Generate k6 script
 Chat summary / optional Jira Test Report comment
 ```
 
-Triggered from the `analyse_traffic` node after IR → k6 emit ([`src/nodes/analyse.py`](../src/nodes/analyse.py)).
+Triggered from the `analyse_traffic` node after IR → k6 emit ([`src/nodes/analyse.py`](../../src/nodes/analyse.py)).
 
 ---
 
@@ -96,7 +96,7 @@ Generated scripts treat HTTP status codes differently on purpose:
 If the *test script* is wrong, NFE tries to fix the script.  
 If the *app under test* is returning server errors, that stays visible so you do not ship a green script that hides production pain.
 
-Implementation: `http.expectedStatuses` and check helpers in [`src/utils/k6_generator.py`](../src/utils/k6_generator.py) / [`src/utils/k6_runtime_helpers.js`](../src/utils/k6_runtime_helpers.js).
+Implementation: `http.expectedStatuses` and check helpers in [`src/utils/k6_generator.py`](../../src/utils/k6_generator.py) / [`src/utils/k6_runtime_helpers.js`](../../src/utils/k6_runtime_helpers.js).
 
 ---
 
@@ -105,7 +105,7 @@ Implementation: `http.expectedStatuses` and check helpers in [`src/utils/k6_gene
 1. **First smoke** runs on the freshly generated script.
 2. If exit code is **0** → done. Chat says smoke passed.
 3. If smoke **failed** (and was not skipped):
-   - Call `heal_load_test_ir(ir, smoke_result, attempt)` ([`src/utils/k6_healer.py`](../src/utils/k6_healer.py)).
+   - Call `heal_load_test_ir(ir, smoke_result, attempt)` ([`src/utils/k6_healer.py`](../../src/utils/k6_healer.py)).
    - That function returns an updated **IR** plus human-readable **heal notes**.
    - Regenerate k6 from the new IR.
    - **Overwrite** the same script/IR filenames (stable artifacts for CI).
@@ -263,7 +263,7 @@ After login, cookies are synced and **later TXNs stay protocol**—those keep no
 
 For **load / capacity**, focus on the **protocol** TXNs after login. Browser Login timing answers: “Did the session establish, and how long did that cost?”—not the main scale path.
 
-Implementation: [`src/utils/k6_generator.py`](../src/utils/k6_generator.py) (`_emit_protocol_txn`, `_emit_browser_txn`), [`src/utils/k6_runtime_helpers.js`](../src/utils/k6_runtime_helpers.js) (`nfeMarkTxn`), [`src/utils/k6_report_builder.py`](../src/utils/k6_report_builder.py).
+Implementation: [`src/utils/k6_generator.py`](../../src/utils/k6_generator.py) (`_emit_protocol_txn`, `_emit_browser_txn`), [`src/utils/k6_runtime_helpers.js`](../../src/utils/k6_runtime_helpers.js) (`nfeMarkTxn`), [`src/utils/k6_report_builder.py`](../../src/utils/k6_report_builder.py).
 
 ---
 
@@ -323,14 +323,14 @@ If after two heals login still 401s because the SPA never exposes a usable CSRF 
 
 | Piece | Location |
 |-------|----------|
-| Orchestrates smoke + ≤2 heals | [`src/nodes/analyse.py`](../src/nodes/analyse.py) |
-| Rule-based IR fixes | [`src/utils/k6_healer.py`](../src/utils/k6_healer.py) |
-| CLI `k6 run` + status enrichment | [`src/utils/k6_runner.py`](../src/utils/k6_runner.py) |
-| Prefer CLI for smoke (HTML/points) | [`src/utils/k6_mcp.py`](../src/utils/k6_mcp.py) |
-| IR → k6 emit (incl. expected statuses) | [`src/utils/k6_generator.py`](../src/utils/k6_generator.py) |
-| Auth / CSRF / create-id helpers | [`src/utils/load_test_ir.py`](../src/utils/load_test_ir.py) |
-| HTML report from points | [`src/utils/k6_report_builder.py`](../src/utils/k6_report_builder.py) |
-| Chat playbook smoke section | [`src/utils/formatting.py`](../src/utils/formatting.py) |
-| Browser *selector* self-heal (different) | [`src/tools/playwright_tool.py`](../src/tools/playwright_tool.py), [`prompts/browser_self_heal.txt`](../prompts/browser_self_heal.txt) |
+| Orchestrates smoke + ≤2 heals | [`src/nodes/analyse.py`](../../src/nodes/analyse.py) |
+| Rule-based IR fixes | [`src/utils/k6_healer.py`](../../src/utils/k6_healer.py) |
+| CLI `k6 run` + status enrichment | [`src/utils/k6_runner.py`](../../src/utils/k6_runner.py) |
+| Prefer CLI for smoke (HTML/points) | [`src/utils/k6_mcp.py`](../../src/utils/k6_mcp.py) |
+| IR → k6 emit (incl. expected statuses) | [`src/utils/k6_generator.py`](../../src/utils/k6_generator.py) |
+| Auth / CSRF / create-id helpers | [`src/utils/load_test_ir.py`](../../src/utils/load_test_ir.py) |
+| HTML report from points | [`src/utils/k6_report_builder.py`](../../src/utils/k6_report_builder.py) |
+| Chat playbook smoke section | [`src/utils/formatting.py`](../../src/utils/formatting.py) |
+| Browser *selector* self-heal (different) | [`src/tools/playwright_tool.py`](../../src/tools/playwright_tool.py), [`prompts/browser_self_heal.txt`](../../prompts/browser_self_heal.txt) |
 
-Related docs: [`security.md`](security.md), [`jira-integration.md`](jira-integration.md), main [`README.md`](../README.md).
+Related docs: [`security.md`](../security/security.md), [`jira-integration.md`](../workers/jira-integration.md), main [`README.md`](../../README.md).

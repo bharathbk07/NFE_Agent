@@ -34,13 +34,13 @@ NFE_USER=Admin NFE_PASS=admin123 k6 run artifacts/k6/example.js
 ## Jira (chat-driven)
 
 - Require label `nfe-agent` before processing (Studio chat or CLI).
-- Comments are sanitized via [`src/integrations/jira/security.py`](../src/integrations/jira/security.py) (password/token redaction).
+- Comments are sanitized via [`src/integrations/jira/security.py`](../../src/integrations/jira/security.py) (password/token redaction).
 - Story `target_url` passes through URL policy before runs.
-- Atlassian MCP stays disabled by default; story processing uses REST only. See [`docs/jira-integration.md`](jira-integration.md).
+- Atlassian MCP stays disabled by default; story processing uses REST only. See [`jira-integration.md`](../workers/jira-integration.md).
 
 ## Error handling
 
-NFE uses a typed exception hierarchy in [`src/exceptions.py`](../src/exceptions.py):
+NFE uses a typed exception hierarchy in [`src/exceptions.py`](../../src/exceptions.py):
 
 | Class | Behavior |
 |-------|----------|
@@ -57,11 +57,11 @@ NFE uses a typed exception hierarchy in [`src/exceptions.py`](../src/exceptions.
 
 ## What is enforced in code
 
-- [`src/exceptions.py`](../src/exceptions.py) — typed errors, redacted user messages, hard vs soft failure helpers
-- [`src/security/url_policy.py`](../src/security/url_policy.py) — `page.goto` / navigate steps
-- [`src/security/step_policy.py`](../src/security/step_policy.py) — action allowlist
-- [`src/security/secrets.py`](../src/security/secrets.py) — LLM placeholders + redaction
-- [`src/security/fs_jail.py`](../src/security/fs_jail.py) — recordings + k6 artifact filenames
-- [`src/integrations/jira/`](../src/integrations/jira/) — comment sanitization, label gate
+- [`src/exceptions.py`](../../src/exceptions.py) — typed errors, redacted user messages, hard vs soft failure helpers
+- [`src/security/url_policy.py`](../../src/security/url_policy.py) — `page.goto` / navigate steps
+- [`src/security/step_policy.py`](../../src/security/step_policy.py) — action allowlist
+- [`src/security/secrets.py`](../../src/security/secrets.py) — LLM placeholders + redaction
+- [`src/security/fs_jail.py`](../../src/security/fs_jail.py) — recordings + k6 artifact filenames
+- [`src/integrations/jira/`](../../src/integrations/jira/) — comment sanitization, label gate
 
-MCP servers in [`config/mcp_servers.json`](../config/mcp_servers.json) stay **disabled** by default; npm packages are version-pinned (no `@latest`).
+MCP servers in [`config/mcp_servers.json`](../../config/mcp_servers.json) stay **disabled** by default; npm packages are version-pinned (no `@latest`).
