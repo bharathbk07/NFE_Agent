@@ -1,8 +1,44 @@
 # NFE Agent
 
-Chat-driven performance-test generator. You describe (or click through) a web journey; the agent captures protocol-level HTTP traffic, correlates dynamic values across runs, and emits a deterministic **k6** smoke script—without using an LLM to write the script.
+**Agentic AI assistant for Performance Testing & Engineering.**
 
-**Product surface:** LangGraph Studio chat (`langgraph dev --allow-blocking`), an optional headed Chromium window for Watch-me recording, and chat-driven **Jira** story pickup (`work on SCRUM-1`).
+The long-term product outcome: an agent that reads **BA / requirements documents** for an application, builds an understanding of the whole system and critical user flows, **creates performance scripts**, **runs** them under load, **analyzes** the results, and delivers **RCA + fix suggestions**—not just a generated file on disk.
+
+**Today (MVP):** chat-driven path from a real browser journey (or a Jira story) → stable **k6** script → smoke/load run → HTML report → optional **Jira** comment + **Confluence** publish. Script generation is **deterministic** (Load-Test IR → k6); LLMs plan, classify, and advise—they do not invent the load script.
+
+**Product surface:** LangGraph Studio chat (`langgraph dev --allow-blocking`), optional headed Chromium for Watch-me recording, chat-driven **Jira** pickup (`work on SCRUM-1`), and **Confluence** run pages with HTML-parity findings.
+
+---
+
+## Vision → what ships today
+
+| Capability | Vision | MVP status |
+|------------|--------|------------|
+| Understand the application | Read BA docs, stories, acceptance criteria; map flows & risk | Jira story YAML/AC + Watch-me journey; BA-doc ingestion expanding |
+| Create performance scripts | Parameterization + correlation for real user flows | Watch-me / Navigator → IR → deterministic k6 (protocol + hybrid login) |
+| Run tests | Smoke + load workloads from story | CLI `k6 run`; story workload (VUs/iterations); catastrophic abort (≥60% fail rate) |
+| Analyze results | SLA, TXN/request tables, error patterns | HTML report + summary metrics; Jira “Why it failed” |
+| RCA & fix suggestions | Root cause + what to fix (script vs app) | Heal notes for script/correlation bugs; 4xx vs 5xx policy; Confluence/Jira findings |
+| Delivery | Durable evidence for the team | Artifacts on disk; Jira ADF report; Confluence page + attachments |
+
+```text
+BA / Jira story / chat intent
+        │
+        ▼
+Understand flows (recording + story context)
+        │
+        ▼
+Build Load-Test IR → emit k6 (no LLM authoring)
+        │
+        ▼
+Run smoke / load → HTML + metrics
+        │
+        ▼
+Analyze → RCA signals (auth, correlation, SLA, abort)
+        │
+        ▼
+Publish findings (Jira comment + Confluence run page)
+```
 
 ---
 
@@ -10,13 +46,13 @@ Chat-driven performance-test generator. You describe (or click through) a web jo
 
 | Stage | Outcome |
 |--------|---------|
-| Capture | Two independent browser runs with CDP-grade network logs |
-| Analyse | Parameters vs correlations, TXN grouping, auth/session fixes |
+| Capture | Two independent browser runs with CDP-grade network logs (app-scoped recordings) |
+| Analyse | Parameters vs correlations, TXN grouping, auth/session + create-ID fixes |
 | Emit | Load-Test IR → k6 JS (protocol and/or hybrid browser login) |
-| Validate | `k6 run` smoke (1 VU × 2 iterations) + HTML report + deterministic heal |
-| Deliver | Artifacts on disk; optional Jira ADF **Test Report** comment |
+| Validate | `k6 run` smoke/load + HTML report + deterministic heal; abort on catastrophic fail rate |
+| Deliver | Artifacts under `artifacts/{recordings,k6,knowledge}/<app>/…`; Jira Test Report; Confluence publish |
 
-Outputs land under `artifacts/k6/` (script, IR, HTML report) and `artifacts/recordings/` (reusable Watch-me captures).
+Outputs are **per application domain** (e.g. `opensource-demo.orangehrmlive.com`), not a single flat host file.
 
 ---
 
@@ -54,8 +90,8 @@ Outputs land under `artifacts/k6/` (script, IR, HTML report) and `artifacts/reco
               │  (diff → IR → k6)   │
               └──────────┬──────────┘
                          ▼
-              artifacts/k6 + chat summary
-              (+ Jira comment when via jira_perf)
+              artifacts + chat summary
+              (+ Jira comment / Confluence when configured)
 ```
 
 `src/graph.py` is a thin assembler (edges + compile). Node logic lives under [`src/nodes/`](src/nodes/).
@@ -71,31 +107,30 @@ NFE_Agent/
 │   ├── nodes/                   # route, capture, analyse, orchestrate, jira_story
 │   ├── security/                # URL/step policy, secrets, path jail
 │   ├── integrations/jira/       # REST client, ADF comments, labels, worker
+│   ├── integrations/confluence/ # Publish completed runs (HTML-parity body)
 │   ├── integrations/jira_runner.py  # CLI debug (--check-auth, --issue)
 │   ├── agents/                  # Intent, orchestrator, navigator, analyst, …
 │   ├── tools/playwright_tool.py # CDP capture, Watch-me, journey replay
 │   └── utils/
+│       ├── app_registry.py / workspace.py / knowledge_store.py / rag_store.py
 │       ├── data_randomization.py  # Run1 harvest → Run2 page.route mutation
 │       ├── load_test_ir.py        # Deterministic Load-Test IR
-│       ├── k6_generator.py        # IR → k6 JS (no LLM)
+│       ├── k6_generator.py        # IR → k6 JS (no LLM); catastrophic abort thresholds
 │       ├── k6_healer.py           # Smoke-driven IR fixes (auth, IDs, CSRF)
-│       ├── k6_runner.py           # CLI k6 smoke + points enrichment
+│       ├── k6_runner.py           # CLI k6 + points enrichment
 │       ├── k6_report_builder.py   # html-report.html
-│       ├── recording_store.py     # artifacts/recordings/
+│       ├── recording_store.py     # artifacts/recordings/<app>/<flow>.json
 │       └── correlation_noise.py   # Drop browser-header / cache-buster noise
 ├── prompts/                     # Versioned LLM prompts (local + optional Hub)
 ├── config/                      # Settings, observability, MCP registry
 ├── docs/                        # See docs/README.md for full index
-│   ├── README.md                # Documentation index
-│   ├── agents/                  # Planning/analysis agent guides
-│   ├── workers/                 # Jira + Confluence workers and setup guides
-│   ├── pipeline/                # Smoke + self-heal
-│   ├── security/                # Threat model + policy
-│   └── mcp/                     # Optional MCP servers
 ├── tests/                       # Security, Jira, Confluence, exceptions, core unit tests
 ├── .github/workflows/           # security-audit (pytest + pip-audit)
-├── artifacts/k6/                # Generated scripts, IR, reports
-├── artifacts/recordings/        # Saved Watch-me captures
+├── artifacts/
+│   ├── k6/<app>/                # Scripts, IR, HTML, summary, points
+│   ├── recordings/<app>/        # Watch-me captures
+│   ├── knowledge/<app>/         # Flow markdown knowledge
+│   └── rag/chroma/              # Local ChromaDB
 └── langgraph.json               # Studio entry: src/graph.py:graph
 ```
 
@@ -106,6 +141,7 @@ NFE_Agent/
 The chatbot keeps a typed LangGraph state across nodes, including:
 
 - **Journey:** `target_url`, `credentials`, `user_journey_steps`, `sub_tasks`
+- **App scope:** `app` (domain), `flow` (recording / Watch-me name)
 - **Captures:** `run_records` (Run 1 / Run 2 / optional Run 3)
 - **Analysis:** `parameterizable_candidates`, `correlations`, `dependencies`, `transactions`
 - **Randomization:** `randomization_ledger`, `randomization_state`, `non_randomizable_endpoints`
@@ -131,7 +167,7 @@ START → route_intent → …
 | `reuse_recording` | `load_saved_recording` | Re-analyse disk capture |
 | `jira_perf` | `run_jira_story` | Process a labeled Jira issue via REST |
 
-How each agent works (intent, orchestrator, navigator, analysts, QA): [`docs/agents/overview.md`](docs/agents/overview.md).  
+How each agent works: [`docs/agents/overview.md`](docs/agents/overview.md).  
 Jira / Confluence workers: [`docs/workers/overview.md`](docs/workers/overview.md).
 
 ### 2. Watch-me (interactive record → replay → k6)
@@ -140,18 +176,18 @@ Jira / Confluence workers: [`docs/workers/overview.md`](docs/workers/overview.md
 orchestrate_journey
   → watch_me_record          # headed Chromium + overlay + CDP
   → replay_recorded_journey  # headless Run 2 + HTTP payload randomization
-  → analyse_traffic          # diff, IR, k6, smoke, heal
+  → analyse_traffic          # diff, IR, k6, smoke, heal, Confluence
   → END
 ```
 
 1. Chat: `watch me https://example.com/` (+ optional credentials).
 2. **Run 1:** Headed browser; overlay supports Start/End TXN, Pause, Done, Cancel.
-3. Steps + CDP network saved to `artifacts/recordings/<host>.json`.
-4. **Run 2:** Headless replay of the same steps. Payload randomization middleware rewrites unique fields (email, orderId, …) via `page.route` and mocks non-randomizable third-party payment hosts.
-5. **Analyse:** Differential correlation, TXN grouping, IR build, k6 emit, smoke + heal.
-6. Chat returns a playbook summary + paths to script / IR / HTML report.
+3. Steps + CDP network saved to `artifacts/recordings/<app>/<flow>.json` (credentials stored when `NFE_STORE_CREDENTIALS=true`).
+4. **Run 2:** Headless replay. Payload randomization rewrites unique fields via `page.route`.
+5. **Analyse:** Differential correlation, TXN grouping, IR, k6 emit, smoke + heal.
+6. Chat returns playbook summary + paths; completed runs can publish to Confluence.
 
-**Display required** for Watch-me (local desktop). Use `langgraph dev --allow-blocking`.
+**Display required** for Watch-me. Use `langgraph dev --allow-blocking`.
 
 ### 3. Natural-language journey (bot drives the browser)
 
@@ -163,7 +199,7 @@ orchestrate_journey
   → END
 ```
 
-Selector failures can trigger LLM self-heal (accessibility snapshot + alternate selector). URL navigation and Playwright actions pass through [`src/security/`](src/security/) policy first.
+Selector failures can trigger LLM self-heal. URL navigation and Playwright actions pass through [`src/security/`](src/security/) first.
 
 ### 4. Reuse a saved recording
 
@@ -180,7 +216,7 @@ Override store with `NFE_RECORDINGS_DIR`.
 
 ### 5. Analysis Q&A
 
-After a successful run in the same Studio thread, ask follow-ups (e.g. “which values are correlated?”). `answer_analysis_question` uses prior state; it does not re-capture. Mentions of TXN / k6 can rebuild script artifacts from existing captures.
+After a successful run in the same Studio thread, ask follow-ups (e.g. “which values are correlated?”). Mentions of TXN / k6 can rebuild script artifacts from existing captures.
 
 ### 6. Jira story (chat-driven)
 
@@ -188,9 +224,9 @@ After a successful run in the same Studio thread, ask follow-ups (e.g. “which 
 route_intent (jira_perf)
   → run_jira_story
        ├─ resolve issue (key in message, or list nfe-agent To Do / In Progress)
-       ├─ parse description YAML/JSON (target_url, recording, workload, …)
-       ├─ gate on artifacts/recordings/<name>.json
-       ├─ run analyse pipeline (reuse recording → IR → k6 → smoke)
+       ├─ parse description YAML/JSON (target_url, recording, workload, credentials, …)
+       ├─ gate on artifacts/recordings/<app>/<flow>.json
+       ├─ analyse → emit k6 with story workload → run → Confluence
        └─ post ADF Test Report comment + lifecycle labels
   → END
 ```
@@ -198,12 +234,12 @@ route_intent (jira_perf)
 ```text
 work on SCRUM-1
 work on jira story
-run jira
 ```
 
-- Issues need label **`nfe-agent`**. Credentials stay in env (`NFE_USER` / `NFE_PASS`), not in the story body.
+- Issues need label **`nfe-agent`**.
+- **Credentials** come from the Watch-Me recording and/or story `credentials:` block (per app)—not a single global `NFE_USER`/`NFE_PASS`.
 - Missing recording → `nfe-blocked` + instructions; after Watch-me, add **`nfe-recording-ready`** and retry (or say **force** / **re-run**).
-- Full setup, API token scopes, and troubleshooting: [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md). Worker deep-dive: [`docs/workers/jira-story-worker.md`](docs/workers/jira-story-worker.md).
+- Full setup: [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md). Worker: [`docs/workers/jira-story-worker.md`](docs/workers/jira-story-worker.md).
 
 ---
 
@@ -222,58 +258,53 @@ Run1 + Run2 network logs
         ├─ TransactionAgent             group HTTP into TXNs
         │
         ├─ build_load_test_ir()
-        │     • vars / correlations / transactions
+        │     • vars / correlations / transactions (+ app credentials)
         │     • CSRF → ${csrf_token} on auth/validate
         │     • browser login when SPA session cannot be protocol-only
         │     • create-resource id → ${requestId} on /requests/{id}
         │     • randomization flags / non-randomizable mocks
         │
         ├─ generate_k6_script(ir)       protocol and/or k6/browser hybrid
-        ├─ k6 smoke (CLI)               1 VU × 2 iterations
+        │     • SLA thresholds (end-of-test fail)
+        │     • catastrophic abort (e.g. fail rate ≥ 60%, extreme p99)
+        ├─ k6 smoke / story workload
         ├─ heal_load_test_ir (≤2)       auth, CSRF, requestId, chrome GETs
-        └─ html-report.html             TXN iters vs req fails, URL+status
+        ├─ html-report.html             TXN / request / failed tables
+        └─ Confluence (completed runs; skip dominant script 4xx)
 ```
 
 ### Correlation vs parameters vs randomization
 
 | Kind | Source | Script handling |
 |------|--------|-----------------|
-| **Parameter** | User-fed (username, remarks, amount) | `vars.*` (optionally randomized per VU) |
+| **Parameter** | User-fed (username, password, remarks, amount) | `vars.*` embedded from recording (per app) |
 | **Correlation** | Server-generated (session cookie, CSRF, claim `data.id`) | Extract from prior response → pass downstream |
 | **Randomization** | Deliberate Run2 payload rewrite | Ledger filters these out of correlation |
-
-Noise dropped early: browser fingerprint headers, cache-busters (`rnd`, `timestamp`, …), parameterish search query keys.
 
 ### Auth & 4xx prevention (script quality)
 
 - Stale captured CSRF literals are always replaced with `${csrf_token}`.
 - Silent login failure (HTTP 200 + login form still present) is detected; persistent 401s convert Login to **browser mode** with cookie sync into the http jar.
-- Create POST `data.id` is correlated as `${requestId}` so downstream `/requests/8` paths do not 403/404.
-- Smoke treats **4xx as script failure**; **5xx is allowed** as application fault (`http.expectedStatuses` 2xx–3xx + 5xx).
+- Create POST `data.id` is correlated as `${requestId}` so downstream paths do not 404 with empty IDs.
+- Smoke treats **4xx as script failure**; **5xx is allowed** as application fault.
+- Load runs abort early when HTTP fail rate exceeds **`NFE_K6_ABORT_FAIL_RATE`** (default **0.60** / 60%), with optional p99 / checks collapse guards.
 
-Full walkthrough of the smoke gate and heal loop (plain language + examples): [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md).
+Full walkthrough: [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md).
 
 ### Protocol vs Chromium (why hybrid exists)
-
-k6 is primarily a **protocol** load tool (`k6/http`). It is **not** “a browser” the way Selenium is. NFE defaults to protocol VUs (cheap, scalable), same idea as JMeter/NeoLoad thread groups with extractors.
 
 | Mode | Engine | Used for |
 |------|--------|----------|
 | **Protocol** | `k6/http` | Most API/XHR load; correlations via extract → `${var}` |
-| **Browser** | `k6/browser` + Chromium | Narrow fallback—usually SPA **login**—when session/CSRF cannot be replayed from HTTP alone |
+| **Browser** | `k6/browser` + Chromium | Narrow fallback—usually SPA **login**—then back to HTTP |
 
-**Correlation first (like JMeter / NeoLoad):** CSRF in HTML/headers, JSON `data.id`, `Set-Cookie` sessions are extracted and passed downstream. Chromium is **not** a substitute for that.
+**High volume:** do **not** run thousands of Chromium instances. Hybrid is a correctness bridge; protocol HTTP is the scale path.
 
-**When expressions are not enough:** the value never appears on the wire in a usable form (JS-only tokens), or login returns a silent **200** with the login page still shown so extractors have nothing valid to bind—then APIs cascade **401**. Hybrid browser login establishes a real session, syncs cookies into the http jar, and **the rest of the journey stays protocol**.
+### HTML report & Confluence parity
 
-**High volume (e.g. 1k VUs):** do **not** run 1k Chromium instances—that burns RAM/CPU. Use hybrid for smoke / low concurrency until auth is green, then prefer **protocol-only** login (or a small auth setup + shared tokens) and scale with `k6/http`. Chromium is a correctness bridge; protocol HTTP is the scale path.
-
-### HTML report metrics
-
-- **Count** = TXN iterations  
-- **Failed iters** ≤ count (iteration-level)  
-- **Req fails** = request-level failures inside the TXN  
-- Failed URL list includes HTTP status (0 = network / blocked)
+- KPI strip, observations, full TXN / request / failed-request tables, SLA PASS/FAIL
+- Confluence run pages mirror the HTML report (coloured status macros + tables) when publish is allowed
+- Dominant **script 4xx** failures skip Confluence (`script_4xx_failures`) so broken scripts do not overwrite good pages
 
 ---
 
@@ -281,14 +312,18 @@ k6 is primarily a **protocol** load tool (`k6/http`). It is **not** “a browser
 
 | Path | Contents |
 |------|----------|
-| `artifacts/k6/<host>.js` | Generated k6 script (overwritten on heal) |
-| `artifacts/k6/<host>_ir.json` | Load-Test IR |
-| `artifacts/k6/html-report.html` | Last smoke report |
-| `artifacts/k6/k6-points.json` | k6 `--out json` samples |
-| `artifacts/k6/summary.json` | k6 handleSummary metrics |
-| `artifacts/recordings/<host>.json` | Watch-me steps + run records |
+| `artifacts/k6/<app>/<flow>.js` | Generated k6 script |
+| `artifacts/k6/<app>/<flow>_ir.json` | Load-Test IR |
+| `artifacts/k6/<app>/html-report.html` | Last smoke/load report |
+| `artifacts/k6/<app>/k6-points.json` | k6 `--out json` samples |
+| `artifacts/k6/<app>/summary.json` | k6 handleSummary metrics |
+| `artifacts/recordings/<app>/<flow>.json` | Watch-me steps + run records (+ credentials when store on) |
+| `artifacts/knowledge/<app>/…` | Flow markdown knowledge |
+| `artifacts/rag/chroma/` | Local ChromaDB |
 
-Install k6 for smoke: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). Smoke uses **CLI** `k6 run` (needed for JSON points + HTML). Grafana k6 MCP is optional and off by default (`NFE_K6_MCP=mcp`); see [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md).
+App / flow layout: [`docs/pipeline/app-artifacts-and-knowledge.md`](docs/pipeline/app-artifacts-and-knowledge.md).
+
+Install k6: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). Smoke uses CLI `k6 run`. Optional MCP notes: [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md).
 
 ---
 
@@ -307,11 +342,10 @@ Minimal `.env`:
 ```ini
 GEMINI_API_KEY=your-key
 GEMINI_MODEL=gemini-2.5-flash
+NFE_STORE_CREDENTIALS=true
 ```
 
-Optional: multi-model routing (`LLM_MODELS`), Cursor SDK (`CURSOR_API_KEY`), LangSmith, Dynatrace OTLP, Jira, security policy—see [`.env.example`](.env.example).
-
-App MCP servers (not Cursor IDE): [`config/mcp_servers.json`](config/mcp_servers.json). All stay **disabled** by default; npm packages are version-pinned (no `@latest`).
+Optional: multi-model routing (`LLM_MODELS`), Cursor SDK, LangSmith, Dynatrace OTLP, Jira, Confluence, abort thresholds—see [`.env.example`](.env.example).
 
 ### Run the chatbot UI
 
@@ -320,12 +354,10 @@ pip install langgraph-cli
 langgraph dev --allow-blocking
 ```
 
-Open the printed Studio URL (typically `http://localhost:2024`).  
-`--allow-blocking` is required for Playwright / Watch-me under the LangGraph runtime.
+Open the Studio URL (typically `http://localhost:2024`).  
+`--allow-blocking` is required for Playwright / Watch-me.
 
-Bind Studio to **localhost** only; do not expose it on a shared network without auth. See [Security](#security).
-
-Graph entry: [`langgraph.json`](langgraph.json) → `src/graph.py:graph` (nodes live under [`src/nodes/`](src/nodes/)).
+Bind Studio to **localhost** only. See [Security](#security).
 
 ### Run the CLI
 
@@ -334,42 +366,26 @@ python -m src.main -m 'watch me https://example.com username=u password=p'
 python -m src.main config.json -o result.json
 ```
 
-`src/main.py` imports the same compiled graph as Studio and invokes it with a chat message or JSON config (`target_url` / `credentials` / `user_journey_steps` or `message`).
-
 ### Security
 
-Controls live under [`src/security/`](src/security/). Full threat model: [`docs/security/security.md`](docs/security/security.md).
+Controls: [`src/security/`](src/security/). Full model: [`docs/security/security.md`](docs/security/security.md).
 
 | Control | Default | Role |
 |---------|---------|------|
 | URL policy | deny private / metadata hosts | Blocks SSRF-style `page.goto` targets |
 | Step policy | allowlisted Playwright actions | Rejects unsafe browser actions |
-| Secrets | placeholders to LLMs | Credentials not sent as plaintext to planners |
-| Artifact redaction | on | Masks auth headers / cookies / password fields |
-| Path jail | on | Recordings + k6 filenames stay under `artifacts/` |
-| Credential store | off | Passwords not written into recordings/IR |
+| Credential store | **on** | Per-app username/password in recording → IR → k6 (scales across apps) |
+| Artifact redaction | on | Masks auth headers / cookies in network captures; password fills kept when store on |
+| Comment redaction | on | Jira/Confluence still redact password-like text |
+| Path jail | on | Recordings + k6 stay under `artifacts/` |
 
-Typed exceptions in [`src/exceptions.py`](src/exceptions.py):
+Typed exceptions: [`src/exceptions.py`](src/exceptions.py) — fail closed on security/config/auth; soft-fail elsewhere.
 
-- **Fail closed:** `NFESecurityError`, `NFEConfigError`, `NFEAuthError`
-- **Soft-fail** (chat / `error_log`): pipeline / validation / most integration errors  
-  User-facing text and Jira comments are redacted (no passwords, tokens, or stack traces).
-
-k6 scripts read credentials from the environment at runtime:
-
-```bash
-NFE_USER=Admin NFE_PASS=secret k6 run artifacts/k6/<host>.js
-```
-
-CI: [`.github/workflows/security-audit.yml`](.github/workflows/security-audit.yml) runs unit tests (security, Jira, exceptions) and informational `pip-audit`.
+CI: [`.github/workflows/security-audit.yml`](.github/workflows/security-audit.yml).
 
 ### Jira
 
-Stories labeled **`nfe-agent`** are processed from **Studio chat** (primary) or CLI debug. Lifecycle labels: `nfe-queued` / `nfe-running` / `nfe-blocked` / `nfe-recording-ready` / `nfe-done`. Atlassian MCP is optional and unused by the worker (REST only).
-
-Setup, **API token scopes**, and troubleshooting: [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md). How the worker fits the graph: [`docs/workers/jira-story-worker.md`](docs/workers/jira-story-worker.md).
-
-Failed smoke/SLA runs get a **Why it failed / stopped** section on the Jira comment. When Confluence publish succeeds, the comment also links the run page.
+Stories labeled **`nfe-agent`** from Studio chat (or CLI debug). Lifecycle labels: `nfe-queued` / `nfe-running` / `nfe-blocked` / `nfe-recording-ready` / `nfe-done`.
 
 ```text
 work on SCRUM-1
@@ -381,31 +397,38 @@ work on jira story
 .venv/bin/python -m src.integrations.jira_runner --issue SCRUM-1
 ```
 
-Minimal Jira `.env` (prefer a classic / unscoped API token for site URL + Basic auth):
-
 ```ini
 JIRA_BASE_URL=https://your-site.atlassian.net
 JIRA_EMAIL=bot@example.com
 JIRA_API_TOKEN=your_api_token_here
 NFE_JIRA_LABEL=nfe-agent
-NFE_USER=Admin
-NFE_PASS=secret
+```
+
+Story YAML may include workload + per-app credentials:
+
+```yaml
+target_url: https://opensource-demo.orangehrmlive.com/...
+recording: default
+workload:
+  vus: 10
+  iterations: 20
+  maxDuration: 5m
+credentials:
+  username: Admin
+  password: admin123
 ```
 
 ### Confluence
 
-Completed k6 runs (SLA pass, SLA fail, or no SLA) can publish under a fixed parent page with HTML + k6 attachments. Mid-run aborts are **not** published.
-
-Setup: [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md). Worker deep-dive: [`docs/workers/confluence-publisher-worker.md`](docs/workers/confluence-publisher-worker.md).
+Completed runs publish under **Performance Testing and Engineering** with k6 + HTML + IR attachments and an HTML-parity storage body. Mid-run infra aborts and dominant script-4xx failures are **not** published.
 
 ```ini
 CONFLUENCE_SPACE_KEY=ENG
-# Optional — defaults to JIRA_* when empty:
-# CONFLUENCE_BASE_URL=https://your-site.atlassian.net
-# CONFLUENCE_EMAIL=
-# CONFLUENCE_API_TOKEN=
 NFE_CONFLUENCE_PUBLISH=true
+# Empty BASE/EMAIL/TOKEN → fall back to JIRA_*
 ```
+
+Setup: [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md).
 
 ---
 
@@ -418,11 +441,7 @@ watch me https://opensource-demo.orangehrmlive.com/web/index.php/auth/login
 username=Admin password=admin123
 ```
 
-In the browser overlay: **Start TXN** / **End TXN**, **Done** (or **Cancel**).
-
 ### Navigator (bot clicks)
-
-Prefer explicit selectors and credential injection:
 
 ```json
 {
@@ -437,43 +456,20 @@ Prefer explicit selectors and credential injection:
 }
 ```
 
-Or free-text journey steps in chat (omit “watch me”).
-
-### Jira
+### Jira / reuse / Q&A
 
 ```text
 work on SCRUM-1
-work on jira story
-work on SCRUM-1 force
-```
-
-### Reuse / Q&A
-
-```text
 list recordings
 analyse saved recording
 Which values are correlated for login?
 ```
 
-### LangSmith vs recordings
-
-| Need | Use |
-|------|-----|
-| Re-run analysis on the same clicks/network | `artifacts/recordings/*.json` |
-| Debug LLM/tool traces | LangSmith (`LANGCHAIN_TRACING_V2` + API key) |
-
-LangSmith does **not** store Watch-me captures. New Studio threads need the disk recording to reuse a prior capture.
-
 ---
 
 ## Prompts
 
-LLM prompts live under [`prompts/`](prompts/) and are loaded via `src/utils/prompt_loader.py`.
-
-1. **LangSmith Hub** (optional): when configured, named prompts can be pulled at runtime.
-2. **Local files**: Git-tracked fallback for offline / default use (`USE_LANGSMITH_PROMPTS` defaults off to avoid blocking the event loop).
-
-Script generation and healing do **not** use these prompts—only planning, classification, and self-heal do.
+LLM prompts live under [`prompts/`](prompts/). Script generation and healing do **not** use these—only planning, classification, and browser self-heal do.
 
 ---
 
@@ -483,21 +479,11 @@ Script generation and healing do **not** use these prompts—only planning, clas
 |-------|-----|
 | Index | [`docs/README.md`](docs/README.md) |
 | Agents overview | [`docs/agents/overview.md`](docs/agents/overview.md) |
-| Intent router | [`docs/agents/intent-router.md`](docs/agents/intent-router.md) |
-| Orchestrator | [`docs/agents/orchestrator-agent.md`](docs/agents/orchestrator-agent.md) |
-| Navigator | [`docs/agents/navigator-agent.md`](docs/agents/navigator-agent.md) |
-| Traffic analyst | [`docs/agents/traffic-analyst-agent.md`](docs/agents/traffic-analyst-agent.md) |
-| Parameter agent | [`docs/agents/parameter-agent.md`](docs/agents/parameter-agent.md) |
-| Correlation classifier | [`docs/agents/correlation-classifier-agent.md`](docs/agents/correlation-classifier-agent.md) |
-| Transaction agent | [`docs/agents/transaction-agent.md`](docs/agents/transaction-agent.md) |
-| Analysis QA | [`docs/agents/analysis-qa-agent.md`](docs/agents/analysis-qa-agent.md) |
-| Shared state | [`docs/agents/agent-state.md`](docs/agents/agent-state.md) |
 | Workers overview | [`docs/workers/overview.md`](docs/workers/overview.md) |
-| Jira story worker | [`docs/workers/jira-story-worker.md`](docs/workers/jira-story-worker.md) |
-| Confluence publisher worker | [`docs/workers/confluence-publisher-worker.md`](docs/workers/confluence-publisher-worker.md) |
-| Jira setup & ops | [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md) |
-| Confluence setup & ops | [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md) |
+| Jira setup | [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md) |
+| Confluence setup | [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md) |
 | Smoke + self-heal | [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md) |
+| App artifacts & knowledge | [`docs/pipeline/app-artifacts-and-knowledge.md`](docs/pipeline/app-artifacts-and-knowledge.md) |
 | Security | [`docs/security/security.md`](docs/security/security.md) |
 | Optional MCPs | [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md) |
 
@@ -509,18 +495,15 @@ Script generation and healing do **not** use these prompts—only planning, clas
 pytest tests/ -q --ignore=tests/test_run.py
 ```
 
-`pytest.ini` sets `pythonpath = .` so `import src...` works without installing the package. Covers security policy, Jira helpers, typed exceptions, and core unit tests.
-
-Optional CI: [`.github/workflows/security-audit.yml`](.github/workflows/security-audit.yml) runs the same tests + informational `pip-audit` on push/PR. Safe to delete that workflow if you prefer local-only checks during MVP.
-
 ---
 
 ## Design principles
 
-1. **Protocol-first** — Capture and mutate at HTTP/CDP level; UI locators are for replay, not for load-test data.
-2. **Deterministic compiler** — Same IR always emits the same k6; LLMs advise, they do not author scripts.
-3. **Two-run differential** — Dynamic tokens are proven by Run1 vs Run2, then origin-traced to prior responses.
-4. **Heal script bugs, not the app** — Fix CSRF, session, and create-IDs that cause 4xx; allow application 5xx.
-5. **Stable artifacts** — One script/IR per host; heals overwrite in place so deliverables stay predictable.
-6. **Fail closed on security** — URL/step/fs-jail violations never bypass; secrets stay out of LLM prompts, logs, and Jira comments.
-7. **Thin graph, fat nodes** — `graph.py` wires edges only; capture, analyse, routing, and Jira live in `src/nodes/`.
+1. **Agentic PTE outcome** — From requirements/journey understanding → script → run → analysis → RCA/fix evidence for the team.
+2. **Protocol-first** — Capture at HTTP/CDP; UI locators are for replay, not load-test data.
+3. **Deterministic compiler** — Same IR always emits the same k6; LLMs advise, they do not author scripts.
+4. **Two-run differential** — Dynamic tokens proven by Run1 vs Run2.
+5. **Heal script bugs, not the app** — Fix CSRF/session/IDs that cause 4xx; allow application 5xx.
+6. **Per-app credentials & artifacts** — Scale across applications without a global env credential pair.
+7. **Fail closed on security** — URL/step/fs-jail violations never bypass; outward comments still redact secrets.
+8. **Thin graph, fat nodes** — `graph.py` wires edges only; logic lives in `src/nodes/` and workers.

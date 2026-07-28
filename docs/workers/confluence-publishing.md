@@ -27,11 +27,16 @@ Space (CONFLUENCE_SPACE_KEY)
 | Test **fully completed**, SLA/thresholds **failed** | **Yes** |
 | Test **fully completed**, SLA/thresholds **passed** | **Yes** |
 | Test **fully completed**, **no SLA** defined | **Yes** |
-| Test **stopped mid-run** (timeout, abort, crash, k6 missing/skipped) | **No** |
+| Watcher stopped (`abortOnFail`) with `summary.json` | **Yes** (`COMPLETED — WATCHER STOPPED`) |
+| Completed run but **dominated by HTTP 4xx** (script/correlation bugs) | **No** (`script_4xx_failures`) |
+| Test **stopped mid-run** (timeout/spawn, **no** usable summary) | **No** |
+| k6 missing / skipped | **No** |
 
-“Fully completed” means k6 finished the planned scenario (default smoke: 1 VU × 2 iterations, or story workload). Failed checks or crossed thresholds still count as a completed run with a report.
+“Fully completed” prefers proof from `summary.json` (`iterations.count > 0`). Incidental `timeout` substrings in stderr no longer block publish when the summary proves the run finished.
 
-Gate: `should_publish_to_confluence()` in [`src/integrations/confluence/publisher.py`](../../src/integrations/confluence/publisher.py).
+**4xx gate:** if smoke failed and status counts / failed URLs show mostly 4xx (or fail rate ≥5% with 4xx signal), Confluence is skipped so broken scripts do not overwrite good pages. Real load/SLA results still publish.
+
+Gate: `should_publish_to_confluence()` / `explain_confluence_skip()` in [`src/integrations/confluence/publisher.py`](../../src/integrations/confluence/publisher.py). Skip reasons include `no_space_key`, `missing_confluence_credentials`, `incomplete_no_summary`, `script_4xx_failures`, `smoke_skipped`, etc. Studio chat and Jira comments surface the reason when not published.
 
 ---
 
@@ -45,21 +50,23 @@ Same Atlassian account as Jira (recommended). In Confluence, grant the bot on th
 - Add/edit pages
 - Add attachments
 
-Prefer a **classic / unscoped** API token with site URL + Basic auth (same as Jira).
+**Auth:** HTTP Basic with **Confluence email** + **Confluence API token** (classic / unscoped recommended).
 
 ### 2. `.env`
 
 ```ini
-# Empty BASE/EMAIL/TOKEN → fall back to JIRA_*
+# Prefer explicit Confluence credentials (falls back to JIRA_* if empty)
 CONFLUENCE_BASE_URL=https://your-site.atlassian.net
-CONFLUENCE_EMAIL=
-CONFLUENCE_API_TOKEN=
+CONFLUENCE_EMAIL=bot@example.com
+CONFLUENCE_API_TOKEN=your_confluence_api_token
 CONFLUENCE_SPACE_KEY=ENG
 CONFLUENCE_PARENT_TITLE=Performance Testing and Engineering
 NFE_CONFLUENCE_PUBLISH=true
 ```
 
-If `CONFLUENCE_SPACE_KEY` is empty or publish is disabled, NFE **skips** Confluence (soft-fail — analyse still succeeds).
+Restart `langgraph` / Studio after changing `.env` (settings load at import).
+
+If `CONFLUENCE_SPACE_KEY` is empty, publish is disabled, or credentials are missing after Jira fallback, NFE **skips** Confluence (soft-fail — analyse still succeeds).
 
 ### 3. Attachments
 
@@ -71,14 +78,29 @@ Uploaded on each **Run** page:
 
 Filenames are unique per flow + timestamp so re-runs do not clash.
 
+Run pages include **planned/actual VUs**, **TPS / HTTP req rate**, workload model, and workload source (`jira_story` vs `default_smoke`).
+
+### Run page content (HTML-parity)
+
+Storage body mirrors the local HTML k6 report ([`src/integrations/confluence/report.py`](../../src/integrations/confluence/report.py)):
+
+1. Coloured status lozenge (PASS / SLA FAILED / script issues)
+2. KPI strip (duration, reqs, iterations, error rate, p95, failed buckets, TPS, VUs)
+3. General test details + observation notes
+4. Full TXN table (min/max/avg/count/failed/percentiles)
+5. Full request table
+6. Failed request list (from `k6-points.json` when present)
+7. SLA thresholds with PASS/FAIL macros
+8. Failed checks, heal notes, attachment list
+
+Points are resolved from `points_json` on the smoke result, or `k6-points.json` next to the k6 script.
+
 ---
 
 ## Wiring
 
 - **Studio / CLI:** after smoke + heal in [`analyse_traffic`](../../src/nodes/analyse.py).
-- **Jira path:** analyse skips Confluence; [`run_perf_for_request`](../../src/integrations/jira/pipeline.py) publishes after the final workload smoke, then the Jira comment includes the Confluence URL when published.
-
-Mid-run failures still get a detailed **Why it failed / stopped** Jira comment (no Confluence page).
+- **Jira path:** analyse sets `skip_k6_smoke` + `skip_confluence_publish`; [`run_perf_for_request`](../../src/integrations/jira/pipeline.py) merges the **story workload**, emits k6 once, runs that script, then publishes Confluence. The Jira comment includes the Confluence URL (or the skip reason).
 
 ---
 
@@ -88,6 +110,7 @@ Mid-run failures still get a detailed **Why it failed / stopped** Jira comment (
 |-------|---------|
 | `PASSED` | Completed + thresholds ok (or none) + smoke ok |
 | `COMPLETED — SLA FAILED` | Completed but thresholds failed |
+| `COMPLETED — WATCHER STOPPED` | Threshold `abortOnFail` stopped the run early (summary present) |
 | `COMPLETED — CHECKS/SCRIPT ISSUES` | Completed but smoke checks failed |
 | `COMPLETED — NO SLA` | Completed with no thresholds and inconclusive smoke |
 
@@ -97,7 +120,11 @@ Mid-run failures still get a detailed **Why it failed / stopped** Jira comment (
 
 | Symptom | Check |
 |---------|--------|
-| Nothing published | `CONFLUENCE_SPACE_KEY`, `NFE_CONFLUENCE_PUBLISH`, k6 completed (`summary.json` present) |
+| Nothing published | `CONFLUENCE_SPACE_KEY`, `NFE_CONFLUENCE_PUBLISH`, chat/Jira skip reason, `summary.json` present |
+| Skip reason `script_4xx_failures` | Expected for broken-script 4xx-heavy runs; fix correlation/script then re-run |
+| Page updated despite many 4xx | Should no longer happen — confirm latest publisher; check skip reason in chat/Jira |
+| Thin Confluence body (no TXN tables) | Ensure `k6-points.json` exists beside the script / smoke returns `points_json` |
+| `missing_confluence_credentials` | Set `CONFLUENCE_EMAIL` + `CONFLUENCE_API_TOKEN` (or Jira fallbacks); restart Studio |
 | 401/403 | Token email, space permissions, classic token vs site URL |
 | No attachments | Files exist under `artifacts/k6/`; bot can add attachments |
 | Wrong flow page | Recording file name / `recording` in Jira story config |

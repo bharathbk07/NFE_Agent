@@ -136,6 +136,10 @@ class AgentState(TypedDict):
     recording_mode: NotRequired[str]  # "watch_me" | "reuse" | unset
     watch_me_status: NotRequired[str]
     recording_file: NotRequired[str]
+    # App id = URL domain; flow id = Watch-me label / recording stem
+    app: NotRequired[str]
+    flow: NotRequired[str]
+    recording_label: NotRequired[str]
     error_log: NotRequired[List[str]]
     # Protocol-level HTTP payload randomization (Run 1 harvest → Run 2 mutate)
     randomization_state: NotRequired[Dict[str, Any]]

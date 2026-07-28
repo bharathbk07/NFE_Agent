@@ -10,6 +10,12 @@ from config.settings import settings
 
 _REDACTED = "***REDACTED***"
 
+
+def is_redacted_secret(value: Any) -> bool:
+    """True when a value was wiped by artifact redaction."""
+    return str(value or "").strip() in (_REDACTED, "", "****")
+
+
 _SENSITIVE_HEADER_KEYS = frozenset(
     {
         "authorization",
@@ -159,14 +165,21 @@ def redact_step(
     *,
     known_secrets: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
-    """Mask fill/select values that look like secrets."""
+    """Mask fill/select values that look like secrets.
+
+    When ``NFE_STORE_CREDENTIALS`` is enabled, password fills are kept so the
+    Load-Test IR / k6 script can replay login for each recorded app.
+    """
     out = dict(step)
     action = str(out.get("action") or "").lower()
     value = out.get("value")
     secrets = {str(s) for s in (known_secrets or []) if s}
     selector = str(out.get("selector") or "").lower()
     if action in ("fill", "select") and value is not None:
-        if "password" in selector or (isinstance(value, str) and value in secrets):
+        is_password_field = "password" in selector
+        if is_password_field and settings.NFE_STORE_CREDENTIALS:
+            return out
+        if is_password_field or (isinstance(value, str) and value in secrets):
             out["value"] = _REDACTED
     return out
 

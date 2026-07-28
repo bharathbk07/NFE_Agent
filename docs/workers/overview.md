@@ -1,6 +1,8 @@
 # NFE workers — overview
 
-Workers are **deterministic REST / delivery pipelines** (not LLM planner classes under `src/agents/`). They pick up external work or publish results after analyse.
+Workers are **deterministic REST / delivery pipelines** (not LLM planner classes under `src/agents/`). They pick up external work or publish **performance evidence** (results, RCA signals, artifacts) after analyse.
+
+They support the product outcome: understand → script → run → analyze → **file findings** on Jira/Confluence for the team.
 
 | Worker | Doc | Layman role |
 |--------|-----|-------------|

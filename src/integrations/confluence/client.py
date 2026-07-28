@@ -107,8 +107,14 @@ class ConfluenceClient:
             )
         if not resolved_email or not resolved_token:
             raise NFEConfigError(
-                "Confluence credentials missing",
-                user_message="Confluence email/API token (or JIRA_*) are not configured.",
+                "Confluence credentials missing: set CONFLUENCE_EMAIL and "
+                "CONFLUENCE_API_TOKEN (Basic auth), or fall back via JIRA_EMAIL / "
+                "JIRA_API_TOKEN",
+                user_message=(
+                    "Confluence Basic auth needs an email and API token. "
+                    "Set CONFLUENCE_EMAIL + CONFLUENCE_API_TOKEN "
+                    "(or JIRA_EMAIL + JIRA_API_TOKEN)."
+                ),
             )
         if not resolved_space:
             raise NFEConfigError(

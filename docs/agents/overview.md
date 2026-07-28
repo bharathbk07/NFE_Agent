@@ -2,6 +2,8 @@
 
 Plain-language map of planning/analysis agents under [`src/agents/`](../../src/agents/).
 
+**Product outcome:** an Agentic AI assistant for Performance Testing & Engineering — understand the app (stories / journeys / BA context), create scripts, run them, analyze results, and surface RCA / fix guidance. Delivery workers (Jira + Confluence) publish that evidence.
+
 **Jira and Confluence are workers** (REST delivery), not `src/agents/` classes — see [`docs/workers/overview.md`](../workers/overview.md).
 
 **Dedicated agent pages** (what / why / how / where / tech / security / performance):
@@ -19,7 +21,7 @@ Plain-language map of planning/analysis agents under [`src/agents/`](../../src/a
 | Shared state | [agent-state.md](agent-state.md) | Clipboard shared by all nodes |
 
 Graph wiring: [`src/graph.py`](../../src/graph.py) · Nodes: [`src/nodes/`](../../src/nodes/)  
-Also: [Documentation index](../README.md) · [Workers](../workers/overview.md) · [Security](../security/security.md) · [Smoke & self-heal](../pipeline/smoke-and-self-heal.md)
+Also: [Documentation index](../README.md) · [Workers](../workers/overview.md) · [Security](../security/security.md) · [Smoke & self-heal](../pipeline/smoke-and-self-heal.md) · [App artifacts & knowledge](../pipeline/app-artifacts-and-knowledge.md)
 
 ---
 

@@ -15,5 +15,8 @@ Do NOT dump the full transaction table or k6 script unless the user asked for it
 ## Prior analysis context
 {context}
 
+## Knowledge (direct flow card + retrieved passages)
+{knowledge}
+
 ## User question
 {question}

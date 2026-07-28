@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.integrations.confluence.publisher import (
+    explain_confluence_skip,
+    is_dominant_4xx_script_failure,
     resolve_flow_name,
     should_publish_to_confluence,
 )
@@ -53,6 +55,14 @@ def test_should_publish_completed_with_summary(tmp_path, monkeypatch):
         "src.integrations.confluence.publisher.settings.JIRA_BASE_URL",
         "",
     )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_EMAIL",
+        "bot@example.com",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_API_TOKEN",
+        "token",
+    )
 
     summary = {
         "metrics": {
@@ -83,6 +93,14 @@ def test_should_publish_no_sla_completed(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "src.integrations.confluence.publisher.settings.CONFLUENCE_BASE_URL",
         "https://example.atlassian.net",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_EMAIL",
+        "bot@example.com",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_API_TOKEN",
+        "token",
     )
     path = tmp_path / "summary.json"
     path.write_text(
@@ -123,7 +141,7 @@ def test_should_not_publish_skipped(monkeypatch):
     )
 
 
-def test_should_not_publish_timeout(monkeypatch):
+def test_should_not_publish_timeout_without_summary(monkeypatch):
     monkeypatch.setattr(
         "src.integrations.confluence.publisher.settings.NFE_CONFLUENCE_PUBLISH",
         True,
@@ -136,6 +154,14 @@ def test_should_not_publish_timeout(monkeypatch):
         "src.integrations.confluence.publisher.settings.CONFLUENCE_BASE_URL",
         "https://example.atlassian.net",
     )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_EMAIL",
+        "bot@example.com",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_API_TOKEN",
+        "token",
+    )
     assert (
         should_publish_to_confluence(
             {"ok": False, "skipped": False, "exit_code": -1, "summary": "timeout"},
@@ -143,6 +169,154 @@ def test_should_not_publish_timeout(monkeypatch):
         )
         is False
     )
+
+
+def test_should_publish_despite_timeout_substring_in_stderr(tmp_path, monkeypatch):
+    """summary.json with iterations wins over incidental 'timeout' in stderr."""
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.NFE_CONFLUENCE_PUBLISH",
+        True,
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_SPACE_KEY",
+        "ENG",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_BASE_URL",
+        "https://example.atlassian.net",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_EMAIL",
+        "bot@example.com",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_API_TOKEN",
+        "token",
+    )
+    path = tmp_path / "summary.json"
+    path.write_text(
+        json.dumps(
+            {
+                "metrics": {"iterations": {"values": {"count": 2}}},
+                "state": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    smoke = {
+        "ok": True,
+        "skipped": False,
+        "exit_code": 0,
+        "summary": "passed",
+        "stderr": "http request timeout was 60s (config)",
+    }
+    assert should_publish_to_confluence(smoke, str(path)) is True
+
+
+def test_explain_skip_missing_credentials(monkeypatch):
+    from src.integrations.confluence.publisher import explain_confluence_skip
+
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.NFE_CONFLUENCE_PUBLISH",
+        True,
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_SPACE_KEY",
+        "ENG",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_BASE_URL",
+        "https://example.atlassian.net",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_EMAIL",
+        "",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_API_TOKEN",
+        "",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.JIRA_EMAIL",
+        "",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.JIRA_API_TOKEN",
+        "",
+    )
+    assert (
+        explain_confluence_skip({"ok": True, "skipped": False, "exit_code": 0}, "")
+        == "missing_confluence_credentials"
+    )
+
+
+def test_resolve_run_status_watcher_stopped():
+    assert (
+        resolve_run_status(smoke_ok=False, summary={}, aborted_by_watcher=True)
+        == "COMPLETED — WATCHER STOPPED"
+    )
+
+
+def test_build_run_storage_includes_vus_tps(tmp_path):
+    summary = tmp_path / "summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "iterations": {"values": {"count": 4}},
+                    "http_reqs": {"values": {"count": 40, "rate": 12.5}},
+                    "vus_max": {"values": {"value": 10}},
+                },
+                "state": {"testRunDurationMs": 3000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    body = build_run_storage_body(
+        status="PASSED",
+        flow_name="Create Claim",
+        summary_json=str(summary),
+        workload={"vus": 10, "iterations": 20, "executor": "shared-iterations"},
+        workload_source="jira_story",
+    )
+    assert "VUs (plan/max)" in body
+    assert "TPS" in body
+    assert "12.5" in body
+    assert "jira_story" in body
+    assert "vus=10" in body
+    assert "ac:name=\"status\"" in body
+    assert "1. KPIs" in body
+
+
+def test_comment_results_includes_vus_tps(tmp_path):
+    summary = tmp_path / "summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "iterations": {"values": {"count": 4}},
+                    "http_reqs": {"values": {"count": 40, "rate": 8.25}},
+                    "vus_max": {"values": {"max": 5}},
+                },
+                "state": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    body = comment_results(
+        issue_key="SCRUM-9",
+        target_url="https://example.com",
+        smoke_ok=True,
+        workload={"vus": 5, "iterations": 10},
+        workload_source="jira_story",
+        summary_json=str(summary),
+        exit_code=0,
+    )
+    assert "Virtual users (planned): `5`" in body
+    assert "TPS / HTTP req rate" in body
+    assert "8.25" in body
+    assert "jira_story" in body
+
 
 
 def test_should_not_publish_without_space(monkeypatch):
@@ -187,7 +361,176 @@ def test_build_run_storage_includes_status():
     )
     assert "COMPLETED — SLA FAILED" in body
     assert "Create Claim" in body
-    assert "Failed requests" in body
+    assert "Failed request list" in body
+    assert "GET /x status=401" in body
+
+
+def test_should_not_publish_dominant_4xx(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.NFE_CONFLUENCE_PUBLISH",
+        True,
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_SPACE_KEY",
+        "ENG",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_BASE_URL",
+        "https://example.atlassian.net",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_EMAIL",
+        "bot@example.com",
+    )
+    monkeypatch.setattr(
+        "src.integrations.confluence.publisher.settings.CONFLUENCE_API_TOKEN",
+        "token",
+    )
+    summary = {
+        "metrics": {
+            "iterations": {"values": {"count": 2}},
+            "http_req_failed": {"values": {"rate": 0.8}},
+        },
+        "state": {"testRunDurationMs": 5000},
+    }
+    path = tmp_path / "summary.json"
+    path.write_text(json.dumps(summary), encoding="utf-8")
+    smoke = {
+        "ok": False,
+        "skipped": False,
+        "exit_code": 99,
+        "summary": "failed",
+        "status_counts": {"401": 12, "200": 2},
+        "failed_urls": [
+            "GET /a status=401",
+            "POST /b status=404",
+            "GET /c status=401",
+        ],
+    }
+    assert is_dominant_4xx_script_failure(smoke, summary) is True
+    assert explain_confluence_skip(smoke, str(path)) == "script_4xx_failures"
+    assert should_publish_to_confluence(smoke, str(path)) is False
+
+
+def test_build_run_storage_html_parity_from_points(tmp_path):
+    summary = tmp_path / "summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "iterations": {"values": {"count": 1}},
+                    "http_reqs": {"values": {"count": 2, "rate": 1.0}},
+                    "http_req_failed": {"values": {"rate": 0.5}},
+                    "http_req_duration": {
+                        "thresholds": {"p(95)<2000": {"ok": True}},
+                        "values": {"p(95)": 100, "avg": 80, "max": 120},
+                    },
+                },
+                "state": {"testRunDurationMs": 2000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    points = tmp_path / "k6-points.json"
+    points.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "Point",
+                        "metric": "nfe_txn_duration",
+                        "data": {
+                            "value": 150.0,
+                            "tags": {"txn": "Login"},
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "Point",
+                        "metric": "nfe_txn_fail",
+                        "data": {"value": 0, "tags": {"txn": "Login"}},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "Point",
+                        "metric": "nfe_req_duration",
+                        "data": {
+                            "value": 90.0,
+                            "tags": {
+                                "txn": "Login",
+                                "method": "GET",
+                                "url": "https://example.com/login",
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "Point",
+                        "metric": "nfe_req_count",
+                        "data": {
+                            "value": 1,
+                            "tags": {
+                                "txn": "Login",
+                                "method": "GET",
+                                "url": "https://example.com/login",
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "Point",
+                        "metric": "nfe_req_fail",
+                        "data": {
+                            "value": 1,
+                            "tags": {
+                                "txn": "Login",
+                                "method": "POST",
+                                "url": "https://example.com/api",
+                                "status": "401",
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "Point",
+                        "metric": "nfe_req_count",
+                        "data": {
+                            "value": 1,
+                            "tags": {
+                                "txn": "Login",
+                                "method": "POST",
+                                "url": "https://example.com/api",
+                            },
+                        },
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    body = build_run_storage_body(
+        status="COMPLETED — CHECKS/SCRIPT ISSUES",
+        flow_name="Login Flow",
+        summary_json=str(summary),
+        points_json=str(points),
+        heal_notes=["rebound cookie"],
+    )
+    assert "Full transaction table" in body
+    assert "Full request table" in body
+    assert "Failed request list" in body
+    assert "Test observation" in body
+    assert "Login" in body
+    assert "https://example.com/login" in body
+    assert "401" in body
+    assert "ac:name=\"status\"" in body
+    assert "colour\">Red" in body or "colour\">Yellow" in body
+    assert "rebound cookie" in body
+    assert "PASS" in body or "FAIL" in body
 
 
 def test_comment_results_why_failed_and_confluence():

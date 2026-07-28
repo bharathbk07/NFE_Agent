@@ -73,6 +73,9 @@ class ParameterAgent:
                 )
                 continue
 
+            from src.security.secrets import is_redacted_secret
+            from src.utils.correlation_noise import is_login_field_selector
+
             val_lower = val.lower()
             is_credential = False
             cred_name = None
@@ -82,10 +85,37 @@ class ParameterAgent:
                     cred_name = cred_key
                     break
 
+            # Selector-based credentials (password field even if value was redacted)
+            if not is_credential and (
+                is_login_field_selector(selector) or "password" in selector.lower()
+            ):
+                is_credential = True
+                suggested = self._suggest_variable_name(selector, val, [])
+                if "password" in selector.lower() or suggested == "password":
+                    cred_name = "password"
+                elif suggested in ("username", "user", "email", "login"):
+                    cred_name = suggested
+                else:
+                    cred_name = "password" if "password" in selector.lower() else "username"
+
+            # Restore real secret from journey credentials when fill was redacted
+            if is_credential and is_redacted_secret(val) and credentials:
+                key = cred_name or ("password" if "password" in selector.lower() else "username")
+                restored = credentials.get(key) or credentials.get(str(key).lower())
+                if not restored and key == "username":
+                    restored = (
+                        credentials.get("user")
+                        or credentials.get("email")
+                        or credentials.get("login")
+                    )
+                if restored and not is_redacted_secret(restored):
+                    val = str(restored)
+                    val_lower = val.lower()
+
             propagations = self._find_propagations(val, val_lower, run1_requests)
             variable_name = (
                 cred_name
-                if is_credential
+                if is_credential and cred_name
                 else self._suggest_variable_name(selector, val, propagations)
             )
             from src.utils.perf_test_classification import looks_like_person_name

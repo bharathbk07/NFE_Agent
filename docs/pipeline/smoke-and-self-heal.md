@@ -69,6 +69,30 @@ Triggered from the `analyse_traffic` node after IR → k6 emit ([`src/nodes/anal
 
 If `k6` is not installed, smoke is **skipped** (script is still written; chat notes that validation did not run).
 
+### Threshold watcher (`abortOnFail`)
+
+k6 uses **layered** thresholds (Grafana k6 best practice):
+
+| Layer | Example | Effect |
+|-------|---------|--------|
+| **SLA** (end of test) | `http_req_failed` `rate<0.01`, p95, checks `rate>0.99` | Marks the run **failed** when breached; does **not** stop early by default |
+| **Catastrophic abort** | fail rate ≥ **60%**, extreme p99, checks collapse | **`abortOnFail: true`** — stops the test mid-run and marks it **failed** |
+
+```ini
+NFE_K6_ABORT_ON_FAIL=true
+NFE_K6_ABORT_DELAY=10s
+NFE_K6_ABORT_FAIL_RATE=0.60
+NFE_K6_ABORT_P99_MS=30000
+NFE_K6_ABORT_CHECKS_MIN=0.40
+NFE_K6_SLA_ABORT_ON_FAIL=false
+```
+
+After `delayAbortEval`, if ≥60% of requests have failed (`http_req_failed` rate ≥ `NFE_K6_ABORT_FAIL_RATE`), k6 aborts. Same for p99 above `NFE_K6_ABORT_P99_MS` or checks pass-rate below `NFE_K6_ABORT_CHECKS_MIN`.
+
+NFE marks the run **failed**, tags `aborted_by_watcher`, and still **publishes Confluence** when `summary.json` exists (`COMPLETED — WATCHER STOPPED`) — unless the 4xx script gate skips. Infrastructure timeouts / spawn failures without a summary do **not** publish.
+
+**Default smoke** (empty workload) does **not** use `abortOnFail`, so self-heal can see the full failure set.
+
 Outputs:
 
 | Artifact | Role |

@@ -222,7 +222,31 @@ def test_comment_templates_sanitized():
     assert "should-redact" not in msg2
 
 
-def test_workload_options_in_emit():
+def test_workload_options_in_emit(monkeypatch):
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_ON_FAIL",
+        True,
+    )
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_DELAY",
+        "10s",
+    )
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_FAIL_RATE",
+        0.60,
+    )
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_P99_MS",
+        30000,
+    )
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_CHECKS_MIN",
+        0.40,
+    )
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_SLA_ABORT_ON_FAIL",
+        False,
+    )
     ir = {
         "version": 1,
         "target_url": "https://httpbin.org/",
@@ -243,14 +267,48 @@ def test_workload_options_in_emit():
                 ],
             }
         ],
-        "workload": {"vus": 3, "iterations": 4, "maxDuration": "1m"},
+        "workload": {"vus": 10, "iterations": 20, "maxDuration": "1m"},
     }
     opts = _workload_options_js(ir, browser=False)
-    assert "vus: 3" in opts
-    assert "iterations: 4" in opts
+    assert "vus: 10" in opts
+    assert "iterations: 20" in opts
+    assert "abortOnFail" in opts
+    assert "delayAbortEval" in opts
+    assert "rate<0.6" in opts
+    assert "p(99)<30000" in opts
+    assert "rate>0.4" in opts
     script = emit_k6_from_ir(ir)
-    assert "vus: 3" in script
+    assert "vus: 10" in script
     assert "shared-iterations" in script
+    assert "abortOnFail" in script
+    assert "rate<0.6" in script
+
+
+def test_catastrophic_abort_not_on_tight_sla(monkeypatch):
+    """SLA rate<0.01 fails at end; only rate<0.6 (and peers) carry abortOnFail."""
+    from src.utils.k6_generator import _inject_catastrophic_abort_thresholds
+
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_FAIL_RATE", 0.60
+    )
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_P99_MS", 30000
+    )
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_K6_ABORT_CHECKS_MIN", 0.40
+    )
+    base = {
+        "http_req_failed": [{"threshold": "rate<0.01"}],
+        "http_req_duration": [{"threshold": "p(95)<2000"}],
+        "checks": [{"threshold": "rate>0.99"}],
+    }
+    out = _inject_catastrophic_abort_thresholds(base, abort_delay="10s")
+    fail_rules = out["http_req_failed"]
+    sla = next(r for r in fail_rules if r.get("threshold") == "rate<0.01")
+    abort = next(r for r in fail_rules if r.get("threshold") == "rate<0.6")
+    assert sla.get("abortOnFail") is not True
+    assert abort.get("abortOnFail") is True
+    assert abort.get("delayAbortEval") == "10s"
 
 
 def test_jira_api_error_message_for_404():

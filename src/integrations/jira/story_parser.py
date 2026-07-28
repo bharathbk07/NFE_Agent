@@ -40,6 +40,7 @@ class JiraPerfRequest:
     workload: Dict[str, Any] = field(default_factory=dict)
     thresholds: Dict[str, Any] = field(default_factory=dict)
     credential_env_refs: Dict[str, str] = field(default_factory=dict)
+    credentials: Dict[str, str] = field(default_factory=dict)
     raw_parse: Dict[str, Any] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
     goal: str = ""
@@ -62,6 +63,18 @@ def _merge_workload(data: Dict[str, Any]) -> Dict[str, Any]:
     thr = data.get("thresholds") or data.get("sla") or {}
     if thr and "thresholds" not in wl:
         wl["thresholds"] = thr
+    if data.get("workload") is None and any(
+        k in data for k in ("vus", "iterations", "stages", "executor", "duration")
+    ):
+        logger.info(
+            "Merged top-level workload keys into workload dict: %s",
+            list(wl.keys()),
+        )
+    elif isinstance(data.get("workload"), dict) and not wl:
+        logger.warning(
+            "Story YAML contained an empty workload block; "
+            "k6 will use default smoke (1 VU × 2) unless prose VUs are found"
+        )
     return wl
 
 
@@ -80,6 +93,7 @@ def _looks_like_nfe_config(data: Dict[str, Any]) -> bool:
             "iterations",
             "credential_env",
             "credentials_env",
+            "credentials",
         }
     )
 
@@ -198,6 +212,14 @@ def parse_story_text(
     creds = data.get("credential_env") or data.get("credentials_env") or {}
     if isinstance(creds, dict):
         req.credential_env_refs = {str(k): str(v) for k, v in creds.items()}
+
+    plain_creds = data.get("credentials") or {}
+    if isinstance(plain_creds, dict):
+        req.credentials = {
+            str(k): str(v)
+            for k, v in plain_creds.items()
+            if v is not None and str(v).strip()
+        }
 
     if not req.target_url and not req.recording_hint:
         req.errors.append(

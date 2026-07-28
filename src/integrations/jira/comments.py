@@ -39,7 +39,8 @@ def comment_missing_recording(
         [
             f"* Expected recording key/host: `{hint}`",
             "* Run Watch-me locally (LangGraph Studio) for this journey.",
-            "* Confirm `artifacts/recordings/<name>.json` exists.",
+            "* Confirm `artifacts/recordings/<domain>/<flow>.json` exists "
+            "(legacy flat `artifacts/recordings/<name>.json` still works).",
             "* Add label `nfe-recording-ready` on this issue to resume.",
         ]
     )
@@ -72,8 +73,11 @@ def _load_summary_metrics(summary_json_path: str) -> Dict[str, Any]:
     http_reqs = (metrics.get("http_reqs") or {}).get("values") or {}
     iterations = (metrics.get("iterations") or {}).get("values") or {}
     checks = (metrics.get("checks") or {}).get("values") or {}
+    vus = (metrics.get("vus") or {}).get("values") or {}
+    vus_max = (metrics.get("vus_max") or {}).get("values") or {}
     return {
         "http_reqs": http_reqs.get("count"),
+        "tps": http_reqs.get("rate"),
         "fail_rate": http_fail.get("rate"),
         "p95_ms": http_dur.get("p(95)"),
         "avg_ms": http_dur.get("avg"),
@@ -82,7 +86,51 @@ def _load_summary_metrics(summary_json_path: str) -> Dict[str, Any]:
         "checks_passes": checks.get("passes"),
         "checks_fails": checks.get("fails"),
         "duration_ms": state.get("testRunDurationMs"),
+        "vus": vus.get("value") if "value" in vus else vus.get("max"),
+        "vus_max": vus_max.get("value") if "value" in vus_max else vus_max.get("max"),
     }
+
+
+def _planned_vus(workload: Optional[Dict[str, Any]]) -> Optional[int]:
+    wl = workload or {}
+    if wl.get("vus") is not None:
+        try:
+            return int(wl["vus"])
+        except (TypeError, ValueError):
+            pass
+    stages = wl.get("stages")
+    if isinstance(stages, list) and stages:
+        peak = 0
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            try:
+                peak = max(peak, int(stage.get("target") or 0))
+            except (TypeError, ValueError):
+                continue
+        return peak or None
+    return None
+
+
+def _format_workload_model(workload: Optional[Dict[str, Any]]) -> str:
+    wl = workload or {}
+    if not wl:
+        return "default smoke (1 VU × 2 iterations)"
+    parts: List[str] = []
+    if wl.get("executor"):
+        parts.append(f"executor={wl['executor']}")
+    vus = _planned_vus(wl)
+    if vus is not None:
+        parts.append(f"vus={vus}")
+    if wl.get("iterations") is not None:
+        parts.append(f"iterations={wl['iterations']}")
+    if wl.get("duration"):
+        parts.append(f"duration={wl['duration']}")
+    elif wl.get("maxDuration"):
+        parts.append(f"maxDuration={wl['maxDuration']}")
+    if isinstance(wl.get("stages"), list) and wl["stages"]:
+        parts.append(f"stages={len(wl['stages'])}")
+    return ", ".join(parts) if parts else "custom workload"
 
 
 def _threshold_rows(summary: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -141,6 +189,7 @@ def _why_failed_section(
     failed_urls: List[str],
     status_counts: Dict[str, Any],
     summary_json: str,
+    aborted_by_watcher: bool = False,
 ) -> List[str]:
     """Build a leading 'Why it failed / stopped' section when not a clean pass."""
     if smoke_ok:
@@ -157,6 +206,15 @@ def _why_failed_section(
             "* Run did **not** complete: k6 was skipped or unavailable "
             f"(`{smoke_summary or 'skipped'}`)."
         )
+    elif aborted_by_watcher or (
+        "abort" in summary_l and "threshold" in summary_l
+    ):
+        lines.append(
+            "* Performance **watcher stopped** the run after an SLA / threshold breach "
+            f"(`{smoke_summary or exit_code}`)."
+        )
+        for r in thr_fails[:15]:
+            lines.append(f"  * `{r['metric']}` → `{r['threshold']}`")
     elif exit_code == -1 or any(
         t in summary_l for t in ("timeout", "timed out", "spawn failed", "script missing")
     ):
@@ -208,6 +266,7 @@ def comment_results(
     smoke_ok: Optional[bool],
     smoke_summary: str = "",
     workload: Optional[Dict[str, Any]] = None,
+    workload_source: str = "",
     k6_path: str = "",
     ir_path: str = "",
     html_report: str = "",
@@ -222,17 +281,19 @@ def comment_results(
     exit_code: Optional[int] = None,
     skipped: bool = False,
     confluence_url: str = "",
+    confluence_skipped_reason: str = "",
+    aborted_by_watcher: bool = False,
     extra: str = "",
 ) -> str:
     """Rich test report comment (converted to ADF when posted)."""
     status = "PASSED" if smoke_ok else ("SKIPPED" if smoke_ok is None else "FAILED")
     wl = workload or {}
-    if wl:
-        wl_text = ", ".join(f"{k}={v}" for k, v in list(wl.items())[:8])
-    else:
-        wl_text = "default smoke (1 VU × 2 iterations)"
+    wl_text = _format_workload_model(wl)
+    src_label = workload_source or ("jira_story" if wl else "default_smoke")
 
     metrics = _load_summary_metrics(summary_json)
+    planned = _planned_vus(wl)
+    actual_vus = metrics.get("vus_max") or metrics.get("vus")
     status_counts = status_counts or {}
     status_line = (
         ", ".join(f"{code}×{count}" for code, count in sorted(status_counts.items()))
@@ -257,6 +318,7 @@ def comment_results(
         failed_urls=list(failed_urls or []),
         status_counts=status_counts,
         summary_json=summary_json,
+        aborted_by_watcher=aborted_by_watcher,
     )
 
     parts = [
@@ -268,11 +330,15 @@ def comment_results(
         f"* Story: {story_summary or 'n/a'}",
         f"* Target: `{target_url or 'n/a'}`",
         f"* Workload: `{wl_text}`",
+        f"* Workload source: `{src_label}`",
         f"* Recording: `{recording_path or 'n/a'}`",
         f"* Run notes: {smoke_summary or 'None'}",
         "",
         "## Statistics",
+        f"* Virtual users (planned): `{_fmt_num(planned, digits=0)}`",
+        f"* Virtual users (actual max): `{_fmt_num(actual_vus, digits=0)}`",
         f"* HTTP requests: `{_fmt_num(metrics.get('http_reqs'), digits=0)}`",
+        f"* TPS / HTTP req rate: `{_fmt_num(metrics.get('tps'), digits=2)} req/s`",
         f"* HTTP fail rate: `{_fmt_pct(metrics.get('fail_rate'))}`",
         (
             f"* Duration p95 / avg / max: "
@@ -314,6 +380,14 @@ def comment_results(
                 "",
                 "## Confluence",
                 f"* Run report: {confluence_url}",
+            ]
+        )
+    elif confluence_skipped_reason:
+        parts.extend(
+            [
+                "",
+                "## Confluence",
+                f"* Not published — `{confluence_skipped_reason}`",
             ]
         )
     if extra:

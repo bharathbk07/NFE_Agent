@@ -27,8 +27,150 @@ def _js_string(value: Any) -> str:
     return json.dumps("" if value is None else str(value))
 
 
+def _body_location_to_k6_json_path(loc: str) -> str:
+    """Convert IR ``body.$…`` / ``body.…`` locations to k6 ``res.json`` (gjson) paths.
+
+    k6 uses gjson selectors: array indexes must be ``.0`` not ``[0]``.
+    Example: ``body.$.data[0].empNumber`` → ``data.0.empNumber``.
+    """
+    path = str(loc or "").strip()
+    if path.startswith("body."):
+        path = path[len("body.") :]
+    path = path.lstrip("$").lstrip(".")
+    # JSONPath ``data[0].x`` / ``data[0][1]`` → gjson ``data.0.x`` / ``data.0.1``
+    path = re.sub(r"\[(\d+)\]", r".\1", path)
+    path = re.sub(r"\.+", ".", path).strip(".")
+    return path
+
+
+def _normalize_threshold_entries(
+    thresholds: Dict[str, Any],
+    *,
+    abort_on_fail: bool,
+    abort_delay: str,
+) -> Dict[str, Any]:
+    """Rewrite threshold values into k6 object form with optional abortOnFail."""
+    out: Dict[str, Any] = {}
+    for metric, rules in thresholds.items():
+        rule_list = rules if isinstance(rules, list) else [rules]
+        normalized: List[Any] = []
+        for rule in rule_list:
+            if isinstance(rule, dict):
+                entry = dict(rule)
+                if "threshold" not in entry and len(entry) == 1:
+                    # Unexpected shape — keep as-is
+                    normalized.append(entry)
+                    continue
+                if abort_on_fail:
+                    entry.setdefault("abortOnFail", True)
+                    entry.setdefault("delayAbortEval", abort_delay)
+                normalized.append(entry)
+            else:
+                entry: Dict[str, Any] = {"threshold": str(rule)}
+                if abort_on_fail:
+                    entry["abortOnFail"] = True
+                    entry["delayAbortEval"] = abort_delay
+                normalized.append(entry)
+        out[str(metric)] = normalized
+    return out
+
+
+def _threshold_expr(entry: Any) -> str:
+    if isinstance(entry, dict):
+        return str(entry.get("threshold") or "")
+    return str(entry or "")
+
+
+def _append_abort_threshold(
+    thresholds: Dict[str, Any],
+    metric: str,
+    expr: str,
+    *,
+    abort_delay: str,
+) -> None:
+    """Ensure ``metric`` has an abortOnFail rule for ``expr`` (idempotent)."""
+    expr = (expr or "").strip()
+    if not expr:
+        return
+    existing = list(thresholds.get(metric) or [])
+    for rule in existing:
+        if _threshold_expr(rule) != expr:
+            continue
+        if isinstance(rule, dict):
+            rule["abortOnFail"] = True
+            rule.setdefault("delayAbortEval", abort_delay)
+            thresholds[metric] = existing
+            return
+        # Replace string rule with aborting object
+        idx = existing.index(rule)
+        existing[idx] = {
+            "threshold": expr,
+            "abortOnFail": True,
+            "delayAbortEval": abort_delay,
+        }
+        thresholds[metric] = existing
+        return
+    existing.append(
+        {
+            "threshold": expr,
+            "abortOnFail": True,
+            "delayAbortEval": abort_delay,
+        }
+    )
+    thresholds[metric] = existing
+
+
+def _inject_catastrophic_abort_thresholds(
+    thresholds: Dict[str, Any],
+    *,
+    abort_delay: str,
+) -> Dict[str, Any]:
+    """Add mid-run abort rules for catastrophic error / latency / checks.
+
+    Layered with SLA thresholds (k6 best practice):
+    - Tight SLA (e.g. ``rate<0.01``) → fail the test at end
+    - Catastrophic fail rate (default 60%) → ``abortOnFail`` stop mid-run
+    - Extreme p99 latency → abort (optional)
+    - Collapsed checks pass-rate → abort (optional)
+    """
+    from config.settings import settings
+
+    out = dict(thresholds)
+    fail_rate = float(getattr(settings, "NFE_K6_ABORT_FAIL_RATE", 0.60) or 0.60)
+    # Clamp to (0, 1]; rate<X means abort when fail rate reaches X
+    fail_rate = min(1.0, max(0.01, fail_rate))
+    _append_abort_threshold(
+        out,
+        "http_req_failed",
+        f"rate<{fail_rate:g}",
+        abort_delay=abort_delay,
+    )
+
+    p99_ms = int(getattr(settings, "NFE_K6_ABORT_P99_MS", 30000) or 0)
+    if p99_ms > 0:
+        _append_abort_threshold(
+            out,
+            "http_req_duration",
+            f"p(99)<{p99_ms}",
+            abort_delay=abort_delay,
+        )
+
+    checks_min = float(getattr(settings, "NFE_K6_ABORT_CHECKS_MIN", 0.40) or 0.0)
+    if checks_min > 0:
+        checks_min = min(0.99, max(0.01, checks_min))
+        _append_abort_threshold(
+            out,
+            "checks",
+            f"rate>{checks_min:g}",
+            abort_delay=abort_delay,
+        )
+    return out
+
+
 def _workload_options_js(ir: Dict[str, Any], *, browser: bool) -> str:
     """Render k6 ``export const options`` from IR ``workload`` or default smoke."""
+    from config.settings import settings
+
     wl = ir.get("workload") or {}
     thresholds = dict(wl.get("thresholds") or ir.get("thresholds") or {})
     if not thresholds:
@@ -37,6 +179,24 @@ def _workload_options_js(ir: Dict[str, Any], *, browser: bool) -> str:
             "http_req_duration": ["p(95)<2000"],
             "checks": ["rate>0.99"],
         }
+    # abortOnFail is for real load/watcher runs. Default smoke (1 VU × 2) must
+    # finish so heal can see the full failure set — early abort left empty
+    # correlation IDs looking like "inconsistent" partial HTML reports.
+    abort_on_fail = bool(settings.NFE_K6_ABORT_ON_FAIL) and bool(wl)
+    abort_delay = str(settings.NFE_K6_ABORT_DELAY or "10s")
+    # Normalize SLA rules first *without* abort, then inject catastrophic aborts.
+    # Optional NFE_K6_SLA_ABORT_ON_FAIL re-applies abort to all SLA rules.
+    thresholds = _normalize_threshold_entries(
+        thresholds,
+        abort_on_fail=bool(
+            abort_on_fail and getattr(settings, "NFE_K6_SLA_ABORT_ON_FAIL", False)
+        ),
+        abort_delay=abort_delay,
+    )
+    if abort_on_fail:
+        thresholds = _inject_catastrophic_abort_thresholds(
+            thresholds, abort_delay=abort_delay
+        )
     thr_js = ",\n    ".join(
         f"{json.dumps(k)}: {json.dumps(v)}" for k, v in thresholds.items()
     )
@@ -135,20 +295,27 @@ def _randomized_var_js(var: Dict[str, Any]) -> str:
 
 
 def _var_js_assignment(var: Dict[str, Any]) -> str:
-    """Render one IR var as a ``name: expr`` pair for the k6 ``vars`` object."""
+    """Render one IR var as a ``name: expr`` pair for the k6 ``vars`` object.
+
+    Credentials are embedded as literals from the recording/IR (per-app). Env
+    overrides are optional fallback only when the IR value is missing/redacted.
+    """
     name = var["name"]
     if var.get("randomize"):
         return f"  {name}: {_randomized_var_js(var)}"
-    # Credentials: read from process env so scripts do not embed secrets
+    raw = var.get("value")
+    from src.security.secrets import is_redacted_secret
+
+    # Prefer real IR value. Never bake "***REDACTED***" into runnable scripts.
+    if not is_redacted_secret(raw):
+        return f"  {name}: {_js_string(raw)}"
+    # Empty/redacted credential: optional __ENV fallback for recovery, else ''
     if var.get("is_credential") or var.get("from_env"):
-        from config.settings import settings
         from src.security.secrets import env_name_for_credential
 
         env_key = str(var.get("from_env") or env_name_for_credential(str(name)))
-        if settings.NFE_STORE_CREDENTIALS and var.get("value") not in (None, ""):
-            return f"  {name}: __ENV.{env_key} || {_js_string(var.get('value'))}"
         return f"  {name}: __ENV.{env_key} || ''"
-    return f"  {name}: {_js_string(var.get('value'))}"
+    return f"  {name}: ''"
 
 
 def _safe_ident(name: str, fallback: str = "value") -> str:
@@ -218,6 +385,19 @@ def _body_to_js(body: Any, body_type: str) -> Tuple[str, Optional[str]]:
         # Pass a JS object — k6 form-encodes when Content-Type is urlencoded
         fields = []
         for k, v in body.items():
+            kl = str(k).lower()
+            # Safety: never emit redacted password literals into runnable scripts
+            if kl in ("password", "passwd", "pwd") and str(v) in (
+                "***REDACTED***",
+                "****",
+                "",
+            ):
+                v = "${password}"
+            if kl in ("username", "user", "email", "login") and str(v) in (
+                "***REDACTED***",
+                "****",
+            ):
+                v = "${username}"
             fields.append(f"    {_js_string(k)}: {_resolve_var_expr(v)}")
         obj = "{\n" + ",\n".join(fields) + "\n  }"
         return obj, "application/x-www-form-urlencoded"
@@ -305,15 +485,15 @@ def _extract_snippets_for_txn(
                 f"if (__m) vars.{var} = __m[1] || __m[2] || vars.{var}; }}"
             )
         elif loc.startswith("body.$") or loc.startswith("body."):
-            path = loc[len("body.") :] if loc.startswith("body.") else loc
-            jp = path.lstrip("$.").replace(".", ".")
-            if jp.startswith("$"):
-                jp = jp[1:].lstrip(".")
-            lines.append(f"    // Correlation extract `{var}` from {loc}")
+            jp = _body_location_to_k6_json_path(loc)
+            lines.append(f"    // Correlation extract `{var}` from {loc} → json({jp})")
+            # Avoid `|| vars.x` so numeric 0 is kept; only skip null/undefined/"".
             lines.append(
-                f"    try {{ if ({res_var} && {res_var}.body) "
-                f"vars.{var} = {res_var}.json({_js_string(jp)}) || vars.{var}; }} "
-                f"catch (e) {{ /* empty/error body — leave vars.{var} */ }}"
+                f"    try {{ if ({res_var} && {res_var}.body) {{ "
+                f"const __nfeExt = {res_var}.json({_js_string(jp)}); "
+                f"if (__nfeExt !== undefined && __nfeExt !== null && __nfeExt !== '') "
+                f"vars.{var} = String(__nfeExt); "
+                f"}} }} catch (e) {{ /* empty/error body — leave vars.{var} */ }}"
             )
         elif "set-cookie" in loc.lower():
             lines.append(
@@ -606,7 +786,9 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
         _var_js_assignment(v) for v in vars_list
     ) or "  // no parameters detected"
 
-    # Mutable bag for runtime correlation extracts (unique names only)
+    # Mutable bag for runtime correlation extracts (unique names only).
+    # Seed with recorded run values when present so URLs never become
+    # ``/employees//requests`` if a single extract momentarily fails.
     corr_var_decls = []
     seen_var_names = {v["name"] for v in vars_list}
     for c in correlations:
@@ -616,7 +798,16 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
         if var in seen_var_names:
             continue
         seen_var_names.add(var)
-        corr_var_decls.append(f"  {var}: '', // filled by correlation extract")
+        seed = c.get("run2_value")
+        if seed is None or seed == "":
+            seed = c.get("run1_value")
+        if seed is not None and str(seed) != "":
+            corr_var_decls.append(
+                f"  {var}: {_js_string(seed)}, "
+                f"// seed from recording; overwritten by extract"
+            )
+        else:
+            corr_var_decls.append(f"  {var}: '', // filled by correlation extract")
 
     if corr_var_decls:
         if param_block.startswith("  //"):

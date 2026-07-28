@@ -21,11 +21,11 @@ When a smoke/load run **fully finishes** (SLA may pass or fail):
 
 1. Find-or-create parent page **“Performance Testing and Engineering”** in `CONFLUENCE_SPACE_KEY`.
 2. Find-or-create a **flow** page named after the Watch-me / recording (e.g. `Create Claim`).
-3. Create a dated child **`Run YYYY-MM-DD HH:MM`** with stats, SLA table, failures, heal notes.
+3. Create a dated child **`Run YYYY-MM-DD HH:MM`** with an **HTML-parity** report (KPIs, observations, TXN/request/failed tables, coloured status macros, SLA).
 4. Attach **k6 script**, **HTML report**, and optional **IR JSON**.
 5. Update the flow page with a “Latest run” summary + link.
 
-**Does not publish** if the run stopped mid-way (timeout, abort, k6 missing/skipped).
+**Does not publish** if the run stopped mid-way (timeout, abort, k6 missing/skipped), or if failures are **dominated by HTTP 4xx** (script/correlation bugs — skip reason `script_4xx_failures`).
 
 ---
 

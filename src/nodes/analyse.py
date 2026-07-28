@@ -276,6 +276,7 @@ Please verify the user journey steps or selectors. If credentials are required, 
         dependencies=dependencies,
         transactions=transactions,
         network_requests=run1.get("network_requests") or [],
+        credentials=credentials,
     )
     # Attach cookie advice into IR for emitters / QA
     load_test_ir["cookie_notes"] = cookie_notes
@@ -300,6 +301,20 @@ Please verify the user journey steps or selectors. If credentials are required, 
     smoke_result: Dict[str, Any] = {}
     heal_notes: List[str] = []
     names = None
+    skip_k6_smoke = bool(state.get("skip_k6_smoke"))
+    app_id = state.get("app") or ""
+    flow_id = state.get("flow") or state.get("recording_label") or ""
+    try:
+        from src.utils.app_registry import resolve_app_and_flow
+
+        app_id, flow_id = resolve_app_and_flow(
+            target_url=state.get("target_url") or "",
+            label=flow_id,
+            recording_hint=flow_id,
+            explicit_app=app_id,
+        )
+    except Exception:
+        pass
     try:
         from src.utils.k6_mcp import run_k6_smoke_preferred
         from src.utils.k6_healer import heal_load_test_ir, format_smoke_section
@@ -307,7 +322,11 @@ Please verify the user journey steps or selectors. If credentials are required, 
         try:
             from src.utils.artifacts import stable_artifact_names
 
-            names = stable_artifact_names(state["target_url"])
+            names = stable_artifact_names(
+                state["target_url"], app=app_id, flow=flow_id
+            )
+            app_id = names.get("app") or app_id
+            flow_id = names.get("flow") or flow_id
         except Exception:
             names = None
 
@@ -315,55 +334,84 @@ Please verify the user journey steps or selectors. If credentials are required, 
             k6_script,
             target_url=state["target_url"],
             filename=(names or {}).get("script"),
+            app=app_id,
+            flow=flow_id,
         )
         save_load_test_ir(
             load_test_ir,
             target_url=state["target_url"],
             filename=(names or {}).get("ir"),
+            app=app_id,
+            flow=flow_id,
         )
 
-        smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
-        max_heals = 2
-        attempt = 0
-        while (
-            not smoke_result.get("ok")
-            and not smoke_result.get("skipped")
-            and attempt < max_heals
-        ):
-            attempt += 1
-            load_test_ir, notes = heal_load_test_ir(
-                load_test_ir, smoke_result, attempt=attempt
+        if skip_k6_smoke:
+            logger.info(
+                "Skipping analyse k6 smoke (Jira/workload path will run authoritative k6)"
             )
-            heal_notes.extend(notes)
-            k6_script = generate_k6_script(
-                target_url=state["target_url"],
-                parameterizable_candidates=parameterizable_candidates,
-                dependencies=dependencies,
-                transactions=transactions,
-                network_requests=run1.get("network_requests") or [],
-                ir=load_test_ir,
-            )
-            # Overwrite the same script/IR for this flow (no extra artifacts).
-            k6_file = save_k6_script(
-                k6_script,
-                target_url=state["target_url"],
-                filename=k6_file.get("filename") or (names or {}).get("script"),
-            )
-            save_load_test_ir(
-                load_test_ir,
-                target_url=state["target_url"],
-                filename=(names or {}).get("ir"),
-            )
+            smoke_result = {
+                "ok": None,
+                "skipped": True,
+                "summary": "deferred_to_jira_workload_run",
+                "exit_code": None,
+            }
+        else:
             smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
-            if smoke_result.get("ok"):
-                heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
-                break
+            max_heals = 2
+            attempt = 0
+            while (
+                not smoke_result.get("ok")
+                and not smoke_result.get("skipped")
+                and attempt < max_heals
+            ):
+                attempt += 1
+                load_test_ir, notes = heal_load_test_ir(
+                    load_test_ir, smoke_result, attempt=attempt
+                )
+                heal_notes.extend(notes)
+                k6_script = generate_k6_script(
+                    target_url=state["target_url"],
+                    parameterizable_candidates=parameterizable_candidates,
+                    dependencies=dependencies,
+                    transactions=transactions,
+                    network_requests=run1.get("network_requests") or [],
+                    ir=load_test_ir,
+                )
+                # Overwrite the same script/IR for this flow (no extra artifacts).
+                k6_file = save_k6_script(
+                    k6_script,
+                    target_url=state["target_url"],
+                    filename=k6_file.get("filename") or (names or {}).get("script"),
+                    app=app_id,
+                    flow=flow_id,
+                )
+                save_load_test_ir(
+                    load_test_ir,
+                    target_url=state["target_url"],
+                    filename=(names or {}).get("ir"),
+                    app=app_id,
+                    flow=flow_id,
+                )
+                smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
+                if smoke_result.get("ok"):
+                    heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
+                    break
     except Exception as art_err:
         logger.warning("Failed to write/validate k6 artifact: %s", art_err)
         if not k6_file:
             try:
-                k6_file = save_k6_script(k6_script, target_url=state["target_url"])
-                save_load_test_ir(load_test_ir, target_url=state["target_url"])
+                k6_file = save_k6_script(
+                    k6_script,
+                    target_url=state["target_url"],
+                    app=app_id,
+                    flow=flow_id,
+                )
+                save_load_test_ir(
+                    load_test_ir,
+                    target_url=state["target_url"],
+                    app=app_id,
+                    flow=flow_id,
+                )
             except Exception:
                 pass
 
@@ -402,15 +450,58 @@ Please verify the user journey steps or selectors. If credentials are required, 
     try:
         from src.utils.artifacts import artifacts_dir, stable_artifact_names
 
-        ir_name = (names or stable_artifact_names(state.get("target_url") or "")).get(
-            "ir"
-        )
+        ir_name = (
+            names
+            or stable_artifact_names(
+                state.get("target_url") or "", app=app_id, flow=flow_id
+            )
+        ).get("ir")
+        app_for_ir = (names or {}).get("app") or app_id
         if ir_name:
-            candidate = artifacts_dir() / ir_name
-            if candidate.is_file():
-                ir_path = str(candidate)
+            candidates = []
+            if app_for_ir:
+                candidates.append(artifacts_dir() / app_for_ir / ir_name)
+            candidates.append(artifacts_dir() / ir_name)
+            for candidate in candidates:
+                if candidate.is_file():
+                    ir_path = str(candidate)
+                    break
     except Exception:
         ir_path = ""
+
+    # Upsert markdown knowledge (+ RAG) after a successful analyse write
+    try:
+        if app_id and (k6_file or smoke_result):
+            from src.utils.knowledge_store import upsert_flow_card
+
+            smoke_ok = smoke_result.get("ok")
+            if smoke_result.get("skipped"):
+                smoke_status = "skipped"
+            elif smoke_ok is True:
+                smoke_status = "passed"
+            elif smoke_ok is False:
+                smoke_status = "failed"
+            else:
+                smoke_status = "unknown"
+            txn_names = [
+                str(t.get("name") or t.get("id") or "")
+                for t in (transactions or [])
+                if isinstance(t, dict)
+            ]
+            upsert_flow_card(
+                app_id,
+                flow_id or "default",
+                target_url=state.get("target_url") or "",
+                recording_path=state.get("recording_file") or "",
+                k6_path=(k6_file or {}).get("path") or "",
+                ir_path=ir_path,
+                txn_names=[n for n in txn_names if n],
+                workload_source="analyse_smoke",
+                smoke_status=smoke_status,
+                step_count=len(user_steps or []),
+            )
+    except Exception as know_err:
+        logger.warning("Knowledge upsert skipped: %s", know_err)
 
     confluence_info: Dict[str, Any] = {"published": False}
     if not state.get("skip_confluence_publish"):
@@ -473,9 +564,13 @@ Please verify the user journey steps or selectors. If credentials are required, 
             f"({confluence_info['run_url']})"
         )
     elif confluence_info.get("skipped_reason"):
-        logger.info(
-            "Confluence not published: %s", confluence_info.get("skipped_reason")
-        )
+        reason = confluence_info.get("skipped_reason")
+        logger.info("Confluence not published: %s", reason)
+        if not state.get("skip_confluence_publish"):
+            summary_markdown = (
+                f"{summary_markdown}\n\n"
+                f"**Confluence:** not published — `{reason}`"
+            )
 
     return {
         "run_records": records,
@@ -490,5 +585,7 @@ Please verify the user journey steps or selectors. If credentials are required, 
         "randomization_state": randomization_state,
         "randomization_ledger": randomization_ledger,
         "non_randomizable_endpoints": non_randomizable_endpoints,
+        "app": app_id or state.get("app") or "",
+        "flow": flow_id or state.get("flow") or "",
         "messages": [AIMessage(content=summary_markdown)],
     }

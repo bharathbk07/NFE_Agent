@@ -54,6 +54,30 @@ async def route_intent(state: AgentState) -> Dict[str, Any]:
     if decision.intent == "watch_me":
         updates["recording_mode"] = "watch_me"
         updates["watch_me_status"] = "requested"
+        text = get_latest_human_text(state.get("messages"))
+        try:
+            from src.utils.app_registry import extract_watch_me_label, resolve_app_and_flow
+
+            label = extract_watch_me_label(text or "")
+            if label:
+                updates["recording_label"] = label
+            url = state.get("target_url") or ""
+            if not url:
+                from src.agents.intent_router import URL_RE
+
+                m = URL_RE.search(text or "")
+                if m:
+                    url = m.group(0)
+            app, flow = resolve_app_and_flow(
+                target_url=url,
+                label=label or state.get("recording_label") or "",
+            )
+            if app:
+                updates["app"] = app
+            if flow:
+                updates["flow"] = flow
+        except Exception as exc:
+            logger.debug("App/flow resolve on watch_me skipped: %s", exc)
     elif decision.intent == "reuse_recording":
         updates["recording_mode"] = "reuse"
         updates["watch_me_status"] = "requested"

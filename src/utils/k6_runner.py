@@ -157,6 +157,15 @@ def run_k6_smoke(
     if status_counts.get("401"):
         summary += f" · {status_counts['401']}× HTTP 401"
 
+    combined_l = combined.lower()
+    aborted_by_watcher = bool(
+        "aborted by threshold" in combined_l
+        or ("thresholds" in combined_l and "abort" in combined_l)
+        or ("threshold" in combined_l and "aborted" in combined_l)
+    )
+    if aborted_by_watcher and not ok:
+        summary = f"watcher abort (exit {proc.returncode})"
+
     html_report = ""
     try:
         html_report = write_html_report(
@@ -186,6 +195,8 @@ def run_k6_smoke(
         "summary": summary,
         "html_report": html_report,
         "summary_json": summary_json,
+        "points_json": points_path if Path(points_path).is_file() else "",
+        "aborted_by_watcher": aborted_by_watcher,
         "code": ErrorCode.K6_SMOKE_FAILED if not ok else "",
     }
 

@@ -334,12 +334,13 @@ def _ensure_auth_csrf(
     correlations: List[Dict[str, Any]],
     *,
     origin: str,
+    vars_list: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
-    """Wire login CSRF extract → ``auth/validate`` body ``_token``.
+    """Wire login CSRF + username/password on ``auth/validate``.
 
     Always replaces captured/stale ``_token`` literals with ``${csrf_token}``.
-    Leaving a Run-1 CSRF value in the script causes silent login failure and
-    cascading 401s on every authenticated API call.
+    Also replaces username/password with IR credential vars so artifact
+    redaction (``***REDACTED***`` in captured POST bodies) cannot break login.
     """
     has_browser_login = any(
         (t.get("mode") == "browser" and "login" in str(t.get("name") or "").lower())
@@ -349,6 +350,7 @@ def _ensure_auth_csrf(
     if has_browser_login:
         return
     csrf_var = "csrf_token"
+    user_var, pwd_var = _credential_vars(vars_list or [])
     login_url = ""
     validate_url = ""
     for txn in transactions or []:
@@ -357,18 +359,58 @@ def _ensure_auth_csrf(
             method = str(r.get("method") or "").upper()
             if method == "GET" and "/auth/login" in url.lower():
                 login_url = url
-            if method == "POST" and "/auth/validate" in url.lower():
-                validate_url = url
-                body = r.get("body")
-                if not isinstance(body, dict):
-                    body = {}
-                else:
-                    body = dict(body)
-                # Always correlate — never ship a captured CSRF literal.
-                body["_token"] = f"${{{csrf_var}}}"
-                r["body"] = body
-                if not r.get("body_type") or r.get("body_type") == "empty":
-                    r["body_type"] = "form"
+            body = r.get("body")
+            is_login_post = method == "POST" and (
+                "/auth/validate" in url.lower()
+                or (
+                    isinstance(body, dict)
+                    and "password" in {str(k).lower() for k in body}
+                    and bool(
+                        {str(k).lower() for k in body}
+                        & {"username", "user", "email", "login"}
+                    )
+                )
+            )
+            if not is_login_post:
+                continue
+            validate_url = url or validate_url
+            if not isinstance(body, dict):
+                body = {}
+            else:
+                body = dict(body)
+            # Always correlate — never ship a captured CSRF literal.
+            body["_token"] = f"${{{csrf_var}}}"
+            if user_var:
+                if "username" in body or not any(
+                    k in body for k in ("user", "email", "login")
+                ):
+                    body["username"] = f"${{{user_var}}}"
+                for key in ("user", "email", "login"):
+                    if key in body:
+                        body[key] = f"${{{user_var}}}"
+            if pwd_var:
+                for key in ("password", "passwd", "pwd"):
+                    if key in body or key == "password":
+                        body[key if key in body else "password"] = f"${{{pwd_var}}}"
+                        break
+            # Never leave redaction sentinels in credential fields
+            for key, val in list(body.items()):
+                kl = str(key).lower()
+                sval = str(val)
+                if kl in ("password", "passwd", "pwd") and pwd_var:
+                    if sval in ("***REDACTED***", "****", "") or not sval.startswith(
+                        "${"
+                    ):
+                        body[key] = f"${{{pwd_var}}}"
+                if (
+                    kl in ("username", "user", "email", "login")
+                    and user_var
+                    and sval in ("***REDACTED***", "****")
+                ):
+                    body[key] = f"${{{user_var}}}"
+            r["body"] = body
+            if not r.get("body_type") or r.get("body_type") == "empty":
+                r["body_type"] = "form"
     if not login_url and origin:
         login_url = f"{origin}/web/index.php/auth/login"
     if not validate_url:
@@ -754,6 +796,7 @@ def build_load_test_ir(
     dependencies: List[Dict[str, Any]],
     transactions: List[Dict[str, Any]],
     network_requests: Optional[List[Dict[str, Any]]] = None,
+    credentials: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build deterministic tool-agnostic Load-Test IR.
 
@@ -763,12 +806,18 @@ def build_load_test_ir(
         dependencies: Extract-to-pass correlation edges.
         transactions: Analyzed transaction definitions.
         network_requests: Optional full captures used to recover bodies/headers.
+        credentials: Optional username/password from Watch-Me / Jira / chat.
 
     Returns:
         Versioned mapping with ``target_url``, ``origin``, ``vars``,
         ``correlations``, and normalized ``transactions``.
     """
     network_requests = network_requests or []
+    credentials = {
+        str(k): str(v)
+        for k, v in (credentials or {}).items()
+        if v is not None and str(v).strip()
+    }
 
     # Excluding observed correlation values from *parameter* vars prevents
     # server output from becoming static CSV data. Correlation literals are
@@ -812,17 +861,80 @@ def build_load_test_ir(
             "is_credential": bool(cand.get("is_credential")),
             "propagations": cand.get("propagations") or [],
         }
+        # Infer credential from selector/name when classifier missed it
+        src_l = str(entry["source"]).lower()
+        if not entry["is_credential"] and (
+            name.lower() in ("password", "passwd", "pwd", "username", "user", "email")
+            or "password" in src_l
+            or 'name="username"' in src_l
+            or "name='username'" in src_l
+        ):
+            entry["is_credential"] = True
         if entry["is_credential"]:
-            from src.security.secrets import env_name_for_credential
+            from src.security.secrets import (
+                env_name_for_credential,
+                is_redacted_secret,
+            )
 
             entry["from_env"] = env_name_for_credential(name)
+            # Keep real values in IR by default (multi-app). Only wipe when
+            # operator explicitly disables NFE_STORE_CREDENTIALS.
             from config.settings import settings
 
-            if not settings.NFE_STORE_CREDENTIALS:
-                entry["value"] = ""
+            if not settings.NFE_STORE_CREDENTIALS or is_redacted_secret(value):
+                # Prefer empty over baking the redaction sentinel into IR
+                if is_redacted_secret(value):
+                    entry["value"] = ""
+                if not settings.NFE_STORE_CREDENTIALS:
+                    entry["value"] = ""
+            # Restore from journey credentials when fill was wiped
+            if is_redacted_secret(entry["value"]) and credentials:
+                restored = credentials.get(name) or credentials.get(name.lower())
+                if not restored and name.lower() in ("username", "user"):
+                    restored = (
+                        credentials.get("username")
+                        or credentials.get("user")
+                        or credentials.get("email")
+                    )
+                if not restored and name.lower() in ("password", "passwd", "pwd"):
+                    restored = credentials.get("password") or credentials.get("passwd")
+                if restored and not is_redacted_secret(restored):
+                    entry["value"] = str(restored)
         vars_list.append(entry)
-        if value and value not in vars_by_value:
-            vars_by_value[value] = name
+        if entry["value"] and entry["value"] not in vars_by_value:
+            vars_by_value[entry["value"]] = name
+
+    # Ensure login vars exist when credentials were provided explicitly
+    from config.settings import settings as _settings
+    from src.security.secrets import (
+        env_name_for_credential,
+        is_redacted_secret as _is_redacted,
+    )
+
+    for cred_key, var_name in (
+        ("username", "username"),
+        ("user", "username"),
+        ("email", "username"),
+        ("password", "password"),
+        ("passwd", "password"),
+    ):
+        raw = credentials.get(cred_key)
+        if not raw or _is_redacted(raw) or var_name in seen_vars:
+            continue
+        seen_vars.add(var_name)
+        stored = str(raw) if _settings.NFE_STORE_CREDENTIALS else ""
+        vars_list.append(
+            {
+                "name": var_name,
+                "value": stored,
+                "source": f"credentials.{cred_key}",
+                "is_credential": True,
+                "from_env": env_name_for_credential(var_name),
+                "propagations": [],
+            }
+        )
+        if stored and stored not in vars_by_value:
+            vars_by_value[stored] = var_name
 
     # Combined map: params + correlations for URL/body/header substitution
     subst_by_value: Dict[str, str] = dict(vars_by_value)
@@ -993,7 +1105,9 @@ def build_load_test_ir(
         target_url=target_url or "",
         correlations=corr_list,
     )
-    _ensure_auth_csrf(txn_list, corr_list, origin=origin)
+    _ensure_auth_csrf(
+        txn_list, corr_list, origin=origin, vars_list=vars_list
+    )
     _ensure_create_resource_ids(
         txn_list,
         corr_list,

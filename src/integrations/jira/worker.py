@@ -237,7 +237,8 @@ async def process_issue_key(
                 target_url=result.get("target_url") or req.target_url,
                 smoke_ok=result.get("smoke_ok"),
                 smoke_summary=result.get("smoke_summary") or "",
-                workload=req.workload,
+                workload=result.get("workload") or req.workload,
+                workload_source=str(result.get("workload_source") or ""),
                 k6_path=str(result.get("k6_path") or ""),
                 ir_path=str(result.get("ir_path") or ""),
                 html_report=str(result.get("html_report") or ""),
@@ -256,6 +257,12 @@ async def process_issue_key(
                     or (result.get("confluence") or {}).get("run_url")
                     or ""
                 ),
+                confluence_skipped_reason=str(
+                    result.get("confluence_skipped_reason")
+                    or (result.get("confluence") or {}).get("skipped_reason")
+                    or ""
+                ),
+                aborted_by_watcher=bool(result.get("aborted_by_watcher")),
             ),
         )
         jira.set_lifecycle(

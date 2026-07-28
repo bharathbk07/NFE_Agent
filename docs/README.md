@@ -1,6 +1,18 @@
 # NFE Agent documentation
 
-Index of project docs. Start with the root [`README.md`](../README.md) for setup and end-to-end flows.
+Index of project docs. Start with the root [`README.md`](../README.md) for product vision, setup, and end-to-end flows.
+
+## Product outcome
+
+NFE is an **Agentic AI assistant for Performance Testing & Engineering**:
+
+1. Understand the application (BA / Jira stories / recorded journeys — BA-doc depth expanding)
+2. Create performance scripts (deterministic IR → k6)
+3. Run smoke and load
+4. Analyze results (HTML, SLA, TXN/request tables)
+5. Deliver **RCA signals and fix guidance** (heal notes, 4xx vs 5xx, Jira + Confluence findings)
+
+MVP focus: Watch-me / Navigator / Jira → k6 → reports. Full BA-document ingestion is on the roadmap; story AC + recordings are the current understanding inputs.
 
 ## Agents
 
@@ -33,13 +45,14 @@ Overview: [workers/overview.md](workers/overview.md)
 
 | Doc | Description |
 |-----|-------------|
-| [Smoke check and self-heal](pipeline/smoke-and-self-heal.md) | k6 smoke gate, heal loop, Chromium vs HTTP timing |
+| [Smoke check and self-heal](pipeline/smoke-and-self-heal.md) | k6 smoke gate, heal loop, catastrophic abort (≥60% fail), Chromium vs HTTP |
+| [App artifacts & knowledge](pipeline/app-artifacts-and-knowledge.md) | Domain-scoped recordings/k6, markdown knowledge, local ChromaDB RAG |
 
 ## Security
 
 | Doc | Description |
 |-----|-------------|
-| [Security](security/security.md) | Threat model, URL/step/fs policy, secrets, exceptions |
+| [Security](security/security.md) | Threat model, URL/step/fs policy, **per-app credential store**, comment redaction |
 
 ## MCP (optional)
 

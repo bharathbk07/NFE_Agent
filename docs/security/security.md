@@ -16,20 +16,17 @@ Chat messages and visited page content are treated as **untrusted**. The agent c
 | `NFE_URL_DENY_PRIVATE` | `true` | Block RFC1918 / link-local / metadata hosts |
 | `NFE_ALLOW_LOCALHOST` | `false` | Set `true` only for local demo apps |
 | `NFE_URL_ALLOWLIST` | empty | If set (comma hosts), only those hosts |
-| `NFE_STORE_CREDENTIALS` | `false` | Do not write password values into recordings/IR |
-| `NFE_REDACT_ARTIFACTS` | `true` | Mask auth headers, cookies, password fields in artifacts |
+| `NFE_STORE_CREDENTIALS` | `true` | Persist Watch-Me username/password into recordings, IR, and k6 scripts (per app). Required for multi-app demos without per-app env vars. |
+| `NFE_REDACT_ARTIFACTS` | `true` | Mask auth headers/cookies in network captures; password **fills** are kept when `NFE_STORE_CREDENTIALS=true` |
 | `NFE_SELF_HEAL_HTML_CHARS` | `15000` | Truncate DOM sent to self-heal LLM |
 | `NFE_SELF_HEAL_A11Y_CHARS` | `6000` | Truncate a11y JSON for self-heal |
 
 ## Operator surface
 
 - Run Studio bound to **localhost** only. Do not expose `langgraph dev` on `0.0.0.0` without an auth proxy.
-- Keep LangSmith / OTLP off unless you accept prompt export; credentials are not sent to planners as plaintext (placeholders only).
-- Supply k6 credentials at runtime:
-
-```bash
-NFE_USER=Admin NFE_PASS=admin123 k6 run artifacts/k6/example.js
-```
+- App login credentials come from the **Watch-Me recording** (and optional chat/Jira credentials), not from a global `NFE_USER`/`NFE_PASS`. That scales across apps.
+- k6 scripts embed those values as `vars.password` / `vars.username`. Heal LLMs may see them; **Jira/Confluence comments** still redact password-like text.
+- Set `NFE_STORE_CREDENTIALS=false` only if you must wipe secrets from disk (scripts will then have empty passwords unless you recover another way).
 
 ## Jira (chat-driven)
 

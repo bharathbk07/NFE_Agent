@@ -39,9 +39,21 @@ async def run_perf_for_request(
 
     loaded = load_watch_me_recording(path)
     target_url = request.target_url or loaded.get("target_url") or ""
+    from src.utils.app_registry import resolve_app_and_flow
+
+    app_id, flow_id = resolve_app_and_flow(
+        target_url=target_url,
+        label=loaded.get("recording_label") or loaded.get("flow") or "",
+        recording_hint=request.recording_hint or "",
+        explicit_app=loaded.get("app") or "",
+    )
+    # Prefer story credentials (per-app), then recording-stored credentials.
+    merged_creds = dict(loaded.get("credentials") or {})
+    if request.credentials:
+        merged_creds.update(request.credentials)
     state: Dict[str, Any] = {
         "target_url": target_url,
-        "credentials": loaded.get("credentials") or {},
+        "credentials": merged_creds,
         "user_journey_steps": loaded.get("user_journey_steps") or [],
         "sub_tasks": loaded.get("sub_tasks") or [],
         "run_records": loaded.get("run_records") or [],
@@ -49,9 +61,14 @@ async def run_perf_for_request(
         "recording_mode": "reuse",
         "watch_me_status": "ready_analyse",
         "recording_file": str(path),
+        "app": app_id,
+        "flow": flow_id,
+        "recording_label": loaded.get("recording_label") or flow_id,
         "messages": [],
-        # Final workload smoke + Confluence publish happen below (avoid double publish).
+        # Final workload smoke + Confluence publish happen below (avoid double publish
+        # and avoid analyse's default 1 VU × 2 smoke when the story has a workload).
         "skip_confluence_publish": True,
+        "skip_k6_smoke": True,
     }
 
     analysis = await analyse_traffic(state)
@@ -59,32 +76,59 @@ async def run_perf_for_request(
     artifacts = dict(perf.get("artifacts") or {})
     ir = dict(perf.get("load_test_ir") or artifacts.get("load_test_ir") or {})
 
-    if request.workload:
-        ir["workload"] = dict(request.workload)
+    story_workload = dict(request.workload or {})
+    if story_workload:
+        ir["workload"] = dict(story_workload)
+        workload_source = "jira_story"
+    else:
+        workload_source = "default_smoke"
     if request.thresholds:
         ir.setdefault("workload", {})
         ir["workload"]["thresholds"] = dict(request.thresholds)
+        if not story_workload:
+            # Thresholds alone still come from the story
+            workload_source = "jira_story"
     ir["target_url"] = ir.get("target_url") or target_url
 
-    names = stable_artifact_names(target_url)
+    names = stable_artifact_names(target_url, app=app_id, flow=flow_id)
+    app_id = names.get("app") or app_id
+    flow_id = names.get("flow") or flow_id
     k6_file: Dict[str, str] = {}
     smoke: Dict[str, Any] = {}
     heal_notes = list((perf.get("k6_smoke") or {}).get("heal_notes") or [])
+    ir_meta: Dict[str, str] = {}
 
-    k6_script = (
-        emit_k6_from_ir(ir)
-        if ir.get("transactions") or ir.get("vars") is not None
-        else ""
-    )
-    if not k6_script:
+    can_emit = bool(ir.get("transactions") or ir.get("vars") is not None)
+    k6_script = emit_k6_from_ir(ir) if can_emit else ""
+    if not k6_script and not story_workload:
+        # Only fall back to analyse script when there is no story workload
+        # (otherwise we must not re-run the default smoke options).
         k6_script = str(artifacts.get("k6_script") or "")
+
+    wl_for_log = ir.get("workload") or {}
+    logger.info(
+        "Running k6 with %s workload: vus=%s executor=%s iterations=%s duration=%s",
+        workload_source,
+        wl_for_log.get("vus"),
+        wl_for_log.get("executor"),
+        wl_for_log.get("iterations"),
+        wl_for_log.get("duration") or wl_for_log.get("maxDuration"),
+    )
 
     if k6_script and ir:
         k6_file = save_k6_script(
-            k6_script, target_url=target_url, filename=names.get("script")
+            k6_script,
+            target_url=target_url,
+            filename=names.get("script"),
+            app=app_id,
+            flow=flow_id,
         )
         ir_meta = save_load_test_ir(
-            ir, target_url=target_url, filename=names.get("ir")
+            ir,
+            target_url=target_url,
+            filename=names.get("ir"),
+            app=app_id,
+            flow=flow_id,
         )
         try:
             smoke = await run_k6_smoke_preferred(k6_file.get("path") or "")
@@ -92,9 +136,55 @@ async def run_perf_for_request(
             logger.warning("k6 run failed: %s", exc)
             smoke = {"ok": False, "summary": str(exc)}
     else:
-        ir_meta = {}
+        if story_workload and not k6_script:
+            logger.error(
+                "Story workload present but k6 emit produced empty script "
+                "(transactions=%s)",
+                bool(ir.get("transactions")),
+            )
+            smoke = {
+                "ok": False,
+                "summary": "k6 emit failed with story workload",
+                "exit_code": -1,
+            }
+
+    # Refresh knowledge after authoritative Jira workload smoke
+    try:
+        if app_id and (k6_file or smoke):
+            from src.utils.knowledge_store import upsert_flow_card
+
+            smoke_ok = smoke.get("ok")
+            if smoke.get("skipped"):
+                smoke_status = "skipped"
+            elif smoke_ok is True:
+                smoke_status = "passed"
+            elif smoke_ok is False:
+                smoke_status = "failed"
+            else:
+                smoke_status = "unknown"
+            txns = analysis.get("transactions") or perf.get("transactions") or []
+            txn_names = [
+                str(t.get("name") or t.get("id") or "")
+                for t in txns
+                if isinstance(t, dict)
+            ]
+            upsert_flow_card(
+                app_id,
+                flow_id or "default",
+                target_url=target_url,
+                recording_path=str(path),
+                k6_path=k6_file.get("path") or "",
+                ir_path=ir_meta.get("path") or "",
+                txn_names=[n for n in txn_names if n],
+                workload_source=workload_source,
+                smoke_status=smoke_status,
+                step_count=len(loaded.get("user_journey_steps") or []),
+            )
+    except Exception as know_err:
+        logger.warning("Knowledge upsert skipped (Jira): %s", know_err)
 
     prior_k6 = artifacts.get("k6_file") if isinstance(artifacts.get("k6_file"), dict) else {}
+    aborted_by_watcher = bool(smoke.get("aborted_by_watcher"))
 
     confluence_info: Dict[str, Any] = {"published": False}
     try:
@@ -131,6 +221,9 @@ async def run_perf_for_request(
                 "failed_urls": list(smoke.get("failed_urls") or []),
                 "status_counts": dict(smoke.get("status_counts") or {}),
                 "exit_code": smoke.get("exit_code"),
+                "workload": ir.get("workload") or story_workload or {},
+                "workload_source": workload_source,
+                "aborted_by_watcher": aborted_by_watcher,
             }
         )
     except Exception as exc:
@@ -142,7 +235,8 @@ async def run_perf_for_request(
         "blocked": False,
         "target_url": target_url,
         "recording_path": str(path),
-        "workload": request.workload,
+        "workload": ir.get("workload") or story_workload or {},
+        "workload_source": workload_source,
         "transactions": analysis.get("transactions") or perf.get("transactions") or [],
         "k6_path": k6_file.get("path") or prior_k6.get("path") or "",
         "ir_path": ir_meta.get("path") or "",
@@ -156,6 +250,8 @@ async def run_perf_for_request(
         "status_counts": dict(smoke.get("status_counts") or {}),
         "summary_json": str(smoke.get("summary_json") or ""),
         "exit_code": smoke.get("exit_code"),
+        "aborted_by_watcher": aborted_by_watcher,
         "confluence": confluence_info,
         "confluence_url": confluence_info.get("run_url") or "",
+        "confluence_skipped_reason": confluence_info.get("skipped_reason") or "",
     }

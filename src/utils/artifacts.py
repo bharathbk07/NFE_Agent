@@ -6,10 +6,14 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
-from urllib.parse import urlparse
 
 from src.security.fs_jail import assert_under_jail, safe_artifact_filename
 from src.exceptions import ErrorCode, NFEValidationError
+from src.utils.app_registry import (
+    ensure_app_dirs,
+    resolve_app_and_flow,
+    slug_flow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,53 +40,28 @@ def artifacts_dir() -> Path:
     return _DEFAULT_DIR
 
 
-def _slug_host(target_url: str) -> str:
-    """Convert a target URL host into a filesystem-safe stem.
+def k6_app_dir(app_id: str) -> Path:
+    """Return ``artifacts/k6/<app>/`` (created lazily)."""
+    app = (app_id or "").strip()
+    if not app:
+        return artifacts_dir()
+    ensure_app_dirs(app)
+    return artifacts_dir() / app
 
-    Args:
-        target_url: Absolute or partial target URL.
 
-    Returns:
-        Sanitized host stem limited to 60 characters.
+def _prune_stale_host_artifacts(out_dir: Path, stem: str, keep: Set[str]) -> None:
+    """Remove older timestamped artifacts for the same stem.
+
+    Keeps the stable set (``stem.js``, ``stem_ir.json``, report sidecars).
     """
-    try:
-        host = urlparse(target_url or "").netloc or "script"
-    except Exception:
-        host = "script"
-    host = re.sub(r"[^a-zA-Z0-9._-]+", "_", host).strip("._") or "script"
-    return host[:60]
-
-
-def stable_artifact_names(target_url: str) -> Dict[str, str]:
-    """Return stable filenames for one recorded flow (overwrite on heal).
-
-    Args:
-        target_url: Journey target URL.
-
-    Returns:
-        Mapping with ``script`` and ``ir`` filenames (no timestamps).
-    """
-    host = _slug_host(target_url)
-    return {
-        "script": f"{host}.js",
-        "ir": f"{host}_ir.json",
-    }
-
-
-def _prune_stale_host_artifacts(out_dir: Path, host: str, keep: Set[str]) -> None:
-    """Remove older timestamped artifacts for the same host.
-
-    Keeps the stable set (``host.js``, ``host_ir.json``, report sidecars).
-    """
-    if not out_dir.is_dir() or not host:
+    if not out_dir.is_dir() or not stem:
         return
-    prefix = f"{host}_"
+    prefix = f"{stem}_"
     for path in out_dir.iterdir():
         if not path.is_file():
             continue
         if path.name in keep:
             continue
-        # Timestamped legacy: host_20260721_191219.js / _ir.json / reports
         if path.name.startswith(prefix) and _TIMESTAMPED_ARTIFACT.match(path.name):
             try:
                 path.unlink()
@@ -91,25 +70,67 @@ def _prune_stale_host_artifacts(out_dir: Path, host: str, keep: Set[str]) -> Non
                 pass
 
 
+def stable_artifact_names(
+    target_url: str = "",
+    *,
+    app: str = "",
+    flow: str = "",
+    label: str = "",
+) -> Dict[str, str]:
+    """Return stable filenames for one recorded flow (overwrite on heal).
+
+    Layout: ``k6/<app>/<flow>.js`` and ``k6/<app>/<flow>_ir.json``.
+
+    Args:
+        target_url: Journey target URL (used to derive app/flow when omitted).
+        app: Explicit app id (URL domain).
+        flow: Explicit flow id (Watch-me label / recording stem).
+        label: Alternate label used when ``flow`` is empty.
+
+    Returns:
+        Mapping with ``script``, ``ir``, ``app``, and ``flow``.
+    """
+    resolved_app, resolved_flow = resolve_app_and_flow(
+        target_url=target_url,
+        label=flow or label,
+        explicit_app=app,
+    )
+    if not resolved_app and app:
+        resolved_app = slug_flow(app) or app
+    if not resolved_flow:
+        resolved_flow = "default"
+    return {
+        "script": f"{resolved_flow}.js",
+        "ir": f"{resolved_flow}_ir.json",
+        "app": resolved_app,
+        "flow": resolved_flow,
+    }
+
+
 def save_k6_script(
     script: str,
     *,
     target_url: str = "",
     filename: Optional[str] = None,
+    app: str = "",
+    flow: str = "",
+    label: str = "",
 ) -> Dict[str, str]:
     """Write a k6 JavaScript artifact and describe the saved file.
 
-    One recorded flow maps to one stable script path (``{host}.js``). Heal
-    loops overwrite the same file instead of creating timestamped copies.
+    One recorded flow maps to one stable script path under ``k6/<app>/``.
+    Heal loops overwrite the same file instead of creating timestamped copies.
 
     Args:
         script: Non-empty k6 JavaScript source.
-        target_url: Target URL used to derive a default filename.
+        target_url: Target URL used to derive app/flow when not provided.
         filename: Optional output filename; ``.js`` is appended if absent.
+        app: Explicit app id (domain).
+        flow: Explicit flow id.
+        label: Alternate flow label.
 
     Returns:
-        String-valued metadata containing ``path``, ``filename``, ``file_url``,
-        ``size_bytes``, and ``relative_path``.
+        String-valued metadata containing path fields plus ``app`` / ``flow``.
 
     Raises:
         NFEValidationError: If ``script`` is empty.
@@ -121,30 +142,38 @@ def save_k6_script(
             user_message="Cannot save empty k6 script.",
         )
 
-    out_dir = artifacts_dir()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    names = stable_artifact_names(
+        target_url, app=app, flow=flow, label=label
+    )
+    app_id = names["app"]
+    flow_id = names["flow"]
+    if app_id:
+        out_dir = k6_app_dir(app_id)
+    else:
+        out_dir = artifacts_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    host = _slug_host(target_url)
     if not filename:
-        filename = stable_artifact_names(target_url)["script"]
+        filename = names["script"]
     filename = safe_artifact_filename(filename, default_suffix=".js")
 
     path = out_dir / filename
-    path = assert_under_jail(path, out_dir)
+    path = assert_under_jail(path, artifacts_dir())
     path.write_text(script, encoding="utf-8")
     abs_path = str(path.resolve())
     logger.info("Saved k6 script → %s (%s bytes)", abs_path, path.stat().st_size)
 
+    stem = Path(filename).stem
     keep = {
         filename,
-        f"{host}_ir.json",
+        f"{stem}_ir.json",
         "html-report.html",
         "summary.json",
         "k6-points.json",
-        f"{Path(filename).stem}_html-report.html",
-        f"{Path(filename).stem}_summary.json",
+        f"{stem}_html-report.html",
+        f"{stem}_summary.json",
     }
-    _prune_stale_host_artifacts(out_dir, host, keep)
+    _prune_stale_host_artifacts(out_dir, stem, keep)
 
     return {
         "path": abs_path,
@@ -154,6 +183,8 @@ def save_k6_script(
         "relative_path": str(path.relative_to(_PROJECT_ROOT))
         if path.is_relative_to(_PROJECT_ROOT)
         else abs_path,
+        "app": app_id,
+        "flow": flow_id,
     }
 
 
@@ -162,20 +193,25 @@ def save_load_test_ir(
     *,
     target_url: str = "",
     filename: Optional[str] = None,
+    app: str = "",
+    flow: str = "",
+    label: str = "",
 ) -> Dict[str, str]:
-    """Write Load-Test IR as formatted JSON (stable overwrite per host).
+    """Write Load-Test IR as formatted JSON (stable overwrite per app/flow).
 
     Args:
         ir: Non-empty Load-Test IR mapping.
-        target_url: Target URL used to derive a default filename.
+        target_url: Target URL used to derive app/flow when not provided.
         filename: Optional output filename; ``.json`` is appended if absent.
+        app: Explicit app id (domain).
+        flow: Explicit flow id.
+        label: Alternate flow label.
 
     Returns:
-        String-valued metadata containing the saved path, name, URL, size, and
-        project-relative path when available.
+        String-valued metadata containing the saved path plus ``app`` / ``flow``.
 
     Raises:
-        ValueError: If ``ir`` is empty.
+        NFEValidationError: If ``ir`` is empty.
     """
     if not ir:
         raise NFEValidationError(
@@ -184,27 +220,37 @@ def save_load_test_ir(
             user_message="Cannot save empty IR.",
         )
 
-    out_dir = artifacts_dir()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    names = stable_artifact_names(
+        target_url, app=app, flow=flow, label=label
+    )
+    app_id = names["app"]
+    flow_id = names["flow"]
+    if app_id:
+        out_dir = k6_app_dir(app_id)
+    else:
+        out_dir = artifacts_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    host = _slug_host(target_url)
     if not filename:
-        filename = stable_artifact_names(target_url)["ir"]
+        filename = names["ir"]
     filename = safe_artifact_filename(filename, default_suffix=".json")
 
     path = out_dir / filename
-    path = assert_under_jail(path, out_dir)
+    path = assert_under_jail(path, artifacts_dir())
     path.write_text(json.dumps(ir, indent=2, default=str), encoding="utf-8")
     abs_path = str(path.resolve())
     logger.info("Saved load-test IR → %s", abs_path)
 
+    stem = Path(filename).stem.replace("_ir", "")
     keep = {
         filename,
-        f"{host}.js",
-        f"{host}_html-report.html",
-        f"{host}_summary.json",
+        f"{stem}.js",
+        f"{stem}_html-report.html",
+        f"{stem}_summary.json",
+        "html-report.html",
+        "summary.json",
     }
-    _prune_stale_host_artifacts(out_dir, host, keep)
+    _prune_stale_host_artifacts(out_dir, stem, keep)
 
     return {
         "path": abs_path,
@@ -214,4 +260,35 @@ def save_load_test_ir(
         "relative_path": str(path.relative_to(_PROJECT_ROOT))
         if path.is_relative_to(_PROJECT_ROOT)
         else abs_path,
+        "app": app_id,
+        "flow": flow_id,
     }
+
+
+def resolve_k6_path(
+    *,
+    target_url: str = "",
+    app: str = "",
+    flow: str = "",
+    kind: str = "script",
+) -> Optional[Path]:
+    """Resolve a k6 script or IR path (app-scoped first, then legacy flat)."""
+    names = stable_artifact_names(target_url, app=app, flow=flow)
+    app_id = names["app"]
+    filename = names["script"] if kind == "script" else names["ir"]
+    candidates: list[Path] = []
+    if app_id:
+        candidates.append(artifacts_dir() / app_id / filename)
+    # Legacy flat: {host}.js / {host}_ir.json
+    if app_id:
+        legacy_name = f"{app_id}.js" if kind == "script" else f"{app_id}_ir.json"
+        candidates.append(artifacts_dir() / legacy_name)
+    candidates.append(artifacts_dir() / filename)
+    for candidate in candidates:
+        try:
+            jailed = assert_under_jail(candidate, artifacts_dir())
+        except Exception:
+            continue
+        if jailed.is_file():
+            return jailed
+    return None

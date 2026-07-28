@@ -115,7 +115,7 @@ Create (or allow auto-create of) these labels:
 
 1. Create a Story/Task in the project.
 2. Add label **`nfe-agent`**.
-3. If a Watch-me file already exists under `artifacts/recordings/`, also add **`nfe-recording-ready`**.
+3. If a Watch-me file already exists under `artifacts/recordings/<domain>/` (or legacy flat `artifacts/recordings/`), also add **`nfe-recording-ready`**.
 4. Put an NFE config block in the **description** (fenced `yaml` or `json`):
 
 ````markdown
@@ -141,7 +141,11 @@ credential_env:
 ```
 ````
 
-`recording` must match the file stem (e.g. `Create Claim` → `artifacts/recordings/Create Claim.json`).
+`target_url` host becomes the **app folder** (`opensource-demo.orangehrmlive.com`). `recording` is the **flow** stem (e.g. `Create Claim` → `artifacts/recordings/opensource-demo.orangehrmlive.com/create-claim.json`). Legacy flat `artifacts/recordings/Create Claim.json` still resolves.
+
+When the story includes a **workload** block, that model is **authoritative** for the k6 run (VUs, iterations, duration/stages, executor, thresholds). The Jira pipeline skips analyse’s default 1 VU × 2 smoke and emits + runs a single script with the story options. If no workload is specified, NFE keeps default smoke and labels `workload_source=default_smoke`.
+
+Jira comments and Confluence run pages report **planned/actual VUs**, **TPS / HTTP req rate**, and the workload source.
 
 ### 8. Trigger from Studio chat (primary)
 

@@ -26,6 +26,13 @@ from src.nodes import (
 
 initialize_observability()
 
+try:
+    from src.utils.workspace import ensure_workspace
+
+    ensure_workspace()
+except Exception as _ws_err:
+    logging.getLogger("AgentGraph").warning("Workspace init skipped: %s", _ws_err)
+
 logger = logging.getLogger("AgentGraph")
 
 try:

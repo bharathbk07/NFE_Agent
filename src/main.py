@@ -82,6 +82,12 @@ def _final_ai_text(result: Dict[str, Any]) -> str:
 async def run_graph(initial_state: Dict[str, Any]) -> Dict[str, Any]:
     """Invoke the compiled LangGraph workflow."""
     initialize_observability()
+    try:
+        from src.utils.workspace import ensure_workspace
+
+        ensure_workspace()
+    except Exception as ws_err:
+        logger.warning("Workspace init skipped: %s", ws_err)
     logger.info("Invoking LangGraph workflow...")
     return await graph.ainvoke(initial_state)
 

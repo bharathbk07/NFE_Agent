@@ -95,8 +95,11 @@ class Settings:
     NFE_REDACT_ARTIFACTS: bool = (
         os.getenv("NFE_REDACT_ARTIFACTS", "true").lower() == "true"
     )
+    # Persist app credentials into recordings / IR / k6 scripts (per-app from Watch-Me).
+    # Default true: multi-app demos cannot rely on a single NFE_USER/NFE_PASS env pair.
+    # Still redact passwords in Jira/Confluence comments via redact_text_for_llm.
     NFE_STORE_CREDENTIALS: bool = (
-        os.getenv("NFE_STORE_CREDENTIALS", "false").lower() == "true"
+        os.getenv("NFE_STORE_CREDENTIALS", "true").lower() == "true"
     )
     NFE_SELF_HEAL_HTML_CHARS: int = int(
         os.getenv("NFE_SELF_HEAL_HTML_CHARS", "15000") or "15000"
@@ -140,6 +143,38 @@ class Settings:
     NFE_CONFLUENCE_PUBLISH: bool = os.getenv(
         "NFE_CONFLUENCE_PUBLISH", "true"
     ).lower() in ("1", "true", "yes", "on")
+
+    # k6 threshold watcher: abort early on *catastrophic* breaches (see docs)
+    NFE_K6_ABORT_ON_FAIL: bool = os.getenv(
+        "NFE_K6_ABORT_ON_FAIL", "true"
+    ).lower() in ("1", "true", "yes", "on")
+    NFE_K6_ABORT_DELAY: str = os.getenv("NFE_K6_ABORT_DELAY", "10s") or "10s"
+    # Stop when HTTP fail rate reaches this fraction (0.60 = 60% of requests failed)
+    NFE_K6_ABORT_FAIL_RATE: float = float(
+        os.getenv("NFE_K6_ABORT_FAIL_RATE", "0.60") or "0.60"
+    )
+    # Stop when p99 latency exceeds this many ms (0 = disable)
+    NFE_K6_ABORT_P99_MS: int = int(os.getenv("NFE_K6_ABORT_P99_MS", "30000") or "30000")
+    # Stop when checks pass-rate falls below this (0 = disable; 0.40 = <40% pass)
+    NFE_K6_ABORT_CHECKS_MIN: float = float(
+        os.getenv("NFE_K6_ABORT_CHECKS_MIN", "0.40") or "0.40"
+    )
+    # If true, also abortOnFail on tight SLA thresholds (1% errors, p95, …).
+    # Default false: SLA fails the test at end; only catastrophe aborts mid-run.
+    NFE_K6_SLA_ABORT_ON_FAIL: bool = os.getenv(
+        "NFE_K6_SLA_ABORT_ON_FAIL", "false"
+    ).lower() in ("1", "true", "yes", "on")
+
+    # App-scoped artifacts + local ChromaDB RAG (see docs/pipeline/app-artifacts-and-knowledge.md)
+    # Fallback app id only when no target URL exists yet (rare bootstrap).
+    NFE_DEFAULT_APP: str = os.getenv("NFE_DEFAULT_APP", "").strip()
+    NFE_RAG_ENABLED: bool = os.getenv("NFE_RAG_ENABLED", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    NFE_RAG_TOP_K: int = int(os.getenv("NFE_RAG_TOP_K", "4") or "4")
 
     # Project MCP registry (single file for all MCP server definitions)
     # Default: <repo>/config/mcp_servers.json

@@ -123,6 +123,64 @@ def _summarize_analysis_context(state: Dict[str, Any]) -> str:
     return text
 
 
+def _knowledge_context(state: Dict[str, Any], question: str) -> str:
+    """Build markdown + RAG context for Analysis QA (soft-fails)."""
+    parts: List[str] = []
+    app = str(state.get("app") or "")
+    flow = str(state.get("flow") or state.get("recording_label") or "")
+    target_url = str(state.get("target_url") or "")
+    if not app and target_url:
+        try:
+            from src.utils.app_registry import resolve_app_and_flow
+
+            app, flow = resolve_app_and_flow(
+                target_url=target_url,
+                label=flow,
+            )
+        except Exception:
+            pass
+
+    try:
+        from src.utils.knowledge_store import read_flow, read_overview
+
+        if app and flow:
+            card = read_flow(app, flow)
+            if card:
+                parts.append(f"### Direct flow card (`{app}/{flow}`)\n\n{card}")
+        if app:
+            overview = read_overview(app)
+            if overview:
+                # Keep overview short in prompt
+                if len(overview) > 1500:
+                    overview = overview[:1500] + "\n... [truncated]"
+                parts.append(f"### App overview (`{app}`)\n\n{overview}")
+    except Exception as exc:
+        logger.debug("Knowledge markdown load skipped: %s", exc)
+
+    try:
+        from src.utils.rag_store import query as rag_query
+
+        hits = rag_query(question or "", app=app or None)
+        if hits:
+            lines = ["### Retrieved from knowledge (RAG)", ""]
+            for i, hit in enumerate(hits, 1):
+                meta = hit.get("metadata") or {}
+                src = meta.get("path") or f"{meta.get('app')}/{meta.get('flow')}"
+                lines.append(f"**[{i}] Retrieved from `{src}`**")
+                lines.append(str(hit.get("text") or "")[:1200])
+                lines.append("")
+            parts.append("\n".join(lines))
+    except Exception as exc:
+        logger.debug("RAG query skipped: %s", exc)
+
+    if not parts:
+        return "(no knowledge cards or RAG hits for this app yet)"
+    text = "\n\n".join(parts)
+    if len(text) > 10000:
+        text = text[:10000] + "\n... [truncated]"
+    return text
+
+
 class AnalysisQAAgent:
     """Answers follow-up questions from existing pipeline state without reruns."""
 
@@ -139,6 +197,7 @@ class AnalysisQAAgent:
         from src.utils.k6_generator import generate_k6_script
         from src.utils.load_test_ir import build_load_test_ir
         from src.utils.artifacts import save_k6_script, save_load_test_ir
+        from src.utils.app_registry import resolve_app_and_flow
 
         records = state.get("run_records") or []
         network = []
@@ -147,6 +206,11 @@ class AnalysisQAAgent:
         user_steps = state.get("user_journey_steps") or []
         sub_tasks = state.get("sub_tasks") or []
         target_url = state.get("target_url") or ""
+        app, flow = resolve_app_and_flow(
+            target_url=target_url,
+            label=state.get("flow") or state.get("recording_label") or "",
+            explicit_app=state.get("app") or "",
+        )
 
         txn_agent = TransactionAgent()
         transactions = await txn_agent.group_transactions(
@@ -161,6 +225,7 @@ class AnalysisQAAgent:
             dependencies=state.get("dependencies") or [],
             transactions=transactions,
             network_requests=network,
+            credentials=state.get("credentials") or {},
         )
         k6_script = generate_k6_script(
             target_url=target_url,
@@ -172,8 +237,12 @@ class AnalysisQAAgent:
         )
         k6_file: Dict[str, str] = {}
         try:
-            k6_file = save_k6_script(k6_script, target_url=target_url)
-            save_load_test_ir(load_test_ir, target_url=target_url)
+            k6_file = save_k6_script(
+                k6_script, target_url=target_url, app=app, flow=flow
+            )
+            save_load_test_ir(
+                load_test_ir, target_url=target_url, app=app, flow=flow
+            )
         except Exception as art_err:
             logger.warning("Failed to write k6 artifact: %s", art_err)
 
@@ -269,9 +338,11 @@ class AnalysisQAAgent:
             return "\n\n".join(parts)
 
         context = _summarize_analysis_context(state)
+        knowledge = _knowledge_context(state, question)
         prompt = render_prompt(
             "analysis_qa",
             context=context,
+            knowledge=knowledge,
             question=question,
         )
         router = get_model_router()

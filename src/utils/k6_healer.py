@@ -126,6 +126,7 @@ def heal_load_test_ir(
             healed["transactions"],
             healed["correlations"],
             origin=str(healed.get("origin") or ""),
+            vars_list=list(healed.get("vars") or []),
         )
         after_bodies = _auth_validate_tokens(healed["transactions"])
         if before_bodies != after_bodies:
@@ -153,6 +154,7 @@ def heal_load_test_ir(
         healed["transactions"],
         healed["correlations"],
         origin=str(healed.get("origin") or ""),
+        vars_list=list(healed.get("vars") or []),
     )
     if not before_auth and _has_auth_post_local(healed["transactions"]):
         notes.append("Injected missing login POST + CSRF token extract.")

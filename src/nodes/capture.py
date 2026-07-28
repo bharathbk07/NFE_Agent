@@ -221,13 +221,23 @@ async def watch_me_record(state: AgentState) -> Dict[str, Any]:
     recording_meta: Dict[str, str] = {}
     try:
         from src.utils.recording_store import save_watch_me_recording
+        from src.utils.app_registry import resolve_app_and_flow
 
+        label = state.get("recording_label") or state.get("flow") or ""
+        app, flow = resolve_app_and_flow(
+            target_url=url,
+            label=label,
+            explicit_app=state.get("app") or "",
+        )
         recording_meta = save_watch_me_recording(
             target_url=url,
             user_journey_steps=recorded_steps,
             run_records=run_records,
             credentials=state.get("credentials") or {},
             sub_tasks=state.get("sub_tasks") or [],
+            label=label,
+            app=app,
+            flow=flow,
         )
     except Exception as save_err:
         logger.warning("Failed to save Watch-me recording: %s", save_err)
@@ -239,7 +249,7 @@ async def watch_me_record(state: AgentState) -> Dict[str, Any]:
             "(reuse later with **analyse saved recording**)."
         )
 
-    return {
+    out: Dict[str, Any] = {
         "user_journey_steps": recorded_steps,
         "run_records": run_records,
         "recording_mode": "watch_me",
@@ -256,6 +266,11 @@ async def watch_me_record(state: AgentState) -> Dict[str, Any]:
             )
         ],
     }
+    if recording_meta.get("app"):
+        out["app"] = recording_meta["app"]
+    if recording_meta.get("flow"):
+        out["flow"] = recording_meta["flow"]
+    return out
 
 
 async def replay_recorded_journey(state: AgentState) -> Dict[str, Any]:
@@ -360,13 +375,23 @@ async def replay_recorded_journey(state: AgentState) -> Dict[str, Any]:
     # Refresh on-disk recording with Run 1 + Run 2 for full reuse.
     try:
         from src.utils.recording_store import save_watch_me_recording
+        from src.utils.app_registry import resolve_app_and_flow
 
+        label = state.get("recording_label") or state.get("flow") or ""
+        app, flow = resolve_app_and_flow(
+            target_url=url,
+            label=label,
+            explicit_app=state.get("app") or "",
+        )
         save_watch_me_recording(
             target_url=url,
             user_journey_steps=steps,
             run_records=run_records,
             credentials=state.get("credentials") or {},
             sub_tasks=state.get("sub_tasks") or [],
+            label=label,
+            app=app,
+            flow=flow,
         )
     except Exception as save_err:
         logger.warning("Failed to update Watch-me recording after replay: %s", save_err)
@@ -405,10 +430,49 @@ async def load_saved_recording(state: AgentState) -> Dict[str, Any]:
     cleaned = (text or "").strip()
 
     if re.search(r"\blist\s+recordings\b|\bsaved\s+recordings\b", cleaned, re.I):
-        rows = list_recordings()
+        app_hint = ""
+        try:
+            from src.utils.app_registry import app_id_from_url
+
+            app_hint = state.get("app") or app_id_from_url(state.get("target_url") or "")
+        except Exception:
+            app_hint = state.get("app") or ""
+        # Optional: "list recordings for opensource-demo.orangehrmlive.com"
+        m = re.search(r"\b(?:for|app|on)\s+([a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+)", cleaned)
+        if m:
+            app_hint = m.group(1)
+        rows = list_recordings(app=app_hint)
+        # Natural-language RAG suggestions when filtering by free text
+        rag_note = ""
+        free = re.sub(
+            r"\b(list|saved|recordings?|for|app|on|the|me|please)\b",
+            " ",
+            cleaned,
+            flags=re.I,
+        )
+        free = re.sub(r"\s+", " ", free).strip()
+        if free and len(free) > 3:
+            try:
+                from src.utils.rag_store import query as rag_query
+
+                hits = rag_query(free, app=app_hint or None, top_k=3)
+                if hits:
+                    sug = []
+                    for hit in hits:
+                        meta = hit.get("metadata") or {}
+                        a = meta.get("app") or ""
+                        f = meta.get("flow") or meta.get("kind") or ""
+                        if a:
+                            sug.append(f"`{a}/{f}`" if f else f"`{a}`")
+                    if sug:
+                        rag_note = "\n\n**Similar from knowledge:** " + ", ".join(sug)
+            except Exception:
+                pass
         return {
             "watch_me_status": "listed",
-            "messages": [AIMessage(content=format_recordings_list(rows))],
+            "messages": [
+                AIMessage(content=format_recordings_list(rows) + rag_note)
+            ],
         }
 
     # Strip command words to leave host/path hint
@@ -421,7 +485,11 @@ async def load_saved_recording(state: AgentState) -> Dict[str, Any]:
     )
     hint = re.sub(r"\s+", " ", hint).strip()
 
-    path = resolve_recording_path(hint)
+    path = resolve_recording_path(
+        hint,
+        app=state.get("app") or "",
+        flow=state.get("flow") or "",
+    )
     if path is None:
         rows = list_recordings()
         return {

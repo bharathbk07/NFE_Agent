@@ -45,6 +45,78 @@ def test_url_allowlist():
     )
 
 
+def test_redact_step_keeps_password_when_store_enabled(monkeypatch):
+    from src.security import secrets as sec
+
+    monkeypatch.setattr(sec.settings, "NFE_STORE_CREDENTIALS", True)
+    out = sec.redact_step(
+        {"action": "fill", "selector": 'input[name="password"]', "value": "admin123"}
+    )
+    assert out["value"] == "admin123"
+
+
+def test_redact_step_wipes_password_when_store_disabled(monkeypatch):
+    from src.security import secrets as sec
+
+    monkeypatch.setattr(sec.settings, "NFE_STORE_CREDENTIALS", False)
+    out = sec.redact_step(
+        {"action": "fill", "selector": 'input[name="password"]', "value": "admin123"}
+    )
+    assert out["value"] == "***REDACTED***"
+
+
+def test_k6_embeds_password_literal(monkeypatch):
+    from src.utils.k6_generator import _var_js_assignment
+
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_STORE_CREDENTIALS", True
+    )
+    line = _var_js_assignment(
+        {"name": "password", "value": "admin123", "is_credential": True}
+    )
+    assert "admin123" in line
+    assert "__ENV" not in line
+
+
+def test_parameter_agent_restores_redacted_password():
+    from src.agents.parameter_agent import ParameterAgent
+
+    agent = ParameterAgent()
+    cands = agent.analyze(
+        user_steps=[
+            {
+                "action": "fill",
+                "selector": 'input[name="password"][type="password"]',
+                "value": "***REDACTED***",
+            }
+        ],
+        run1_requests=[],
+        credentials={"username": "Admin", "password": "admin123"},
+    )
+    assert any(
+        c.get("variable_name") == "password" and c.get("value") == "admin123"
+        for c in cands
+    )
+
+
+def test_build_ir_seeds_credentials(monkeypatch):
+    from src.utils.load_test_ir import build_load_test_ir
+
+    monkeypatch.setattr(
+        "config.settings.settings.NFE_STORE_CREDENTIALS", True
+    )
+    ir = build_load_test_ir(
+        target_url="https://example.com/login",
+        parameterizable_candidates=[],
+        dependencies=[],
+        transactions=[],
+        credentials={"username": "Admin", "password": "admin123"},
+    )
+    by_name = {v["name"]: v for v in ir["vars"]}
+    assert by_name["password"]["value"] == "admin123"
+    assert by_name["username"]["value"] == "Admin"
+
+
 def test_credential_placeholders_and_substitute():
     creds = {"username": "Admin", "password": "s3cret"}
     ph = credentials_placeholders(creds)
