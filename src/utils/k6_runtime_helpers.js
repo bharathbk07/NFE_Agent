@@ -22,6 +22,128 @@ function nfeReqTags(txn, method, url, status) {
   };
 }
 
+/** Resolve ``$.a.0.b`` / ``a.b`` against a parsed JSON value. */
+function nfeJsonPathExists(obj, path) {
+  var p = String(path || '').replace(/^\$\.?/, '');
+  if (!p) return obj !== undefined && obj !== null;
+  var parts = p.split('.');
+  var cur = obj;
+  for (var i = 0; i < parts.length; i++) {
+    if (cur === undefined || cur === null) return false;
+    var key = parts[i];
+    if (Array.isArray(cur)) {
+      var idx = parseInt(key, 10);
+      if (isNaN(idx) || idx < 0 || idx >= cur.length) return false;
+      cur = cur[idx];
+      continue;
+    }
+    if (typeof cur !== 'object') return false;
+    if (!(key in cur)) return false;
+    cur = cur[key];
+  }
+  return cur !== undefined && cur !== null;
+}
+
+/**
+ * Evaluate IR content assertion; returns true when content checks fail.
+ * Also registers k6 check() entries via the shared ``checks`` object.
+ */
+function nfeApplyContentAssertion(res, txn, method, assertion, checks) {
+  if (!assertion) return false;
+  var failed = false;
+  var bodyStr = res ? String(res.body || '') : '';
+  var status = res ? res.status : 0;
+
+  if (assertion.expect_status && assertion.expect_status.length) {
+    checks[txn + ' ' + method + ' expect status'] = function (r) {
+      if (!r || !r.status) return false;
+      if (r.status >= 500 && r.status < 600) return true;
+      for (var i = 0; i < assertion.expect_status.length; i++) {
+        if (r.status === assertion.expect_status[i]) return true;
+      }
+      return false;
+    };
+    var statusOk = false;
+    if (status >= 500 && status < 600) statusOk = true;
+    else {
+      for (var si = 0; si < assertion.expect_status.length; si++) {
+        if (status === assertion.expect_status[si]) {
+          statusOk = true;
+          break;
+        }
+      }
+    }
+    if (!statusOk) failed = true;
+  }
+
+  if (assertion.body_contains && assertion.body_contains.length) {
+    for (var ci = 0; ci < assertion.body_contains.length; ci++) {
+      (function (needle, idx) {
+        var short = needle.length > 24 ? needle.slice(0, 21) + '...' : needle;
+        var label = txn + ' ' + method + ' body contains [' + idx + '] ' + short;
+        checks[label] = function (r) {
+          if (!r) return false;
+          if (r.status >= 500 && r.status < 600) return true;
+          return String(r.body || '').indexOf(needle) >= 0;
+        };
+        if (!(status >= 500 && status < 600) && bodyStr.indexOf(needle) < 0) {
+          failed = true;
+        }
+      })(String(assertion.body_contains[ci]), ci);
+    }
+  }
+
+  if (assertion.body_not_contains && assertion.body_not_contains.length) {
+    for (var ni = 0; ni < assertion.body_not_contains.length; ni++) {
+      (function (needle, idx) {
+        var short = needle.length > 24 ? needle.slice(0, 21) + '...' : needle;
+        var label = txn + ' ' + method + ' body not contains [' + idx + '] ' + short;
+        checks[label] = function (r) {
+          if (!r) return false;
+          if (r.status >= 500 && r.status < 600) return true;
+          return String(r.body || '').indexOf(needle) < 0;
+        };
+        if (!(status >= 500 && status < 600) && bodyStr.indexOf(needle) >= 0) {
+          failed = true;
+        }
+      })(String(assertion.body_not_contains[ni]), ni);
+    }
+  }
+
+  if (assertion.json_path_exists && assertion.json_path_exists.length) {
+    var parsed = null;
+    var parseOk = false;
+    try {
+      if (res && res.body) {
+        parsed = typeof res.json === 'function' ? res.json() : JSON.parse(bodyStr);
+        parseOk = true;
+      }
+    } catch (e) {
+      parseOk = false;
+    }
+    for (var ji = 0; ji < assertion.json_path_exists.length; ji++) {
+      (function (jp) {
+        var label = txn + ' ' + method + ' json path ' + jp;
+        checks[label] = function (r) {
+          if (!r) return false;
+          if (r.status >= 500 && r.status < 600) return true;
+          try {
+            var data = typeof r.json === 'function' ? r.json() : JSON.parse(String(r.body || ''));
+            return nfeJsonPathExists(data, jp);
+          } catch (e2) {
+            return false;
+          }
+        };
+        if (!(status >= 500 && status < 600)) {
+          if (!parseOk || !nfeJsonPathExists(parsed, jp)) failed = true;
+        }
+      })(String(assertion.json_path_exists[ji]));
+    }
+  }
+
+  return failed;
+}
+
 /**
  * Record request metrics + checks.
  * Returns true when the request is considered failed (for TXN roll-up).
@@ -94,6 +216,15 @@ function nfeAssertResponse(res, txn, method, opts) {
       return r.status >= 200 && r.status < 400;
     };
   }
+
+  var contentFailed = nfeApplyContentAssertion(
+    res,
+    txn,
+    method,
+    opts.assertion,
+    checks
+  );
+
   check(res, checks);
   if (requireAuthSession && res && !reqFailed) {
     var finalUrl = String(res.url || '');
@@ -105,6 +236,10 @@ function nfeAssertResponse(res, txn, method, opts) {
       reqFailed = true;
       nfeReqFail.add(1, nfeReqTags(txn, method, url, String(status || '200')));
     }
+  }
+  if (contentFailed && !reqFailed) {
+    reqFailed = true;
+    nfeReqFail.add(1, nfeReqTags(txn, method, url, String(status || '')));
   }
   return reqFailed;
 }

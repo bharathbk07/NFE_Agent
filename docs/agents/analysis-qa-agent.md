@@ -15,12 +15,26 @@
 
 ## What it does
 
-Uses existing `AgentState` (correlations, parameters, TXNs, artifacts) to answer questions like:
+Uses existing `AgentState` (correlations, parameters, TXNs, artifacts, **smoke results**) plus **local knowledge markdown + Chroma RAG** to answer questions like:
 
 - “Which values are correlated for login?”  
 - “What parameters were detected?”  
+- “Did smoke pass? What’s the p95?”  
+- “Show trend across recent runs”
 
 If the question mentions TXNs / k6 / script generation, it can **rebuild** transactions and regenerate IR/k6 from stored captures, then answer.
+
+### Cache-first retrieval (trends / results)
+
+```text
+1. Session state (k6_smoke, artifact paths, Confluence URLs already in thread)
+2. Knowledge markdown (flow card + runs/<flow>_*.md history)
+3. Chroma RAG over knowledge
+4. Tool refresh (Confluence sync → write back to knowledge/RAG) only on miss
+   or explicit “from Confluence / refresh”; monitoring stub for future tools
+```
+
+Chat does **not** hit Confluence or monitoring on every question.
 
 ---
 
@@ -33,7 +47,7 @@ Re-capturing for every follow-up is slow and flaky. In-thread Q&A keeps the Stud
 ## How it works
 
 1. Intent router selects `analysis_qa`.
-2. Optional rebuild of TXN + k6 when keywords match.
+2. Optional rebuild of TXN + k6 only when the user clearly asks to regenerate the script.
 3. Summarize bounded analysis context → LLM answer.
 4. If LLM fails → rule-based fallback summary.
 
@@ -63,9 +77,11 @@ Requires prior analysis context in the same LangGraph thread (or enough state fi
 
 ## Security techniques
 
-- Context pack is **truncated** (~12k) before the LLM.
+- Context pack is **truncated** (~12k) and passed through `redact_text_for_llm` before the LLM.
+- Run-history markdown is redacted before disk/RAG upsert.
 - Still may include sample parameter/correlation values — treat shared Studio threads carefully.
 - No new navigation → URL policy not re-invoked for browsing.
+- Confluence refresh (when used) stays under the configured space / NFE parent hierarchy — no arbitrary page URLs from chat.
 
 ---
 
@@ -78,6 +94,11 @@ Requires prior analysis context in the same LangGraph thread (or enough state fi
 ---
 
 ## Related
+
+- [Overview](overview.md)
+- [Smoke + self-heal](../pipeline/smoke-and-self-heal.md)
+- [App artifacts & knowledge](../pipeline/app-artifacts-and-knowledge.md) — run history + RAG ladder
+- Helpers: [`perf_trend.py`](../../src/utils/perf_trend.py), [`perf_evidence.py`](../../src/utils/perf_evidence.py), [`knowledge_store.ingest_run_history`](../../src/utils/knowledge_store.py)
 
 - [Intent router](intent-router.md) — routes here  
 - [Transaction agent](transaction-agent.md) — rebuild helper  

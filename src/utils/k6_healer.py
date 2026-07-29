@@ -60,10 +60,17 @@ def heal_load_test_ir(
     if chrome_dropped:
         notes.append(f"Removed {chrome_dropped} non-critical/chrome GET request(s).")
 
-    # 2) Soften checks ONLY on non-critical GETs (never soft 401-prone APIs)
+    # 2) Soften checks ONLY on non-critical GETs (never soft 401-prone APIs
+    # or per-TXN content assertion anchors)
     soft = 0
+    content_assert_hits = _smoke_indicates_content_assertion_failure(smoke_result)
     for txn in healed["transactions"]:
         for r in txn.get("requests") or []:
+            if r.get("assertion_anchor") or r.get("assertion"):
+                # Never soft-pass the one important request per TXN
+                if r.get("soft_check"):
+                    r["soft_check"] = False
+                continue
             method = str(r.get("method") or "GET").upper()
             if method != "GET":
                 continue
@@ -83,6 +90,11 @@ def heal_load_test_ir(
                 soft += 1
     if soft:
         notes.append(f"Relaxed status checks on {soft} non-critical GET request(s).")
+    if content_assert_hits:
+        notes.append(
+            "Content assertion failed — likely correlation/script issue; "
+            "not softening anchor request(s)."
+        )
 
     # 3) Dedupe correlation vars that collide on the same name
     before = len(healed["correlations"])
@@ -196,6 +208,16 @@ def heal_load_test_ir(
         notes.append(
             "No deterministic heal applied — review failed checks and correlations."
         )
+
+    # Re-select per-TXN content assertion anchors after request list changes
+    from src.utils.load_test_ir import apply_txn_anchor_assertions
+
+    apply_txn_anchor_assertions(
+        healed["transactions"],
+        healed.get("correlations") or [],
+        network_requests=None,
+    )
+
     healed["heal_notes"] = list(healed.get("heal_notes") or []) + notes
     healed["heal_attempt"] = attempt
     return healed, notes
@@ -227,6 +249,25 @@ def _smoke_indicates_401(smoke_result: Dict[str, Any]) -> bool:
         return True
     return False
 
+
+def _smoke_indicates_content_assertion_failure(smoke_result: Dict[str, Any]) -> bool:
+    """Return True when failed checks mention content assertion labels."""
+    fails = smoke_result.get("failed_checks") or []
+    blob = " ".join(str(x) for x in fails).lower()
+    if not blob:
+        blob = " ".join(
+            [
+                str(smoke_result.get("stdout") or ""),
+                str(smoke_result.get("stderr") or ""),
+            ]
+        ).lower()
+    markers = (
+        "expect status",
+        "body contains",
+        "body not contains",
+        "json path",
+    )
+    return any(m in blob for m in markers)
 
 def _smoke_indicates_stale_resource_id(smoke_result: Dict[str, Any]) -> bool:
     """Return True when smoke shows 403/404 on create-resource path ids."""

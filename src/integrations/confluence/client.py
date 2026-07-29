@@ -295,3 +295,38 @@ class ConfluenceClient:
             f"{self.base_url}/wiki/download/attachments/{page_id}/"
             f"{quote(filename)}"
         )
+
+    def list_child_pages(
+        self,
+        parent_id: str,
+        *,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """List direct child pages of ``parent_id`` (newest first when possible)."""
+        if not parent_id:
+            return []
+        with self._client() as client:
+            resp = client.get(
+                f"{self._api}/content/{parent_id}/child/page",
+                params={
+                    "limit": max(1, min(100, int(limit))),
+                    "expand": "version,body.storage",
+                },
+            )
+            _raise_for_status(resp, context="list child pages")
+            results = list((resp.json() or {}).get("results") or [])
+        # Prefer Run pages; sort by title descending (timestamps in title)
+        results.sort(key=lambda p: str(p.get("title") or ""), reverse=True)
+        return results
+
+    def list_attachments(self, page_id: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """List attachments on a page."""
+        if not page_id:
+            return []
+        with self._client() as client:
+            resp = client.get(
+                f"{self._api}/content/{page_id}/child/attachment",
+                params={"limit": max(1, min(100, int(limit))), "expand": "version"},
+            )
+            _raise_for_status(resp, context="list attachments")
+            return list((resp.json() or {}).get("results") or [])

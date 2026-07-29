@@ -34,8 +34,11 @@ artifacts/
   recordings/<domain>/<flow>.json
   knowledge/<domain>/overview.md
   knowledge/<domain>/flows/<flow>.md
+  knowledge/<domain>/runs/<flow>_<timestamp>.md   # per-run KPIs (ingest after smoke)
   rag/chroma/                 # Chroma persistent client
 ```
+
+After each analyse / Jira smoke, NFE **ingests** KPI cards under `runs/` and upserts them into Chroma. Analysis QA answers trends from this local store first; Confluence/monitoring are optional sync sources that write back here.
 
 ## Initialization
 

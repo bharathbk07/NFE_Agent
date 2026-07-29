@@ -24,8 +24,22 @@ def _summarize_analysis_context(state: Dict[str, Any]) -> str:
     Returns:
         A bounded JSON string suitable for the QA model prompt.
     """
+    from src.security.secrets import redact_text_for_llm
+
+    perf = state.get("performance_test_output") or {}
+    arts = perf.get("artifacts") or {}
+    smoke = perf.get("k6_smoke") or state.get("k6_smoke") or {}
+    confluence = perf.get("confluence") or {}
+    ir = perf.get("load_test_ir") or state.get("load_test_ir") or {}
+    if not isinstance(ir, dict):
+        ir = {}
+    workload = ir.get("workload") or {}
+
+    k6_file = arts.get("k6_file") if isinstance(arts.get("k6_file"), dict) else {}
     payload: Dict[str, Any] = {
         "target_url": state.get("target_url"),
+        "app": state.get("app"),
+        "flow": state.get("flow") or state.get("recording_label"),
         "sub_tasks": state.get("sub_tasks") or [],
         "parameterization": [],
         "correlations": {
@@ -34,18 +48,42 @@ def _summarize_analysis_context(state: Dict[str, Any]) -> str:
             "summary": "",
         },
         "transactions": state.get("transactions")
-        or (state.get("performance_test_output") or {}).get("transactions")
+        or perf.get("transactions")
         or [],
         "artifacts": {
-            "has_har": bool(
-                ((state.get("performance_test_output") or {}).get("artifacts") or {}).get("har")
-            ),
-            "has_k6_script": bool(
-                ((state.get("performance_test_output") or {}).get("artifacts") or {}).get(
-                    "k6_script"
-                )
-            ),
+            "has_har": bool(arts.get("har")),
+            "has_k6_script": bool(arts.get("k6_script")),
+            "k6_path": k6_file.get("path") or arts.get("k6_path") or "",
+            "ir_path": arts.get("ir_path") or "",
+            "html_report": smoke.get("html_report") or "",
+            "summary_json": smoke.get("summary_json") or "",
         },
+        "k6_smoke": {
+            "ok": smoke.get("ok"),
+            "skipped": smoke.get("skipped"),
+            "summary": str(smoke.get("summary") or "")[:800],
+            "failed_checks": list(smoke.get("failed_checks") or [])[:20],
+            "failed_urls": list(smoke.get("failed_urls") or [])[:20],
+            "status_counts": dict(smoke.get("status_counts") or {}),
+            "heal_notes": list(smoke.get("heal_notes") or [])[:15],
+            "exit_code": smoke.get("exit_code"),
+            "assertion_gate_failed": smoke.get("assertion_gate_failed"),
+        },
+        "workload": {
+            "vus": workload.get("vus"),
+            "iterations": workload.get("iterations"),
+            "executor": workload.get("executor"),
+            "pacing_s": workload.get("pacing_s"),
+            "think_time_s": workload.get("think_time_s"),
+            "thresholds": workload.get("thresholds") or {},
+        },
+        "confluence": {
+            "published": confluence.get("published"),
+            "run_url": confluence.get("run_url") or "",
+            "flow_url": confluence.get("flow_url") or "",
+            "skipped_reason": confluence.get("skipped_reason") or "",
+        },
+        "evidence_sources": ["session"],
     }
 
     for cand in state.get("parameterizable_candidates") or []:
@@ -80,7 +118,6 @@ def _summarize_analysis_context(state: Dict[str, Any]) -> str:
 
     # Prefer the normalized report structure because it may contain richer
     # post-processing than the raw detector state.
-    perf = state.get("performance_test_output") or {}
     corr = perf.get("correlation") or {}
     if corr.get("extract_pass"):
         payload["correlations"]["extract_pass"] = corr.get("extract_pass")
@@ -116,16 +153,15 @@ def _summarize_analysis_context(state: Dict[str, Any]) -> str:
             f"{len(deps)} extract→pass correlation link(s) were traced."
         )
 
-    # Keep prompt size bounded
+    # Keep prompt size bounded + redact secrets
     text = json.dumps(payload, indent=2, default=str)
+    text = redact_text_for_llm(text)
     if len(text) > 12000:
         text = text[:12000] + "\n... [truncated]"
     return text
 
 
-def _knowledge_context(state: Dict[str, Any], question: str) -> str:
-    """Build markdown + RAG context for Analysis QA (soft-fails)."""
-    parts: List[str] = []
+def _resolve_app_flow(state: Dict[str, Any]) -> tuple[str, str]:
     app = str(state.get("app") or "")
     flow = str(state.get("flow") or state.get("recording_label") or "")
     target_url = str(state.get("target_url") or "")
@@ -139,6 +175,15 @@ def _knowledge_context(state: Dict[str, Any], question: str) -> str:
             )
         except Exception:
             pass
+    return app, flow or "default"
+
+
+def _knowledge_context(state: Dict[str, Any], question: str) -> str:
+    """Build markdown + RAG + local trend context for Analysis QA (soft-fails)."""
+    parts: List[str] = []
+    sources: List[str] = []
+    app, flow = _resolve_app_flow(state)
+    target_url = str(state.get("target_url") or "")
 
     try:
         from src.utils.knowledge_store import read_flow, read_overview
@@ -146,22 +191,61 @@ def _knowledge_context(state: Dict[str, Any], question: str) -> str:
         if app and flow:
             card = read_flow(app, flow)
             if card:
+                sources.append("knowledge_markdown")
                 parts.append(f"### Direct flow card (`{app}/{flow}`)\n\n{card}")
         if app:
             overview = read_overview(app)
             if overview:
-                # Keep overview short in prompt
                 if len(overview) > 1500:
                     overview = overview[:1500] + "\n... [truncated]"
                 parts.append(f"### App overview (`{app}`)\n\n{overview}")
     except Exception as exc:
         logger.debug("Knowledge markdown load skipped: %s", exc)
 
+    # Local trends + optional Confluence refresh (cache-first)
+    try:
+        from src.utils.perf_evidence import gather_evidence_for_question
+        from src.utils.perf_trend import wants_trend_question
+
+        if app and (
+            wants_trend_question(question)
+            or "result" in (question or "").lower()
+            or "p95" in (question or "").lower()
+            or "smoke" in (question or "").lower()
+        ):
+            evidence = gather_evidence_for_question(
+                question,
+                app=app,
+                flow=flow,
+                target_url=target_url,
+            )
+            for s in evidence.get("sources") or []:
+                if s not in sources:
+                    sources.append(s)
+            trend_md = evidence.get("trend_markdown") or ""
+            notes = evidence.get("notes") or []
+            block = ["### Local run history / trends", ""]
+            if sources:
+                block.append(f"_Evidence sources: {', '.join(sources)}_")
+                block.append("")
+            if trend_md:
+                block.append(trend_md)
+            if notes:
+                block.append("")
+                block.append("**Notes:**")
+                for n in notes:
+                    block.append(f"- {n}")
+            parts.append("\n".join(block))
+    except Exception as exc:
+        logger.debug("Trend/evidence pack skipped: %s", exc)
+
     try:
         from src.utils.rag_store import query as rag_query
 
         hits = rag_query(question or "", app=app or None)
         if hits:
+            if "rag" not in sources:
+                sources.append("rag")
             lines = ["### Retrieved from knowledge (RAG)", ""]
             for i, hit in enumerate(hits, 1):
                 meta = hit.get("metadata") or {}
@@ -174,7 +258,10 @@ def _knowledge_context(state: Dict[str, Any], question: str) -> str:
         logger.debug("RAG query skipped: %s", exc)
 
     if not parts:
-        return "(no knowledge cards or RAG hits for this app yet)"
+        return (
+            "(no knowledge cards, run history, or RAG hits for this app yet — "
+            "complete a smoke run to ingest KPIs locally)"
+        )
     text = "\n\n".join(parts)
     if len(text) > 10000:
         text = text[:10000] + "\n... [truncated]"
@@ -434,9 +521,22 @@ class AnalysisQAAgent:
                     f"- `{p.get('variable_name')}` ← `{p.get('selector')}` = `{p.get('value')}`"
                 )
 
+        smoke = (state.get("performance_test_output") or {}).get("k6_smoke") or {}
+        if smoke and any(
+            k in q for k in ("smoke", "p95", "result", "fail", "sla", "report", "trend")
+        ):
+            lines.append("\n**Last smoke / results (session):**\n")
+            lines.append(f"- ok: `{smoke.get('ok')}` skipped: `{smoke.get('skipped')}`")
+            if smoke.get("summary"):
+                lines.append(f"- summary: {smoke.get('summary')}")
+            fails = smoke.get("failed_checks") or []
+            if fails:
+                lines.append("- failed checks: " + ", ".join(f"`{f}`" for f in fails[:8]))
+
         if len(lines) == 1:
             lines.append(
                 "I still have the prior analysis in context. Ask about correlations, tokens, "
-                "parameters, or a specific request — or say **run again** to re-execute the journey."
+                "parameters, smoke results, trends, or a specific request — or say **run again** "
+                "to re-execute the journey."
             )
         return "\n".join(lines)

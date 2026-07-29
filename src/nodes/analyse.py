@@ -356,12 +356,48 @@ Please verify the user journey steps or selectors. If credentials are required, 
                 "exit_code": None,
             }
         else:
-            smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
+            from src.utils.k6_assertion_gate import (
+                assertion_coverage_failure_result,
+                prepare_ir_and_script_for_smoke,
+            )
+
+            load_test_ir, k6_script, assert_ok, assert_notes = (
+                prepare_ir_and_script_for_smoke(
+                    load_test_ir,
+                    k6_script,
+                    network_requests=run1.get("network_requests") or [],
+                )
+            )
+            heal_notes.extend(assert_notes)
+            if assert_notes:
+                k6_file = save_k6_script(
+                    k6_script,
+                    target_url=state["target_url"],
+                    filename=k6_file.get("filename") or (names or {}).get("script"),
+                    app=app_id,
+                    flow=flow_id,
+                )
+                save_load_test_ir(
+                    load_test_ir,
+                    target_url=state["target_url"],
+                    filename=(names or {}).get("ir"),
+                    app=app_id,
+                    flow=flow_id,
+                )
+            if not assert_ok:
+                logger.warning(
+                    "Assertion coverage gate blocked k6 smoke: %s",
+                    "; ".join(assert_notes[:5]),
+                )
+                smoke_result = assertion_coverage_failure_result(assert_notes)
+            else:
+                smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
             max_heals = 2
             attempt = 0
             while (
-                not smoke_result.get("ok")
+                smoke_result.get("ok") is False
                 and not smoke_result.get("skipped")
+                and not smoke_result.get("assertion_gate_failed")
                 and attempt < max_heals
             ):
                 attempt += 1
@@ -377,6 +413,14 @@ Please verify the user journey steps or selectors. If credentials are required, 
                     network_requests=run1.get("network_requests") or [],
                     ir=load_test_ir,
                 )
+                load_test_ir, k6_script, assert_ok, assert_notes = (
+                    prepare_ir_and_script_for_smoke(
+                        load_test_ir,
+                        k6_script,
+                        network_requests=run1.get("network_requests") or [],
+                    )
+                )
+                heal_notes.extend(assert_notes)
                 # Overwrite the same script/IR for this flow (no extra artifacts).
                 k6_file = save_k6_script(
                     k6_script,
@@ -392,6 +436,14 @@ Please verify the user journey steps or selectors. If credentials are required, 
                     app=app_id,
                     flow=flow_id,
                 )
+                if not assert_ok:
+                    logger.warning(
+                        "Assertion coverage gate blocked k6 after heal %s: %s",
+                        attempt,
+                        "; ".join(assert_notes[:5]),
+                    )
+                    smoke_result = assertion_coverage_failure_result(assert_notes)
+                    break
                 smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
                 if smoke_result.get("ok"):
                     heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
@@ -500,6 +552,20 @@ Please verify the user journey steps or selectors. If credentials are required, 
                 smoke_status=smoke_status,
                 step_count=len(user_steps or []),
             )
+            try:
+                from src.utils.knowledge_store import ingest_run_history
+
+                ingest_run_history(
+                    app_id,
+                    flow_id or "default",
+                    smoke=smoke_result or {},
+                    workload_source="analyse_smoke",
+                    k6_path=(k6_file or {}).get("path") or "",
+                    summary_json=str((smoke_result or {}).get("summary_json") or ""),
+                    target_url=state.get("target_url") or "",
+                )
+            except Exception as run_err:
+                logger.warning("Run history ingest skipped: %s", run_err)
     except Exception as know_err:
         logger.warning("Knowledge upsert skipped: %s", know_err)
 

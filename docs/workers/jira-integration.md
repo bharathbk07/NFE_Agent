@@ -4,7 +4,7 @@ NFE Agent can pick up **Jira Cloud** stories labeled **`nfe-agent`**, check for 
 
 | Path | Role |
 |------|------|
-| **Studio chat** (`jira_perf` intent → `run_jira_story`) | Primary trigger: “work on SCRUM-1” / “work on jira story” |
+| **Studio chat** (`jira_perf` intent → `run_jira_story`) | Only on **explicit execute** intent: “work on SCRUM-1” / “work on jira story” — mentioning Jira or an issue key in a question does **not** start the run |
 | **REST helpers** ([`src/integrations/jira/`](../../src/integrations/jira/)) | Get issue, JQL search, comments, lifecycle labels (source of truth) |
 | **CLI** (`jira_runner`) | Debug only: `--check-auth`, `--issue`, `--poll-once` |
 | **Atlassian MCP** | Optional Studio tooling (`config/mcp_servers.json` → `atlassian`, disabled by default) |

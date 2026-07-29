@@ -52,6 +52,37 @@ Top-level shape from [`build_load_test_ir`](../../src/utils/load_test_ir.py) (`v
 | `vars` | Tester-supplied / credential values (`name`, `value`, `is_credential`, optional `from_env`) |
 | `correlations` | Extract → pass edges (CSRF, request ids, cookies flagged `auto_cookie`) |
 | `transactions` | Ordered TXNs with `mode` (`protocol` or `browser`), requests, and optional `ui_steps` |
+| `workload` | Optional load model: VUs, stages, **`pacing_s`**, **`think_time_s`**, thresholds |
+
+### Think time, pacing, and per-TXN assertions
+
+| Control | IR location | k6 behavior |
+|---------|-------------|-------------|
+| **Think time** | Per TXN `think_time_s: {min, max}` (default `1`–`3`). Scalar `1` still accepted. Workload `think_time_s` overrides all TXNs. | Emitted into `CONFIG.thinkTime`; TXNs call `sleep` from CONFIG. Set `NFE_THINK_TIME=0` to disable. |
+| **Pacing** | `workload.pacing_s` (seconds, start-to-start). Omit or `0` = off. | `CONFIG.pacing_s`; at end of `default`, sleep remaining if `> 0`. |
+| **Content assertion** | One request per protocol TXN marked `assertion_anchor` with an `assertion` object (`expect_status`, `body_contains` / `body_not_contains`, `json_path_exists`). | Extra k6 `check()` entries via `nfeAssertResponse`; failures mark the TXN failed. Other requests keep lightweight status/body checks. |
+
+### Generated script layout (edit USER CONFIG only)
+
+```text
+1. imports
+2. header comment
+3. USER CONFIG — CONFIG (thinkTime, pacing_s, workload, thresholds) + vars
+4. export const options  (reads CONFIG.workload / CONFIG.thresholds)
+5. response callback + runtime helpers
+6. TXN functions
+7. export default + handleSummary
+```
+
+All human tunables (parameters, VUs, think time, pacing, thresholds) live in the **USER CONFIG** block at the top of the emitted `.js`.
+
+### Assertion coverage gate (before smoke)
+
+Before any k6 smoke/load run, NFE validates: **each protocol TXN has ≥1 valid content assertion** (N protocol TXNs ⇒ ≥N assertions). Browser TXNs are excluded from the count.
+
+If coverage is short, NFE re-applies anchors (`apply_txn_anchor_assertions`), re-emits, and re-checks. If still short, **k6 is not started** and smoke reports `assertion coverage failed` (see [Smoke + self-heal](smoke-and-self-heal.md)).
+
+Anchor selection (deterministic): correlation extract source → first mutating method → last XHR/document GET → last non-soft request. Markers come from the recording (`status` + `response_body`); dynamic values (ids, tokens, timestamps) are never asserted.
 
 **IR builder also synthesizes common auth fixes** before emit:
 
@@ -108,6 +139,7 @@ App / flow layout: [App artifacts & knowledge](app-artifacts-and-knowledge.md).
 |-------|----------|
 | Build IR | [`src/utils/load_test_ir.py`](../../src/utils/load_test_ir.py) — `build_load_test_ir` |
 | Emit k6 | [`src/utils/k6_generator.py`](../../src/utils/k6_generator.py) — `generate_k6_script`, `emit_k6_from_ir` |
+| Assertion gate | [`src/utils/k6_assertion_gate.py`](../../src/utils/k6_assertion_gate.py) — coverage check before smoke |
 | Heal IR | [`src/utils/k6_healer.py`](../../src/utils/k6_healer.py) |
 | Orchestration | [`src/nodes/analyse.py`](../../src/nodes/analyse.py) |
 | Run 2 randomization | [`src/utils/data_randomization.py`](../../src/utils/data_randomization.py) |

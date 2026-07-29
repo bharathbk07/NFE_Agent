@@ -12,6 +12,7 @@ from src.nodes.jira_story import extract_issue_key, run_jira_story, summarize_ji
 
 
 def test_heuristic_jira_perf_phrases():
+    """Only explicit execute commands short-circuit; NL mentions do not."""
     phrases = [
         "work on SCRUM-1",
         "work on jira story",
@@ -24,6 +25,37 @@ def test_heuristic_jira_perf_phrases():
         intent, confidence, _reason = _heuristic_intent(text, False)
         assert intent == "jira_perf", text
         assert confidence >= 0.9
+
+
+def test_heuristic_does_not_trigger_jira_on_mentions():
+    """Product-critical: talking about Jira must not auto-run the worker."""
+    non_execute = [
+        "what happened with the jira smoke?",
+        "jira mentioned 50 VUs",
+        "tell me about SCRUM-1",
+        "did SCRUM-1 fail?",
+        "the jira story has pacing of 5s",
+        "compare this run to the jira ticket",
+        "why did jira fail with 401",
+    ]
+    for text in non_execute:
+        assert _heuristic_intent(text, True) is None, text
+        assert _heuristic_intent(text, False) is None, text
+
+
+def test_guard_downgrades_jira_question():
+    from src.agents.intent_router import IntentDecision, _guard_pipeline_intents
+
+    guarded = _guard_pipeline_intents(
+        IntentDecision(
+            intent="jira_perf",
+            confidence=0.9,
+            reason="llm said jira",
+        ),
+        "what about the jira smoke results?",
+        True,
+    )
+    assert guarded.intent == "analysis_qa"
 
 
 def test_extract_issue_key():

@@ -270,15 +270,14 @@ def test_workload_options_in_emit(monkeypatch):
         "workload": {"vus": 10, "iterations": 20, "maxDuration": "1m"},
     }
     opts = _workload_options_js(ir, browser=False)
-    assert "vus: 10" in opts
-    assert "iterations: 20" in opts
-    assert "abortOnFail" in opts
-    assert "delayAbortEval" in opts
-    assert "rate<0.6" in opts
-    assert "p(99)<30000" in opts
-    assert "rate>0.4" in opts
+    assert "vus: CONFIG.workload.vus" in opts
+    assert "iterations: CONFIG.workload.iterations" in opts
+    assert "thresholds: CONFIG.thresholds" in opts
     script = emit_k6_from_ir(ir)
-    assert "vus: 10" in script
+    assert "USER CONFIG" in script
+    assert '"vus": 10' in script
+    assert '"iterations": 20' in script
+    assert "CONFIG.workload.vus" in script
     assert "shared-iterations" in script
     assert "abortOnFail" in script
     assert "rate<0.6" in script

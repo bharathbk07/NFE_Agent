@@ -13,11 +13,475 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from src.utils.http_body import content_type_from_headers, parse_post_data
+
 
 CSRF_TOKEN_REGEX = (
     r"""name=["']_token["'][^>]*value=["']([^"']+)|"""
     r"""value=["']([^"']+)["'][^>]*name=["']_token["']"""
 )
+
+DEFAULT_THINK_TIME_S: Dict[str, float] = {"min": 1.0, "max": 3.0}
+
+_STATIC_RESOURCE_TYPES = frozenset(
+    {"stylesheet", "script", "image", "font", "media", "manifest", "other"}
+)
+_XHR_LIKE_TYPES = frozenset({"xhr", "fetch", "document", "xmlhttprequest", ""})
+_STABLE_JSON_KEYS = ("success", "ok", "status", "data", "result", "message")
+_DYNAMIC_TOKEN_RE = re.compile(
+    r"(?i)^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|\d{6,}"
+    r"|[A-Za-z0-9_-]{32,})$"
+)
+_TITLE_RE = re.compile(r"<title[^>]*>\s*([^<]{3,80})\s*</title>", re.I)
+_HEAVY_DIGIT_RE = re.compile(r"\d{5,}|[0-9a-f]{8}-[0-9a-f]{4}", re.I)
+
+
+def normalize_think_time_s(value: Any) -> Dict[str, float]:
+    """Normalize IR think time to ``{min, max}`` seconds.
+
+    Accepts a number (fixed delay), a ``{min, max}`` mapping, or ``None``
+    (defaults to :data:`DEFAULT_THINK_TIME_S`).
+    """
+    if value is None:
+        return dict(DEFAULT_THINK_TIME_S)
+    if isinstance(value, dict):
+        try:
+            lo = float(value.get("min", value.get("max", 1)))
+            hi = float(value.get("max", value.get("min", lo)))
+        except (TypeError, ValueError):
+            return dict(DEFAULT_THINK_TIME_S)
+        if lo < 0:
+            lo = 0.0
+        if hi < lo:
+            hi = lo
+        return {"min": lo, "max": hi}
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return dict(DEFAULT_THINK_TIME_S)
+    if n < 0:
+        n = 0.0
+    return {"min": n, "max": n}
+
+
+def _url_path_sig(url: str) -> str:
+    """Path signature with ``${var}`` and numeric ID segments wildcarded."""
+    try:
+        path = urlparse(url or "").path
+    except Exception:
+        path = url or ""
+    segs = []
+    for s in path.split("/"):
+        if not s:
+            continue
+        if s.isdigit() or re.fullmatch(r"\$\{[^}]+\}", s):
+            segs.append("{id}")
+        else:
+            segs.append(s)
+    return "/" + "/".join(segs)
+
+
+def _urls_match_loose(a: str, b: str) -> bool:
+    """Match URLs ignoring trailing slashes, query, placeholders, and path IDs."""
+    if not a or not b:
+        return False
+    if a.rstrip("/") == b.rstrip("/"):
+        return True
+    try:
+        pa = urlparse(re.sub(r"\$\{[^}]+\}", "X", a))
+        pb = urlparse(re.sub(r"\$\{[^}]+\}", "X", b))
+        if pa.netloc == pb.netloc and pa.path.rstrip("/") == pb.path.rstrip("/"):
+            return True
+        if pa.netloc == pb.netloc and _url_path_sig(a) == _url_path_sig(b):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def select_anchor_request_index(
+    requests: List[Dict[str, Any]],
+    correlations: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[int]:
+    """Pick one important request index for a TXN content assertion.
+
+    Priority: correlation extract source → mutating method → last XHR/document
+    GET → last non-soft request.
+    """
+    if not requests:
+        return None
+    corrs = correlations or []
+
+    def _is_mocked(r: Dict[str, Any]) -> bool:
+        return bool(
+            r.get("mock_in_load_test")
+            or r.get("requires_manual_data")
+            or r.get("ir_flag") == "manual_test_data_or_mock"
+        )
+
+    # 1) Correlation extract sources
+    for i, r in enumerate(requests):
+        if _is_mocked(r) or r.get("soft_check"):
+            continue
+        url = str(r.get("url") or "")
+        for c in corrs:
+            if c.get("auto_cookie"):
+                continue
+            from_req = str((c.get("extract") or {}).get("from_request") or "")
+            if from_req and _urls_match_loose(from_req, url):
+                return i
+
+    # 2) First mutating method
+    for i, r in enumerate(requests):
+        method = str(r.get("method") or "GET").upper()
+        if method in ("POST", "PUT", "PATCH", "DELETE") and not _is_mocked(r):
+            if not r.get("soft_check"):
+                return i
+
+    # 3) Last non-static XHR/document GET
+    last_xhr: Optional[int] = None
+    for i, r in enumerate(requests):
+        method = str(r.get("method") or "GET").upper()
+        if method != "GET" or _is_mocked(r) or r.get("soft_check"):
+            continue
+        rt = str(r.get("resource_type") or "").lower()
+        if rt in _STATIC_RESOURCE_TYPES:
+            continue
+        if rt in _XHR_LIKE_TYPES or not rt:
+            last_xhr = i
+    if last_xhr is not None:
+        return last_xhr
+
+    # 4) Fallback: last non-soft request
+    for i in range(len(requests) - 1, -1, -1):
+        r = requests[i]
+        if not r.get("soft_check") and not _is_mocked(r):
+            return i
+    return len(requests) - 1
+
+
+def _json_path_exists_on(data: Any, path: str) -> bool:
+    """Return True when ``path`` (``$.a.b`` / ``a.0.b``) resolves on ``data``."""
+    p = str(path or "").strip()
+    if p.startswith("$."):
+        p = p[2:]
+    elif p.startswith("$"):
+        p = p[1:].lstrip(".")
+    if not p:
+        return data is not None
+    cur: Any = data
+    for part in p.split("."):
+        if cur is None:
+            return False
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return False
+            continue
+        if isinstance(cur, dict):
+            if part not in cur:
+                return False
+            cur = cur[part]
+            continue
+        return False
+    return cur is not None
+
+
+def derive_request_assertion(
+    request: Dict[str, Any],
+    *,
+    captured: Optional[Dict[str, Any]] = None,
+    correlations: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Build a stable content assertion from a captured response (no dynamic values)."""
+    full = captured or {}
+    status_raw = full.get("status", request.get("status"))
+    expect_status: List[int] = []
+    try:
+        status_i = int(status_raw) if status_raw is not None else 0
+    except (TypeError, ValueError):
+        status_i = 0
+    if 200 <= status_i < 400:
+        expect_status = [status_i]
+        if status_i == 200:
+            expect_status = [200, 201]
+        elif status_i in (301, 302, 303, 307, 308):
+            expect_status = [status_i, 200]
+    else:
+        expect_status = [200, 201, 204]
+
+    assertion: Dict[str, Any] = {
+        "type": "status_and_body",
+        "expect_status": expect_status,
+    }
+
+    body = full.get("response_body")
+    if body is None:
+        body = request.get("response_body") or ""
+    if not isinstance(body, str):
+        try:
+            body = json.dumps(body)
+        except Exception:
+            body = str(body)
+
+    method = str(request.get("method") or "GET").upper()
+    url = str(request.get("url") or "")
+    if method == "POST" and "/auth/validate" in url.lower():
+        assertion["require_auth_session"] = True
+        return assertion
+
+    data = None
+    if body.strip().startswith("{") or body.strip().startswith("["):
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = None
+
+    json_paths: List[str] = []
+    url_ir = str(request.get("url") or "")
+    for c in correlations or []:
+        if c.get("auto_cookie"):
+            continue
+        ex = c.get("extract") or {}
+        from_req = str(ex.get("from_request") or "")
+        loc = str(ex.get("from_location") or "")
+        if not from_req or not _urls_match_loose(from_req, url_ir):
+            continue
+        if loc.startswith("body.$") or (
+            loc.startswith("body.") and not loc.startswith("body.regex:")
+        ):
+            path = loc[len("body.") :] if loc.startswith("body.") else loc
+            if path.startswith("$"):
+                jp = path
+            else:
+                jp = f"$.{path}"
+            if data is None or _json_path_exists_on(data, jp):
+                if jp not in json_paths:
+                    json_paths.append(jp)
+
+    if isinstance(data, dict):
+        for key in _STABLE_JSON_KEYS:
+            if key not in data:
+                continue
+            jp = f"$.{key}"
+            if jp not in json_paths:
+                json_paths.append(jp)
+        if json_paths:
+            assertion["json_path_exists"] = json_paths[:4]
+            return assertion
+
+    if isinstance(data, list) and data:
+        assertion["json_path_exists"] = ["$.0"]
+        return assertion
+
+    if body and ("<html" in body.lower() or "<!doctype" in body.lower()):
+        title_m = _TITLE_RE.search(body)
+        contains: List[str] = []
+        if title_m:
+            title = title_m.group(1).strip()
+            if title and not _HEAVY_DIGIT_RE.search(title):
+                contains.append(f"<title>{title}</title>")
+        if not contains:
+            # Prefer a short static phrase without UUID/long digits
+            for chunk in re.findall(r">([^<]{12,60})<", body):
+                text = " ".join(chunk.split())
+                if len(text) < 12 or _HEAVY_DIGIT_RE.search(text):
+                    continue
+                if _DYNAMIC_TOKEN_RE.match(text.strip()):
+                    continue
+                contains.append(text[:60])
+                break
+        if contains:
+            assertion["body_contains"] = contains[:2]
+        # Success pages should not still show the login form
+        if re.search(r'name=["\']username["\']', body, re.I) and re.search(
+            r'name=["\']password["\']', body, re.I
+        ):
+            # Login page itself — do not assert body_not_contains
+            pass
+        elif "/auth/login" not in url.lower():
+            assertion["body_not_contains"] = [
+                'name="username"',
+                'name="password"',
+            ]
+        return assertion
+
+    if body and len(body.strip()) >= 12 and not _HEAVY_DIGIT_RE.search(body[:80]):
+        # Plain text: use a short prefix as presence check when stable
+        snippet = body.strip()[:40]
+        if not _DYNAMIC_TOKEN_RE.match(snippet):
+            assertion["body_contains"] = [snippet]
+    # else: status-only
+    return assertion
+
+
+def apply_txn_anchor_assertions(
+    transactions: List[Dict[str, Any]],
+    correlations: List[Dict[str, Any]],
+    network_requests: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Mark one anchor request per protocol TXN and attach a content assertion."""
+    network_requests = network_requests or []
+    for txn in transactions or []:
+        if (txn.get("mode") or "protocol") == "browser":
+            continue
+        reqs = list(txn.get("requests") or [])
+        if not reqs:
+            continue
+        # Preserve prior assertions when re-applying without captures (heal path)
+        prior: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for r in reqs:
+            a = r.get("assertion")
+            if isinstance(a, dict):
+                prior[(str(r.get("method") or "GET").upper(), str(r.get("url") or ""))] = a
+            r.pop("assertion_anchor", None)
+            r.pop("assertion", None)
+            r.pop("synthesized_assertion", None)
+        idx = select_anchor_request_index(reqs, correlations)
+        if idx is None or idx < 0 or idx >= len(reqs):
+            continue
+        anchor = reqs[idx]
+        anchor["assertion_anchor"] = True
+        key = (
+            str(anchor.get("method") or "GET").upper(),
+            str(anchor.get("url") or ""),
+        )
+        captured = None
+        if network_requests:
+            look_url = str(anchor.get("url") or "")
+            if "${" in look_url:
+                look_url = look_url.split("?")[0]
+            captured = _lookup_request(
+                network_requests,
+                method=str(anchor.get("method") or "GET"),
+                url=look_url,
+                step_indices=txn.get("step_indices"),
+            )
+            if captured is None:
+                method_u = str(anchor.get("method") or "GET").upper()
+                for req in network_requests:
+                    if (req.get("method") or "GET").upper() != method_u:
+                        continue
+                    if _urls_match_loose(
+                        str(req.get("url") or ""), str(anchor.get("url") or "")
+                    ):
+                        captured = req
+                        break
+        if not network_requests and key in prior:
+            assertion = prior[key]
+        else:
+            assertion = derive_request_assertion(
+                anchor, captured=captured, correlations=correlations
+            )
+        anchor["assertion"] = assertion
+        anchor["synthesized_assertion"] = True
+        txn["requests"] = reqs
+        txn["anchor_request_index"] = idx
+
+
+def is_valid_assertion(assertion: Any) -> bool:
+    """Return True when ``assertion`` has at least one usable content condition."""
+    if not isinstance(assertion, dict) or not assertion:
+        return False
+    if assertion.get("require_auth_session"):
+        return True
+    statuses = assertion.get("expect_status")
+    if isinstance(statuses, list) and len(statuses) > 0:
+        return True
+    for key in ("json_path_exists", "body_contains", "body_not_contains"):
+        val = assertion.get(key)
+        if isinstance(val, list) and len(val) > 0:
+            return True
+        if isinstance(val, str) and val.strip():
+            return True
+    return False
+
+
+def validate_txn_assertions(
+    ir: Dict[str, Any],
+    *,
+    script: Optional[str] = None,
+) -> Tuple[bool, List[str]]:
+    """Ensure each protocol TXN has ≥1 valid content assertion (N TXNs ⇒ ≥N asserts).
+
+    Browser-mode TXNs are excluded from the count. When ``script`` is provided,
+    also require that emitted ``assertion:`` occurrences are ≥ protocol TXN count.
+
+    Returns:
+        ``(ok, notes)`` — notes list issues when ``ok`` is False.
+    """
+    notes: List[str] = []
+    protocol_txns = [
+        t
+        for t in (ir.get("transactions") or [])
+        if isinstance(t, dict) and (t.get("mode") or "protocol") != "browser"
+    ]
+    n_txns = len(protocol_txns)
+    if n_txns == 0:
+        return True, notes
+
+    valid_count = 0
+    for txn in protocol_txns:
+        name = str(txn.get("name") or "Txn")
+        reqs = [r for r in (txn.get("requests") or []) if isinstance(r, dict)]
+        anchor = next((r for r in reqs if r.get("assertion_anchor")), None)
+        if anchor is None:
+            anchor = next(
+                (r for r in reqs if is_valid_assertion(r.get("assertion"))),
+                None,
+            )
+        if anchor is None:
+            notes.append(
+                f"Txn `{name}`: missing content assertion (no assertion_anchor)."
+            )
+            continue
+        if not is_valid_assertion(anchor.get("assertion")):
+            notes.append(
+                f"Txn `{name}`: assertion present but has no valid conditions."
+            )
+            continue
+        valid_count += 1
+
+    if valid_count < n_txns:
+        notes.append(
+            f"Assertion coverage {valid_count}/{n_txns} protocol TXN(s) — "
+            f"need ≥{n_txns} valid assertion(s)."
+        )
+
+    if script is not None:
+        emitted = script.count("assertion:")
+        if emitted < n_txns:
+            notes.append(
+                f"Emitted script has {emitted} content assertion(s) for "
+                f"{n_txns} protocol TXN(s) — regenerate after fixing IR."
+            )
+
+    ok = valid_count >= n_txns
+    if script is not None and script.count("assertion:") < n_txns:
+        ok = False
+    return ok, notes
+
+
+def ensure_txn_assertions(
+    ir: Dict[str, Any],
+    *,
+    network_requests: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Apply anchor assertions when coverage is incomplete; return IR + notes."""
+    ok, notes = validate_txn_assertions(ir)
+    if ok:
+        return ir, []
+    apply_txn_anchor_assertions(
+        ir.get("transactions") or [],
+        ir.get("correlations") or [],
+        network_requests,
+    )
+    return ir, [
+        "Re-applied per-TXN content assertion anchors before k6 run.",
+        *notes,
+    ]
 
 
 def _safe_ident(name: str, fallback: str = "value") -> str:
@@ -534,7 +998,7 @@ def _inject_missing_auth(
         "name": "login",
         "description": "Browser login (SPA CSRF cannot be extracted via protocol HTTP)",
         "mode": "browser",
-        "think_time_s": 1,
+        "think_time_s": dict(DEFAULT_THINK_TIME_S),
         "requests": [],
         "ui_steps": ui_steps,
         "step_indices": [],
@@ -1089,7 +1553,7 @@ def build_load_test_ir(
                 "name": name,
                 "description": txn.get("description") or name,
                 "mode": mode,
-                "think_time_s": 1,
+                "think_time_s": dict(DEFAULT_THINK_TIME_S),
                 "requests": requests_ir,
                 "ui_steps": ui_steps,
                 "step_indices": step_indices or [],
@@ -1113,6 +1577,7 @@ def build_load_test_ir(
         corr_list,
         network_requests=network_requests,
     )
+    apply_txn_anchor_assertions(txn_list, corr_list, network_requests)
 
     return {
         "version": 1,

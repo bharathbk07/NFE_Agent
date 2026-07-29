@@ -93,6 +93,14 @@ NFE marks the run **failed**, tags `aborted_by_watcher`, and still **publishes C
 
 **Default smoke** (empty workload) does **not** use `abortOnFail`, so self-heal can see the full failure set.
 
+### Content assertions and heal
+
+Each protocol TXN has **one anchor request** with a recording-derived content assertion (`expect_status`, JSON path presence, or body substring). Smoke can fail when that content check fails even if HTTP status is 2xx (wrong page, missing `$.data.id`, still on login form).
+
+**Pre-run gate:** Before smoke starts, NFE checks that every protocol TXN has a valid content assertion (N TXNs ⇒ ≥N assertions). If short, it re-applies anchors and re-emits. If still short, **smoke does not run** and the result is `assertion coverage failed` — fix the IR/script first.
+
+Heal **does not** soft-pass or drop content assertions on the anchor. A note like “Content assertion failed — likely correlation/script issue” means fix correlations / auth, not relax the check. Non-anchor chrome GETs may still be softened or removed as before.
+
 Outputs:
 
 | Artifact | Role |

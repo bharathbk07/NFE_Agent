@@ -57,7 +57,16 @@ class JiraPerfRequest:
 
 def _merge_workload(data: Dict[str, Any]) -> Dict[str, Any]:
     wl = dict(data.get("workload") or {})
-    for key in ("vus", "duration", "stages", "iterations", "executor", "maxDuration"):
+    for key in (
+        "vus",
+        "duration",
+        "stages",
+        "iterations",
+        "executor",
+        "maxDuration",
+        "pacing_s",
+        "think_time_s",
+    ):
         if key in data and key not in wl:
             wl[key] = data[key]
     thr = data.get("thresholds") or data.get("sla") or {}

@@ -159,9 +159,16 @@ async def answer_analysis_question(state: AgentState) -> Dict[str, Any]:
     qa = AnalysisQAAgent()
 
     q = (question or "").lower()
+    # Only rebuild when the user clearly asks to regenerate — not on topic words
+    # like "k6" / "transaction" inside a question about prior results.
     wants_rebuild = bool(
         re.search(
-            r"\b(txn|txns|transaction|transactions|k6|load\s*script|generate\s+script)\b",
+            r"\b("
+            r"(re)?generate\s+(the\s+)?(k6|load\s*)?script|"
+            r"rebuild\s+(txns?|transactions?|k6|script)|"
+            r"(update|refresh)\s+(the\s+)?(k6|load\s*)?script|"
+            r"regenerate\s+(txns?|transactions?)"
+            r")\b",
             q,
         )
     )

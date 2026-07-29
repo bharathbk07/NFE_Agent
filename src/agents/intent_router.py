@@ -1,6 +1,9 @@
 """
-Intent routing: decide whether the latest user message is casual conversation,
-a question about prior analysis results, a full pipeline run, or a rerun.
+Intent routing: understand natural-language meaning, then branch the graph.
+
+Mechanical heuristics cover only ultra-clear commands (greetings, URLs,
+explicit “work on SCRUM-1”). Everything else goes through the LLM classifier
+so product chat does not fire pipelines from keyword hits like “jira”.
 """
 from __future__ import annotations
 
@@ -26,10 +29,12 @@ IntentName = Literal[
     "jira_perf",
 ]
 
-WATCH_ME_KEYWORDS = re.compile(
-    r"\b("
+# Product command phrases — used only as *mechanical* short-circuits when the
+# whole message is clearly that command, not as substring keyword triggers.
+WATCH_ME_COMMAND = re.compile(
+    r"^\s*("
     r"watch\s+me|"
-    r"record\s+while\s+i|"
+    r"record\s+while\s+i(\s+click)?|"
     r"i('?ll| will)\s+click|"
     r"interactive\s+record|"
     r"record\s+my\s+(clicks|actions|flow)|"
@@ -39,68 +44,52 @@ WATCH_ME_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-REUSE_RECORDING_KEYWORDS = re.compile(
-    r"\b("
+REUSE_RECORDING_COMMAND = re.compile(
+    r"^\s*("
     r"reuse\s+(the\s+)?((last|saved|previous)\s+)?recording|"
     r"analyse?\s+saved\s+recording|"
     r"analyze\s+saved\s+recording|"
     r"load\s+(the\s+)?(saved\s+)?recording|"
     r"use\s+(the\s+)?(last|saved|previous)\s+recording|"
-    r"from\s+saved\s+recording|"
     r"list\s+recordings|"
     r"saved\s+recordings|"
     r"rerun\s+(from\s+)?(saved\s+)?recording|"
-    r"replay\s+saved"
+    r"replay\s+saved(\s+recording)?"
     r")\b",
     re.IGNORECASE,
 )
 
-ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
-
-JIRA_PERF_KEYWORDS = re.compile(
-    r"\b("
-    r"work\s+on\s+(a\s+)?(jira\s+)?(story|issue)|"
-    r"work\s+on\s+jira|"
-    r"jira\s+story|"
-    r"run\s+jira|"
-    r"process\s+(a\s+)?(jira\s+)?(issue|story)|"
-    r"work\s+on\s+[A-Z][A-Z0-9]+-\d+"
-    r")\b",
+# Explicit execute + issue key — whole-message style commands only.
+JIRA_EXECUTE_WITH_KEY = re.compile(
+    r"^\s*("
+    r"(please\s+)?"
+    r"(work\s+on|process|execute|run)\s+"
+    r"((the|a|this)\s+)?"
+    r"(jira\s+)?"
+    r"(story|issue|ticket)?\s*"
+    r"(?P<key>[A-Z][A-Z0-9]+-\d+)"
+    r")\s*[!.]?\s*$",
     re.IGNORECASE,
 )
 
-ANALYSIS_KEYWORDS = re.compile(
-    r"\b("
-    r"performance\s*test|load\s*test|correlation|correlat\w*|corelat\w*|parameteri[sz]ation|"
-    r"user\s*journey|navigate|login\s+to|record\s+(the\s+)?(flow|journey)|"
-    r"playwright|analyze\s+(this|the|network|traffic)|analyse\s+(this|the|network|traffic)|"
-    r"target_url|saucedemo|checkout|add\s+to\s+cart|sub[\s_-]?task|"
-    r"run\s+(the\s+)?(analysis|agent|flow|test)|capture\s+traffic|"
-    r"extract\s+(dynamic|correlation)|script\s+generation"
-    r")\b",
+JIRA_EXECUTE_NO_KEY = re.compile(
+    r"^\s*("
+    r"(please\s+)?"
+    r"(work\s+on|process|execute)\s+"
+    r"((a|the|this)\s+)?"
+    r"jira\s+(story|issue|ticket)"
+    r"|run\s+jira"
+    r")\s*[!.]?\s*$",
     re.IGNORECASE,
 )
 
-RESULT_QA_KEYWORDS = re.compile(
-    r"\b("
-    r"token|csrf|jwt|bearer|session|cookie|auth(?:entication|enticat\w*)?|"
-    r"correlat\w*|corelat\w*|parameter\w*|dynamic\s+value|extract|pass\s+to|"
-    r"txn|txns|transaction|transactions|group(?:ing)?\s+request|"
-    r"k6|load\s*script|jmeter|gatling|"
-    r"why\s+(is|are|was|were|no|not)|is\s+(there|that|this)|do\s+i\s+need|"
-    r"needed|missing|not\s+found|no\s+\w+\s+found|what\s+about|explain|"
-    r"does\s+(that|this|it)\s+mean|should\s+i|login\s+token|authorization"
-    r")\b",
-    re.IGNORECASE,
-)
-
-FOLLOW_UP_KEYWORDS = re.compile(
-    r"\b("
-    r"run\s+again|analyze\s+again|analyse\s+again|same\s+(flow|journey|url)|"
-    r"previous\s+(flow|journey|run)|retry|re[\s-]?run|do\s+it\s+again|"
-    r"use\s+(the\s+)?(last|previous)\s+(one|flow|journey)|"
-    r"execute\s+again|replay\s+(the\s+)?(flow|journey)"
-    r")\b",
+FOLLOW_UP_COMMAND = re.compile(
+    r"^\s*("
+    r"run\s+again|analyze\s+again|analyse\s+again|"
+    r"retry|re[\s-]?run|do\s+it\s+again|"
+    r"execute\s+again|replay\s+(the\s+)?(flow|journey)|"
+    r"same\s+(flow|journey|url)\s+again"
+    r")\s*[!.]?\s*$",
     re.IGNORECASE,
 )
 
@@ -112,10 +101,26 @@ GREETING_OR_CHAT = re.compile(
     re.IGNORECASE,
 )
 
+ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 URL_RE = re.compile(r"https?://[^\s\"']+", re.IGNORECASE)
 STRUCTURED_KEYS_RE = re.compile(
     r'"(target_url|url|user_journey_steps|journey|credentials|steps)"\s*:',
     re.IGNORECASE,
+)
+
+# Soft signals for the LLM prompt only (never used as hard routing).
+_SOFT_WATCH = re.compile(r"\b(watch\s+me|record\s+while|i('?ll| will)\s+click)\b", re.I)
+_SOFT_JIRA = re.compile(r"\b(jira|scrum-\d+|[A-Z][A-Z0-9]+-\d+)\b", re.I)
+_SOFT_REUSE = re.compile(r"\b(saved\s+recording|list\s+recordings|reuse\s+recording)\b", re.I)
+_SOFT_QA = re.compile(
+    r"\b(why|what|how|explain|trend|smoke|p95|script|result|fail|token|csrf)\b",
+    re.I,
+)
+_SOFT_RERUN = re.compile(r"\b(run\s+again|retry|re[\s-]?run)\b", re.I)
+_QUESTIONISH = re.compile(
+    r"^\s*(what|why|how|when|where|which|who|is|are|was|were|did|does|do|can|could|"
+    r"should|would|tell\s+me|explain|summarize|summarise)\b|\?\s*$",
+    re.I,
 )
 
 
@@ -125,10 +130,10 @@ class IntentDecision(BaseModel):
     intent: IntentName = Field(
         description=(
             "conversation = casual chat / math / greetings unrelated to prior analysis; "
-            "analysis_qa = question about prior analysis results in this chat (tokens, correlations, params); "
+            "analysis_qa = question about prior analysis results in this chat; "
             "watch_me = user will click in a headed browser the bot opens; "
             "reuse_recording = load/list a saved Watch-me recording; "
-            "jira_perf = process a Jira issue via REST (work on story / issue key); "
+            "jira_perf = user explicitly asks to EXECUTE a Jira issue workflow; "
             "performance_analysis = new URL/journey to run the full pipeline; "
             "follow_up_analysis = explicitly rerun the previous journey"
         )
@@ -138,7 +143,7 @@ class IntentDecision(BaseModel):
         default=None,
         description="Short helpful reply when intent is conversation; otherwise null",
     )
-    reason: str = Field(default="", description="Brief reason for the decision")
+    reason: str = Field(default="", description="Brief reason citing user meaning")
 
 
 def get_latest_human_text(messages: Any) -> str:
@@ -170,11 +175,42 @@ def get_latest_human_text(messages: Any) -> str:
     return ""
 
 
-def _heuristic_intent(
+def _soft_signals(text: str, has_prior: bool) -> str:
+    """Build non-binding hint lines for the LLM classifier prompt."""
+    hints = []
+    if _SOFT_WATCH.search(text):
+        hints.append("- message mentions interactive-recording language")
+    if _SOFT_JIRA.search(text):
+        hints.append(
+            "- message mentions Jira / an issue key (topic ≠ execute unless asked)"
+        )
+    if _SOFT_REUSE.search(text):
+        hints.append("- message mentions saved/list recordings")
+    if _SOFT_QA.search(text):
+        hints.append("- message looks question/explanation oriented")
+    if _SOFT_RERUN.search(text):
+        hints.append("- message may ask to rerun")
+    if _QUESTIONISH.search(text):
+        hints.append("- message reads as a question")
+    if URL_RE.search(text):
+        hints.append("- message contains a URL")
+    if has_prior:
+        hints.append("- prior analysis/smoke/script context is available in this chat")
+    else:
+        hints.append("- no prior analysis context in this chat")
+    if not hints:
+        return "- (none)"
+    return "\n".join(hints)
+
+
+def _mechanical_intent(
     text: str,
     has_prior_analysis_context: bool,
 ) -> Optional[Tuple[IntentName, float, str]]:
-    """Route obvious requests without invoking an LLM.
+    """Route only ultra-clear mechanical commands without an LLM.
+
+    Natural-language messages return ``None`` so the classifier understands
+    meaning. Keyword *topics* (jira, smoke, k6, …) never short-circuit here.
 
     Args:
         text: Latest user message.
@@ -190,82 +226,75 @@ def _heuristic_intent(
     if GREETING_OR_CHAT.match(cleaned):
         return "conversation", 0.95, "Greeting / small talk"
 
-    # Explicit rerun of previous journey
-    if FOLLOW_UP_KEYWORDS.search(cleaned) and has_prior_analysis_context:
-        return "follow_up_analysis", 0.9, "Explicit rerun of prior journey"
+    # Pure arithmetic — keep free of LLM cost
+    if len(cleaned) < 80 and re.fullmatch(
+        r"\s*\d+\s*[\+\-\*/]\s*\d+\s*[?.!]?\s*", cleaned
+    ):
+        return "conversation", 0.9, "Math expression"
 
+    # Explicit whole-message Jira *execute* commands only
+    if JIRA_EXECUTE_WITH_KEY.match(cleaned) or JIRA_EXECUTE_NO_KEY.match(cleaned):
+        if not _QUESTIONISH.search(cleaned):
+            return "jira_perf", 0.96, "Explicit Jira execute command"
+
+    # Explicit whole-message reuse / watch-me / rerun commands
+    if REUSE_RECORDING_COMMAND.match(cleaned):
+        return "reuse_recording", 0.95, "Explicit reuse/list recording command"
+
+    if WATCH_ME_COMMAND.match(cleaned):
+        if URL_RE.search(cleaned):
+            return "watch_me", 0.96, "Explicit watch-me command with URL"
+        # "watch me" alone is still a clear product command
+        if len(cleaned) < 160:
+            return "watch_me", 0.9, "Explicit watch-me command"
+
+    if FOLLOW_UP_COMMAND.match(cleaned) and has_prior_analysis_context:
+        return "follow_up_analysis", 0.92, "Explicit rerun command"
+
+    # Machine payloads (URL / JSON journey) — not free-form NL
     has_url = bool(URL_RE.search(cleaned))
     has_structured = bool(STRUCTURED_KEYS_RE.search(cleaned))
-    has_analysis_kw = bool(ANALYSIS_KEYWORDS.search(cleaned))
-    has_result_qa = bool(RESULT_QA_KEYWORDS.search(cleaned))
-    wants_watch_me = bool(WATCH_ME_KEYWORDS.search(cleaned))
-
     looks_like_recording = (
         '"type":' in cleaned
         and '"steps"' in cleaned
-        and any(tok in cleaned for tok in ('"click"', '"change"', '"navigate"', '"setViewport"'))
+        and any(
+            tok in cleaned
+            for tok in ('"click"', '"change"', '"navigate"', '"setViewport"')
+        )
     )
-
-    # Interactive Watch-me recording beats automated performance_analysis
-    if wants_watch_me:
-        if has_url:
-            return "watch_me", 0.96, "Watch-me recording requested with URL"
-        return "watch_me", 0.9, "Watch-me recording requested (URL may come from extract)"
-
-    if _wants_jira_perf(cleaned):
-        return "jira_perf", 0.95, "Jira story / issue processing requested"
-
-    if REUSE_RECORDING_KEYWORDS.search(cleaned):
-        return "reuse_recording", 0.95, "Reuse / list saved Watch-me recording"
-
-    # New journey payload always wins
-    if has_url or has_structured or looks_like_recording:
-        return "performance_analysis", 0.95, "URL / structured journey payload detected"
-
-    # Questions about prior results — do NOT re-run the pipeline
-    if has_prior_analysis_context and (
-        has_result_qa
-        or (cleaned.endswith("?") and len(cleaned) < 400)
-        or has_analysis_kw
-    ):
-        # "analyze this traffic" without URL while prior exists → QA unless they said run again
-        if not FOLLOW_UP_KEYWORDS.search(cleaned):
-            return "analysis_qa", 0.9, "Question about prior analysis results"
-
-    # New analysis request without URL yet (will ask for URL in orchestrator)
-    if has_analysis_kw and len(cleaned) > 20 and not has_prior_analysis_context:
-        return "performance_analysis", 0.8, "Analysis keywords without prior context"
-
-    # Short math / trivia
-    if len(cleaned) < 120 and not has_analysis_kw and not has_result_qa and not has_url:
-        if re.search(r"\d+\s*[\+\-\*/]\s*\d+", cleaned):
-            return "conversation", 0.9, "Math / general question"
-        if cleaned.endswith("?") and not has_prior_analysis_context:
-            return "conversation", 0.75, "General question without journey signals"
-
-    # Any remaining question with prior analysis context → QA
-    if has_prior_analysis_context and ("?" in cleaned or has_result_qa):
-        return "analysis_qa", 0.8, "Follow-up with prior analysis available"
+    if has_structured or looks_like_recording:
+        return "performance_analysis", 0.95, "Structured journey / recording payload"
+    # Bare URL-only paste (no question language) → new analysis
+    if has_url and not _QUESTIONISH.search(cleaned) and len(cleaned) < 300:
+        # If they also said watch-me mid-sentence, let LLM decide
+        if not _SOFT_WATCH.search(cleaned) and not _SOFT_JIRA.search(cleaned):
+            return "performance_analysis", 0.9, "URL payload for new analysis"
 
     return None
 
 
 def _wants_jira_perf(text: str) -> bool:
-    """True when the user asks to process a Jira story/issue via NFE."""
-    if JIRA_PERF_KEYWORDS.search(text):
-        return True
-    if ISSUE_KEY_RE.search(text) and re.search(
-        r"\b(jira|work\s+on|process|run)\b", text, re.IGNORECASE
-    ):
-        return True
-    return False
+    """True only for explicit Jira *execute* commands (mechanical path).
+
+    Kept for callers/tests; natural-language Jira mentions return False.
+    """
+    cleaned = (text or "").strip()
+    if _QUESTIONISH.search(cleaned):
+        return False
+    return bool(
+        JIRA_EXECUTE_WITH_KEY.match(cleaned) or JIRA_EXECUTE_NO_KEY.match(cleaned)
+    )
+
+
+# Back-compat alias used by older tests / imports
+_heuristic_intent = _mechanical_intent
 
 
 async def classify_intent(
     text: str,
     has_prior_analysis_context: bool = False,
 ) -> IntentDecision:
-    """Classify user intent with deterministic rules and LLM fallback.
+    """Classify user intent with LLM understanding; mechanical fallback only.
 
     Args:
         text: Latest user message as plain text.
@@ -274,9 +303,9 @@ async def classify_intent(
     Returns:
         A validated intent decision and optional conversational reply.
     """
-    heuristic = _heuristic_intent(text, has_prior_analysis_context)
-    if heuristic is not None:
-        intent, confidence, reason = heuristic
+    mechanical = _mechanical_intent(text, has_prior_analysis_context)
+    if mechanical is not None:
+        intent, confidence, reason = mechanical
         reply = None
         if intent == "conversation":
             reply = _default_conversation_reply(text, has_prior_analysis_context)
@@ -293,6 +322,7 @@ async def classify_intent(
             "intent_classifier",
             has_prior_analysis_context=has_prior_analysis_context,
             user_message=text[:4000],
+            soft_signals=_soft_signals(text, has_prior_analysis_context),
         )
         decision = await router.ainvoke_with_failover(
             TaskType.EXTRACTION,
@@ -302,15 +332,15 @@ async def classify_intent(
             prompt,
         )
         if isinstance(decision, IntentDecision):
+            decision = _guard_pipeline_intents(decision, text, has_prior_analysis_context)
             if decision.intent == "conversation" and not decision.reply:
                 decision.reply = _default_conversation_reply(
                     text, has_prior_analysis_context
                 )
             return decision
         if isinstance(decision, dict):
-            # Provider adapters may unwrap schema-constrained output to a
-            # dictionary; validate it before relying on routing fields.
             parsed = IntentDecision.model_validate(decision)
+            parsed = _guard_pipeline_intents(parsed, text, has_prior_analysis_context)
             if parsed.intent == "conversation" and not parsed.reply:
                 parsed.reply = _default_conversation_reply(
                     text, has_prior_analysis_context
@@ -319,18 +349,55 @@ async def classify_intent(
     except Exception as exc:
         logger.warning("LLM intent classification failed (%s); defaulting carefully.", exc)
 
+    # Fail closed: never auto-run Jira/pipeline on ambiguity
     if has_prior_analysis_context:
         return IntentDecision(
             intent="analysis_qa",
-            confidence=0.6,
-            reason="Ambiguous with prior analysis; answering from context",
+            confidence=0.55,
+            reason="Ambiguous with prior analysis; answering from context (fail-closed)",
         )
 
     return IntentDecision(
         intent="conversation",
         confidence=0.55,
         reply=_default_conversation_reply(text, False),
-        reason="Ambiguous; defaulting to conversation",
+        reason="Ambiguous; defaulting to conversation (fail-closed)",
+    )
+
+
+def _guard_pipeline_intents(
+    decision: IntentDecision,
+    text: str,
+    has_prior: bool,
+) -> IntentDecision:
+    """Downgrade risky pipeline intents when the message is clearly a question.
+
+    Prevents selling a brittle product where “jira” / issue keys in a question
+    accidentally start the Jira worker.
+    """
+    if decision.intent not in ("jira_perf", "performance_analysis", "follow_up_analysis"):
+        return decision
+    if not _QUESTIONISH.search(text or ""):
+        return decision
+    # Question + prior context → QA; question without prior → conversation
+    if has_prior:
+        return IntentDecision(
+            intent="analysis_qa",
+            confidence=min(decision.confidence, 0.75),
+            reply=None,
+            reason=(
+                f"Guarded: message is a question; refused pipeline intent "
+                f"'{decision.intent}' ({decision.reason})"
+            ),
+        )
+    return IntentDecision(
+        intent="conversation",
+        confidence=0.6,
+        reply=_default_conversation_reply(text, False),
+        reason=(
+            f"Guarded: question without prior analysis; refused pipeline intent "
+            f"'{decision.intent}'"
+        ),
     )
 
 
@@ -349,8 +416,9 @@ def _default_conversation_reply(text: str, has_prior: bool = False) -> str:
         if has_prior:
             return (
                 "Hi! I still have your last performance analysis in this chat.\n\n"
-                "Ask about correlations, tokens, parameters, or auth — "
-                "or paste a new journey / say **run again** to re-execute."
+                "Ask about correlations, tokens, parameters, smoke, or trends — "
+                "or paste a new journey / say **run again** to re-execute.\n"
+                "To process a Jira story, say clearly: **work on SCRUM-1**."
             )
         return (
             "Hi! I’m the NFE performance-testing agent.\n\n"
@@ -359,7 +427,8 @@ def _default_conversation_reply(text: str, has_prior: bool = False) -> str:
             "To start:\n"
             "- Send a target URL plus journey steps, **or**\n"
             "- Say **watch me** with a URL — I’ll open a browser; click through, then **Done recording**.\n"
-            "- Later: **analyse saved recording** (no re-record) or **list recordings**."
+            "- Later: **analyse saved recording** (no re-record) or **list recordings**.\n"
+            "- Jira: say **work on SCRUM-1** only when you want me to *run* that story."
         )
 
     math = re.search(r"(\d+)\s*([\+\-\*/])\s*(\d+)", cleaned)
@@ -374,14 +443,15 @@ def _default_conversation_reply(text: str, has_prior: bool = False) -> str:
     if has_prior:
         return (
             "I still have your previous analysis in context. "
-            "Ask a specific question about correlations, tokens, or parameters, "
-            "or say **run again** to re-run the journey."
+            "Ask a specific question about results, scripts, or correlations, "
+            "or say **run again** / **work on SCRUM-1** only if you want a new run."
         )
 
     return (
-        "I can chat about performance testing here. "
-        "Provide a **target URL** and **user journey**, or say **watch me** with a URL "
-        "so you can click through in a browser I open."
+        "I can help with performance testing here. "
+        "Tell me what you want to do — analyse a URL, **watch me** record a flow, "
+        "reuse a saved recording, or **work on SCRUM-1** to execute a Jira story. "
+        "Mentioning a tool name alone won’t start a run."
     )
 
 

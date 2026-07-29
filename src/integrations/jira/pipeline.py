@@ -116,6 +116,24 @@ async def run_perf_for_request(
     )
 
     if k6_script and ir:
+        from src.utils.k6_assertion_gate import (
+            assertion_coverage_failure_result,
+            prepare_ir_and_script_for_smoke,
+        )
+
+        network_reqs: list = []
+        for rec in loaded.get("run_records") or []:
+            if isinstance(rec, dict) and rec.get("network_requests"):
+                network_reqs = list(rec.get("network_requests") or [])
+                break
+
+        ir, k6_script, assert_ok, assert_notes = prepare_ir_and_script_for_smoke(
+            ir,
+            k6_script,
+            network_requests=network_reqs,
+        )
+        heal_notes.extend(assert_notes)
+
         k6_file = save_k6_script(
             k6_script,
             target_url=target_url,
@@ -130,11 +148,76 @@ async def run_perf_for_request(
             app=app_id,
             flow=flow_id,
         )
-        try:
-            smoke = await run_k6_smoke_preferred(k6_file.get("path") or "")
-        except Exception as exc:
-            logger.warning("k6 run failed: %s", exc)
-            smoke = {"ok": False, "summary": str(exc)}
+        if not assert_ok:
+            logger.warning(
+                "Assertion coverage gate blocked Jira k6 run: %s",
+                "; ".join(assert_notes[:5]),
+            )
+            smoke = assertion_coverage_failure_result(assert_notes)
+        else:
+            try:
+                smoke = await run_k6_smoke_preferred(k6_file.get("path") or "")
+            except Exception as exc:
+                logger.warning("k6 run failed: %s", exc)
+                smoke = {"ok": False, "summary": str(exc)}
+
+        # Heal loop — same pattern as analyse_traffic; runs against real workload
+        max_heals = 2
+        attempt = 0
+        while (
+            smoke.get("ok") is False
+            and not smoke.get("skipped")
+            and not smoke.get("assertion_gate_failed")
+            and attempt < max_heals
+        ):
+            attempt += 1
+            from src.utils.k6_generator import emit_k6_from_ir as _emit
+            from src.utils.k6_healer import heal_load_test_ir
+
+            ir, heal_attempt_notes = heal_load_test_ir(
+                ir, smoke, attempt=attempt
+            )
+            heal_notes.extend(heal_attempt_notes)
+            # Preserve story workload in the healed IR
+            if story_workload:
+                ir["workload"] = dict(story_workload)
+            k6_script = _emit(ir)
+            ir, k6_script, assert_ok, assert_notes = prepare_ir_and_script_for_smoke(
+                ir,
+                k6_script,
+                network_requests=network_reqs,
+            )
+            heal_notes.extend(assert_notes)
+            k6_file = save_k6_script(
+                k6_script,
+                target_url=target_url,
+                filename=names.get("script"),
+                app=app_id,
+                flow=flow_id,
+            )
+            ir_meta = save_load_test_ir(
+                ir,
+                target_url=target_url,
+                filename=names.get("ir"),
+                app=app_id,
+                flow=flow_id,
+            )
+            if not assert_ok:
+                logger.warning(
+                    "Assertion coverage gate blocked Jira k6 after heal %s: %s",
+                    attempt,
+                    "; ".join(assert_notes[:5]),
+                )
+                smoke = assertion_coverage_failure_result(assert_notes)
+                break
+            try:
+                smoke = await run_k6_smoke_preferred(k6_file.get("path") or "")
+            except Exception as exc:
+                logger.warning("k6 run failed after heal %s: %s", attempt, exc)
+                smoke = {"ok": False, "summary": str(exc)}
+            if smoke.get("ok"):
+                heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
+                break
     else:
         if story_workload and not k6_script:
             logger.error(
@@ -180,6 +263,20 @@ async def run_perf_for_request(
                 smoke_status=smoke_status,
                 step_count=len(loaded.get("user_journey_steps") or []),
             )
+            try:
+                from src.utils.knowledge_store import ingest_run_history
+
+                ingest_run_history(
+                    app_id,
+                    flow_id or "default",
+                    smoke=smoke or {},
+                    workload_source=workload_source,
+                    k6_path=k6_file.get("path") or "",
+                    summary_json=str(smoke.get("summary_json") or ""),
+                    target_url=target_url,
+                )
+            except Exception as run_err:
+                logger.warning("Run history ingest skipped (Jira): %s", run_err)
     except Exception as know_err:
         logger.warning("Knowledge upsert skipped (Jira): %s", know_err)
 

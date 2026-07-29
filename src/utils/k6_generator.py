@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from src.utils.load_test_ir import build_load_test_ir
+from src.utils.load_test_ir import build_load_test_ir, normalize_think_time_s
 
 
 def _js_string(value: Any) -> str:
@@ -167,8 +167,19 @@ def _inject_catastrophic_abort_thresholds(
     return out
 
 
-def _workload_options_js(ir: Dict[str, Any], *, browser: bool) -> str:
-    """Render k6 ``export const options`` from IR ``workload`` or default smoke."""
+def _resolve_global_think_time(ir: Dict[str, Any]) -> Dict[str, float]:
+    """Resolve script-wide think time: workload → first TXN → default 1–3s."""
+    wl = ir.get("workload") or {}
+    if "think_time_s" in wl and wl.get("think_time_s") is not None:
+        return normalize_think_time_s(wl.get("think_time_s"))
+    for txn in ir.get("transactions") or []:
+        if txn.get("think_time_s") is not None:
+            return normalize_think_time_s(txn.get("think_time_s"))
+    return normalize_think_time_s({"min": 1, "max": 3})
+
+
+def _config_thresholds(ir: Dict[str, Any]) -> Dict[str, Any]:
+    """Build normalized threshold map for CONFIG (and options)."""
     from config.settings import settings
 
     wl = ir.get("workload") or {}
@@ -179,13 +190,8 @@ def _workload_options_js(ir: Dict[str, Any], *, browser: bool) -> str:
             "http_req_duration": ["p(95)<2000"],
             "checks": ["rate>0.99"],
         }
-    # abortOnFail is for real load/watcher runs. Default smoke (1 VU × 2) must
-    # finish so heal can see the full failure set — early abort left empty
-    # correlation IDs looking like "inconsistent" partial HTML reports.
     abort_on_fail = bool(settings.NFE_K6_ABORT_ON_FAIL) and bool(wl)
     abort_delay = str(settings.NFE_K6_ABORT_DELAY or "10s")
-    # Normalize SLA rules first *without* abort, then inject catastrophic aborts.
-    # Optional NFE_K6_SLA_ABORT_ON_FAIL re-applies abort to all SLA rules.
     thresholds = _normalize_threshold_entries(
         thresholds,
         abort_on_fail=bool(
@@ -197,65 +203,111 @@ def _workload_options_js(ir: Dict[str, Any], *, browser: bool) -> str:
         thresholds = _inject_catastrophic_abort_thresholds(
             thresholds, abort_delay=abort_delay
         )
-    thr_js = ",\n    ".join(
-        f"{json.dumps(k)}: {json.dumps(v)}" for k, v in thresholds.items()
-    )
-    browser_opts = (
-        "\n      options: { browser: { type: 'chromium' } }," if browser else ""
-    )
+    return thresholds
 
+
+def _config_workload_dict(ir: Dict[str, Any]) -> Dict[str, Any]:
+    """Build CONFIG.workload object (user-editable load model)."""
+    wl = ir.get("workload") or {}
     stages = wl.get("stages")
     if isinstance(stages, list) and stages:
-        stages_js = json.dumps(stages)
-        return f"""export const options = {{
-  scenarios: {{
-    load: {{
-      executor: 'ramping-vus',
-      startVUs: 0,
-      stages: {stages_js},{browser_opts}
-    }},
-  }},
-  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
-  thresholds: {{
-    {thr_js}
-  }},
-}};"""
-
+        return {
+            "executor": "ramping-vus",
+            "startVUs": 0,
+            "stages": stages,
+        }
     executor = str(wl.get("executor") or "shared-iterations")
     vus = int(wl.get("vus") or 1)
     iterations = int(wl.get("iterations") or 2)
     max_duration = str(wl.get("maxDuration") or wl.get("duration") or "2m")
-    scenario_name = "load" if wl else "smoke"
-
     if executor == "constant-vus":
         duration = str(wl.get("duration") or max_duration)
+        return {
+            "executor": "constant-vus",
+            "vus": vus,
+            "duration": duration,
+        }
+    return {
+        "executor": "shared-iterations",
+        "vus": vus,
+        "iterations": iterations,
+        "maxDuration": max_duration,
+    }
+
+
+def _user_config_js(ir: Dict[str, Any], param_block: str) -> str:
+    """Emit USER CONFIG (think/pacing/workload/thresholds) + vars in one place."""
+    think = _resolve_global_think_time(ir)
+    try:
+        pacing = max(0.0, float((ir.get("workload") or {}).get("pacing_s") or 0))
+    except (TypeError, ValueError):
+        pacing = 0.0
+    workload = _config_workload_dict(ir)
+    thresholds = _config_thresholds(ir)
+    config_obj = {
+        "thinkTime": {"min": think["min"], "max": think["max"]},
+        "pacing_s": pacing,
+        "workload": workload,
+        "thresholds": thresholds,
+    }
+    config_body = json.dumps(config_obj, indent=2)
+    return f"""// =============================================================================
+// USER CONFIG — edit parameters, workload, think time, and pacing here
+// =============================================================================
+const CONFIG = {config_body};
+
+const vars = {{
+{param_block}
+}};"""
+
+
+def _workload_options_js(ir: Dict[str, Any], *, browser: bool) -> str:
+    """Render k6 ``export const options`` reading from ``CONFIG``."""
+    wl = ir.get("workload") or {}
+    browser_opts = (
+        "\n      options: { browser: { type: 'chromium' } }," if browser else ""
+    )
+    stages = wl.get("stages")
+    scenario_name = "load" if wl else "smoke"
+
+    if isinstance(stages, list) and stages:
         return f"""export const options = {{
   scenarios: {{
-    {scenario_name}: {{
-      executor: 'constant-vus',
-      vus: {vus},
-      duration: {json.dumps(duration)},{browser_opts}
+    load: {{
+      executor: CONFIG.workload.executor,
+      startVUs: CONFIG.workload.startVUs || 0,
+      stages: CONFIG.workload.stages,{browser_opts}
     }},
   }},
   summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
-  thresholds: {{
-    {thr_js}
+  thresholds: CONFIG.thresholds,
+}};"""
+
+    executor = str(wl.get("executor") or "shared-iterations")
+    if executor == "constant-vus":
+        return f"""export const options = {{
+  scenarios: {{
+    {scenario_name}: {{
+      executor: CONFIG.workload.executor,
+      vus: CONFIG.workload.vus,
+      duration: CONFIG.workload.duration,{browser_opts}
+    }},
   }},
+  summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
+  thresholds: CONFIG.thresholds,
 }};"""
 
     return f"""export const options = {{
   scenarios: {{
     {scenario_name}: {{
-      executor: 'shared-iterations',
-      vus: {vus},
-      iterations: {iterations},
-      maxDuration: {json.dumps(max_duration)},{browser_opts}
+      executor: CONFIG.workload.executor,
+      vus: CONFIG.workload.vus,
+      iterations: CONFIG.workload.iterations,
+      maxDuration: CONFIG.workload.maxDuration,{browser_opts}
     }},
   }},
   summaryTrendStats: ['min', 'avg', 'med', 'max', 'p(50)', 'p(90)', 'p(95)', 'p(99)', 'count'],
-  thresholds: {{
-    {thr_js}
-  }},
+  thresholds: CONFIG.thresholds,
 }};"""
 
 
@@ -541,7 +593,48 @@ def _expect_json(headers: Dict[str, Any], body_type: str) -> bool:
     return False
 
 
-def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) -> str:
+def _think_sleep_js(*, awaitable: bool = False) -> str:
+    """Emit randomized think-time sleep from ``CONFIG.thinkTime``."""
+    prefix = "await " if awaitable else ""
+    return (
+        f"{prefix}sleep(__ENV.NFE_THINK_TIME === '0' ? 0 : "
+        f"(Math.random() * (CONFIG.thinkTime.max - CONFIG.thinkTime.min) "
+        f"+ CONFIG.thinkTime.min));"
+    )
+
+
+def _pacing_sleep_js(*, awaitable: bool = False) -> str:
+    """Emit dynamic start-to-start pacing from ``CONFIG.pacing_s`` (0 = off)."""
+    prefix = "await " if awaitable else ""
+    return (
+        "  // Dynamic pacing (start-to-start); set CONFIG.pacing_s > 0 to enable\n"
+        "  if (CONFIG.pacing_s > 0) {\n"
+        "    const __nfeElapsed = (Date.now() - __nfeIterStart) / 1000;\n"
+        f"    {prefix}sleep(Math.max(0, CONFIG.pacing_s - __nfeElapsed));\n"
+        "  }"
+    )
+
+
+def _assertion_opts_js(assertion: Optional[Dict[str, Any]]) -> str:
+    """Serialize IR assertion object into a k6 opts fragment."""
+    if not assertion:
+        return ""
+    # Strip emit-only flag; require_auth_session is handled via requireAuthSession
+    payload = {
+        k: v
+        for k, v in assertion.items()
+        if k not in ("require_auth_session",)
+    }
+    if not payload:
+        return ""
+    return f", assertion: {json.dumps(payload, separators=(',', ':'))}"
+
+
+def _emit_protocol_txn(
+    txn: Dict[str, Any],
+    correlations: List[Dict[str, Any]],
+    ir: Optional[Dict[str, Any]] = None,
+) -> str:
     """Emit one protocol-mode k6 transaction function.
 
     Args:
@@ -553,7 +646,6 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
     """
     name = txn["name"]
     desc = txn.get("description") or name
-    think = txn.get("think_time_s", 1)
     reqs = txn.get("requests") or []
     comments = "\n".join(
         f"    // - {r.get('method')} {r.get('url')}" for r in reqs[:30]
@@ -597,6 +689,13 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
         elif method == "POST" and "/auth/" in str(r.get("url") or "").lower():
             params_bits.append("redirects: 5")
         params_obj = "{ " + ", ".join(params_bits) + " }"
+
+        assertion = r.get("assertion") if isinstance(r.get("assertion"), dict) else None
+        assertion_js = _assertion_opts_js(assertion)
+        require_auth = bool(
+            (assertion or {}).get("require_auth_session")
+            or (method == "POST" and "/auth/validate" in str(r.get("url") or "").lower())
+        )
 
         # Non-randomizable / payment endpoints flagged in IR: mock instead of live call
         # so the deterministic compiler does not hit third-party limits during load.
@@ -653,12 +752,10 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
         expect_json = "true" if _expect_json(headers, str(r.get("body_type") or "")) else "false"
         # Auth validate: 2xx alone is insufficient — SPA often returns 200 login HTML
         # when CSRF/session is wrong, then every API call 401s.
-        auth_ok = ""
-        if method == "POST" and "/auth/validate" in str(r.get("url") or "").lower():
-            auth_ok = ", requireAuthSession: true"
+        auth_ok = ", requireAuthSession: true" if require_auth else ""
         body_lines.append(
             f"    if (nfeAssertResponse({var}, {_js_string(name)}, {_js_string(method)}, "
-            f"{{ soft: {soft}, expectJson: {expect_json}, label: {url_js}{auth_ok} }})) "
+            f"{{ soft: {soft}, expectJson: {expect_json}, label: {url_js}{auth_ok}{assertion_js} }})) "
             f"__nfeTxnFailed = true;"
         )
 
@@ -672,13 +769,13 @@ def _emit_protocol_txn(txn: Dict[str, Any], correlations: List[Dict[str, Any]]) 
     body_lines.append(
         f"    nfeMarkTxn({_js_string(name)}, __nfeTxnStart, __nfeTxnFailed);"
     )
-    body_lines.append(f"    sleep({think});")
+    body_lines.append(f"    {_think_sleep_js()}")
 
     if len(body_lines) <= 3:
         body_lines = [
             "    // No protocol HTTP for this TXN — check browser mode",
             f"    nfeMarkTxn({_js_string(name)}, Date.now(), false);",
-            f"    sleep({think});",
+            f"    {_think_sleep_js()}",
         ]
 
     return f"""
@@ -693,7 +790,11 @@ export function {name}() {{
 }}""".rstrip()
 
 
-def _emit_browser_txn(txn: Dict[str, Any], target_url: str) -> str:
+def _emit_browser_txn(
+    txn: Dict[str, Any],
+    target_url: str,
+    ir: Optional[Dict[str, Any]] = None,
+) -> str:
     """Emit one browser-mode k6 transaction function.
 
     Args:
@@ -705,7 +806,6 @@ def _emit_browser_txn(txn: Dict[str, Any], target_url: str) -> str:
     """
     name = txn["name"]
     desc = txn.get("description") or name
-    think = txn.get("think_time_s", 1)
     ui_steps = txn.get("ui_steps") or []
     reqs = txn.get("requests") or []
     seed = (reqs[0]["url"] if reqs else target_url) or "about:blank"
@@ -762,7 +862,7 @@ export async function {name}(page) {{
   }}
 {body}{post_login_wait}
   nfeMarkTxn({_js_string(name)}, __nfeTxnStart, __nfeTxnFailed);
-  await sleep({think});
+  {_think_sleep_js(awaitable=True)}
 }}""".rstrip()
 
 
@@ -864,7 +964,7 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
         mode = txn.get("mode") or "protocol"
         if mode == "browser":
             needs_browser = True
-            txn_fns.append(_emit_browser_txn(txn, target_url))
+            txn_fns.append(_emit_browser_txn(txn, target_url, ir))
             txn_meta.append((txn["name"], True))
         else:
             if not txn.get("requests"):
@@ -881,7 +981,7 @@ def emit_k6_from_ir(ir: Dict[str, Any]) -> str:
                         }
                     ],
                 }
-            txn_fns.append(_emit_protocol_txn(txn, correlations))
+            txn_fns.append(_emit_protocol_txn(txn, correlations, ir))
             txn_meta.append((txn["name"], False))
 
     if not txn_fns:
@@ -896,11 +996,15 @@ export function Launch() {{
     }});
     if (nfeAssertResponse(res, 'Launch', 'GET', {{ soft: false, expectJson: false }})) __nfeTxnFailed = true;
     nfeMarkTxn('Launch', __nfeTxnStart, __nfeTxnFailed);
-    sleep(1);
+    {_think_sleep_js()}
   }});
 }}""".rstrip()
         )
         txn_meta.append(("Launch", False))
+
+    pacing_start = "  const __nfeIterStart = Date.now();\n"
+    pacing_tail = f"\n{_pacing_sleep_js(awaitable=needs_browser)}"
+    user_config = _user_config_js(ir, param_block)
 
     if needs_browser:
         origin = ir.get("origin") or ""
@@ -971,30 +1075,29 @@ import {{ Trend, Counter }} from 'k6/metrics';
  * Target: {target_url}
  * IR version: {ir.get('version', 1)}
  * Hybrid: browser login (SPA CSRF) + protocol API TXNs.
+ * Edit USER CONFIG below for parameters, workload, think time, and pacing.
  */
 
-{_response_callback_js()}
+{user_config}
 
 {_workload_options_js(ir, browser=True)}
 
-{_runtime_helpers_js()}
+{_response_callback_js()}
 
-const vars = {{
-{param_block}
-}};
+{_runtime_helpers_js()}
 
 {chr(10).join(txn_fns)}
 
 export default async function () {{
   // Correlation checklist:
 {corr_block}
-
+{pacing_start}
   const page = await browser.newPage();
   try {{
 {calls}
   }} finally {{
     await page.close();
-  }}
+  }}{pacing_tail}
 }}
 
 {_handle_summary_block()}
@@ -1012,27 +1115,24 @@ import {{ Trend, Counter }} from 'k6/metrics';
  *
  * Protocol TXNs replay captured METHOD+URL (+ body when available).
  * Cookie-based sessions use the k6 cookie jar automatically.
- * Each response is asserted (status / body / optional JSON) and recorded
- * into tagged metrics for the HTML report tables.
+ * Edit USER CONFIG below for parameters, workload, think time, and pacing.
  */
 
-{_response_callback_js()}
+{user_config}
 
 {_workload_options_js(ir, browser=False)}
 
-{_runtime_helpers_js()}
+{_response_callback_js()}
 
-const vars = {{
-{param_block}
-}};
+{_runtime_helpers_js()}
 
 {chr(10).join(txn_fns)}
 
 export default function () {{
   // Correlation checklist:
 {corr_block}
-
-{calls}
+{pacing_start}
+{calls}{pacing_tail}
 }}
 
 {_handle_summary_block()}
