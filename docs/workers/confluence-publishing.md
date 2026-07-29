@@ -126,7 +126,7 @@ Points are resolved from `points_json` on the smoke result, or `k6-points.json` 
 | Thin Confluence body (no TXN tables) | Ensure `k6-points.json` exists beside the script / smoke returns `points_json` |
 | `missing_confluence_credentials` | Set `CONFLUENCE_EMAIL` + `CONFLUENCE_API_TOKEN` (or Jira fallbacks); restart Studio |
 | 401/403 | Token email, space permissions, classic token vs site URL |
-| No attachments | Files exist under `artifacts/k6/`; bot can add attachments |
+| No attachments | Files exist under `artifacts/k6/<app>/`; bot can add attachments |
 | Wrong flow page | Recording file name / `recording` in Jira story config |
 
 See also: [`jira-integration.md`](jira-integration.md), [`confluence-publisher-worker.md`](confluence-publisher-worker.md), [`security.md`](../security/security.md).

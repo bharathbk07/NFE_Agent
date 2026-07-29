@@ -20,7 +20,7 @@ Python agents load via `src/tools/mcp_client.py`.
       "enabled": true,
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"],
+      "args": ["-y", "@playwright/mcp@0.0.39"],
       "env": {}
     },
     "my-remote": {
@@ -67,7 +67,7 @@ Turn a server on only when a sub-agent should call that MCP at runtime.
 
 ### k6 smoke (CLI)
 
-Analysis smoke/heal always runs ``k6 run --out json=...`` via [`src/utils/k6_runner.py`](../../src/utils/k6_runner.py) so ``artifacts/k6/html-report.html`` gets full TXN/request tables.
+Analysis smoke/heal always runs ``k6 run --out json=...`` via [`src/utils/k6_runner.py`](../../src/utils/k6_runner.py) so ``artifacts/k6/<app>/html-report.html`` gets full TXN/request tables. Packages in [`config/mcp_servers.json`](../../config/mcp_servers.json) are **version-pinned** (no `@latest`).
 
 | Env | Effect |
 | --- | --- |

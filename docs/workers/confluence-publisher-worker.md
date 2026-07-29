@@ -31,7 +31,7 @@ When a smoke/load run **fully finishes** (SLA may pass or fail):
 
 ## Why it exists
 
-Artifacts on disk (`artifacts/k6/…`) are easy to lose in chat noise. Confluence gives the team a durable, searchable home per user flow — without asking an LLM to write wiki pages.
+Artifacts on disk (`artifacts/k6/<app>/…`) are easy to lose in chat noise. Confluence gives the team a durable, searchable home per user flow — without asking an LLM to write wiki pages.
 
 ---
 
@@ -111,6 +111,6 @@ analyse / Jira pipeline finishes smoke
 ## Related
 
 - [Jira story worker](jira-story-worker.md) — may link the Confluence run URL on the ticket  
-- [Transaction / analysts](overview.md) — supply metrics and TXNs in the page body  
+- [Transaction / analysts](../agents/overview.md) — supply metrics and TXNs in the page body  
 - [Smoke & self-heal](../pipeline/smoke-and-self-heal.md) — defines completed vs aborted  
 - [Security](../security/security.md)  

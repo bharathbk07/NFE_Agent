@@ -92,7 +92,7 @@ Chat: "work on SCRUM-1"
 | Label gate (`nfe-agent`) | Only opted-in issues are processed |
 | Comment sanitization / redaction | No passwords or tokens in Jira |
 | URL policy on `target_url` | Same SSRF controls as browser nav |
-| Credentials via `NFE_USER` / `NFE_PASS` | Never put app passwords in the story body |
+| Credentials via recording + story `credentials:` | Prefer Watch-me store; optional YAML `credentials:` — never put passwords only in free-text AC |
 | Fail closed on auth errors | Bad token does not silently “succeed” |
 
 ---

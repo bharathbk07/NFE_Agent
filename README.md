@@ -54,6 +54,8 @@ Publish findings (Jira comment + Confluence run page)
 
 Outputs are **per application domain** (e.g. `opensource-demo.orangehrmlive.com`), not a single flat host file.
 
+**Flow diagrams (Mermaid):** [User flow · End-to-end · Data transmission](docs/pipeline/flow-diagrams.md) · [Load-Test IR → k6](docs/pipeline/load-test-ir-and-k6.md)
+
 ---
 
 ## Architecture
@@ -289,7 +291,7 @@ Run1 + Run2 network logs
 - Smoke treats **4xx as script failure**; **5xx is allowed** as application fault.
 - Load runs abort early when HTTP fail rate exceeds **`NFE_K6_ABORT_FAIL_RATE`** (default **0.60** / 60%), with optional p99 / checks collapse guards.
 
-Full walkthrough: [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md).
+Full walkthrough: [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md). IR → k6: [`docs/pipeline/load-test-ir-and-k6.md`](docs/pipeline/load-test-ir-and-k6.md).
 
 ### Protocol vs Chromium (why hybrid exists)
 
@@ -323,7 +325,7 @@ Full walkthrough: [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-a
 
 App / flow layout: [`docs/pipeline/app-artifacts-and-knowledge.md`](docs/pipeline/app-artifacts-and-knowledge.md).
 
-Install k6: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). Smoke uses CLI `k6 run`. Optional MCP notes: [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md).
+Install k6: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/). Smoke uses CLI `k6 run` by default (MCP k6 stays disabled — see [Optional MCP servers](#optional-mcp-servers-enabled-false-by-default)).
 
 ---
 
@@ -430,6 +432,29 @@ NFE_CONFLUENCE_PUBLISH=true
 
 Setup: [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md).
 
+### Optional MCP servers (`enabled: false` by default)
+
+Project MCP registry: [`config/mcp_servers.json`](config/mcp_servers.json) (loaded by the LangGraph app — **not** Cursor IDE `.cursor/mcp.json`).
+
+Every server ships with **`"enabled": false`**. The core pipeline does **not** need MCP:
+
+| Server | Default | Why off | Core path instead |
+|--------|---------|---------|-------------------|
+| `k6` | `false` | Smoke/heal need CLI output for HTML + points | CLI `k6 run` |
+| `playwright` | `false` | Extra process; not used for capture | In-process Playwright + CDP |
+| `chrome-devtools` | `false` | Optional live traces only | CDP network in capture |
+| `atlassian` | `false` | Avoid Rovo MCP auth on every start | Jira/Confluence **REST** workers |
+
+Packages are **version-pinned** (no `@latest`) to avoid surprise upgrades.
+
+**Enable only when you need that MCP in-bot:**
+
+1. Set `"enabled": true` on the server in `config/mcp_servers.json`
+2. For k6 MCP tools: also set `NFE_K6_MCP=mcp` in `.env` (default remains `cli`)
+3. Restart Studio / `langgraph`
+
+Full details: [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md).
+
 ---
 
 ## Using the chat
@@ -483,9 +508,11 @@ LLM prompts live under [`prompts/`](prompts/). Script generation and healing do 
 | Jira setup | [`docs/workers/jira-integration.md`](docs/workers/jira-integration.md) |
 | Confluence setup | [`docs/workers/confluence-publishing.md`](docs/workers/confluence-publishing.md) |
 | Smoke + self-heal | [`docs/pipeline/smoke-and-self-heal.md`](docs/pipeline/smoke-and-self-heal.md) |
+| Flow diagrams (user / E2E / data) | [`docs/pipeline/flow-diagrams.md`](docs/pipeline/flow-diagrams.md) |
+| Load-Test IR → k6 | [`docs/pipeline/load-test-ir-and-k6.md`](docs/pipeline/load-test-ir-and-k6.md) |
 | App artifacts & knowledge | [`docs/pipeline/app-artifacts-and-knowledge.md`](docs/pipeline/app-artifacts-and-knowledge.md) |
 | Security | [`docs/security/security.md`](docs/security/security.md) |
-| Optional MCPs | [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md) |
+| Optional MCPs (`enabled: false` defaults) | [`docs/mcp/optional-mcps.md`](docs/mcp/optional-mcps.md) |
 
 ---
 

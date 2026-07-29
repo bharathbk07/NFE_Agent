@@ -65,7 +65,7 @@ Triggered from the `analyse_traffic` node after IR → k6 emit ([`src/nodes/anal
 | Virtual users | 1 | One user path |
 | Iterations | 2 | Catch flaky script bugs twice |
 | Tool | CLI `k6 run` | Same engine you use in CI |
-| Credentials | `NFE_USER` / `NFE_PASS` env | Not baked into the script by default |
+| Credentials | From Watch-me recording and/or chat/Jira `credentials:` (when `NFE_STORE_CREDENTIALS`) | IR vars / k6 `vars` — not a global `NFE_USER`/`NFE_PASS` |
 
 If `k6` is not installed, smoke is **skipped** (script is still written; chat notes that validation did not run).
 
@@ -97,10 +97,10 @@ Outputs:
 
 | Artifact | Role |
 |----------|------|
-| `artifacts/k6/<host>.js` | Script (overwritten on each heal) |
-| `artifacts/k6/<host>_ir.json` | Structured plan the compiler reads |
-| `artifacts/k6/html-report.html` | Human-readable TXN / fail view |
-| `artifacts/k6/k6-points.json` | Raw samples used to build the HTML report |
+| `artifacts/k6/<app>/<flow>.js` | Script (overwritten on each heal) |
+| `artifacts/k6/<app>/<flow>_ir.json` | Structured plan the compiler reads |
+| `artifacts/k6/<app>/html-report.html` | Human-readable TXN / fail view |
+| `artifacts/k6/<app>/k6-points.json` | Raw samples used to build the HTML report |
 | Chat / Jira | Pass/fail + short heal notes |
 
 ---
@@ -331,13 +331,8 @@ If after two heals login still 401s because the SPA never exposes a usable CSRF 
 ## Operator checklist
 
 1. Install k6: [Install k6](https://grafana.com/docs/k6/latest/set-up/install-k6/).
-2. For authenticated apps, export credentials for the smoke process:
-
-   ```bash
-   NFE_USER=Admin NFE_PASS=secret
-   ```
-
-3. After a run, open `artifacts/k6/html-report.html` if smoke failed.
+2. For authenticated apps, supply credentials via Watch-me / chat (`username=… password=…`) or a Jira story `credentials:` block (stored on the recording when `NFE_STORE_CREDENTIALS=true`). Do **not** rely on a global `NFE_USER`/`NFE_PASS`.
+3. After a run, open `artifacts/k6/<app>/html-report.html` if smoke failed.
 4. Read heal notes in the Studio chat summary (or Jira Test Report).
 5. Only raise VUs / iterations in the IR or script after smoke is green.
 
@@ -357,4 +352,4 @@ If after two heals login still 401s because the SPA never exposes a usable CSRF 
 | Chat playbook smoke section | [`src/utils/formatting.py`](../../src/utils/formatting.py) |
 | Browser *selector* self-heal (different) | [`src/tools/playwright_tool.py`](../../src/tools/playwright_tool.py), [`prompts/browser_self_heal.txt`](../../prompts/browser_self_heal.txt) |
 
-Related docs: [`security.md`](../security/security.md), [`jira-integration.md`](../workers/jira-integration.md), main [`README.md`](../../README.md).
+Related docs: [`load-test-ir-and-k6.md`](load-test-ir-and-k6.md), [`flow-diagrams.md`](flow-diagrams.md), [`security.md`](../security/security.md), [`jira-integration.md`](../workers/jira-integration.md), main [`README.md`](../../README.md).

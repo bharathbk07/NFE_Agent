@@ -47,7 +47,7 @@ artifacts/
 App/domain paths are preferred. Readers still fall back to legacy flat files:
 
 - `artifacts/recordings/<host>.json`
-- `artifacts/k6/<host>.js` / `<host>_ir.json`
+- `artifacts/k6/<host>.js` / `<host>_ir.json` (legacy flat; prefer `k6/<domain>/<flow>.*`)
 
 ## Markdown knowledge
 

@@ -64,7 +64,7 @@ analyse_traffic
 
 ## Security techniques
 
-- Identifies credential fields so they can stay as env-backed vars (`NFE_USER` / `NFE_PASS`) instead of literals.
+- Identifies credential fields so they map to IR vars from the Watch-me / chat / Jira `credentials:` store (not hardcoded literals). Placeholder names like `NFE_USER` / `NFE_PASS` may appear only when values are redacted / store is off.
 - Does **not** send password values to an LLM.
 - Helps keep secrets out of the “correlation” bucket (wrong place for passwords).
 

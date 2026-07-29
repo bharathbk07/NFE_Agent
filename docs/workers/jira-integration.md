@@ -83,9 +83,8 @@ NFE_JIRA_IN_PROGRESS_STATUS=In Progress
 # Optional: custom field id for Acceptance Criteria (otherwise use description)
 # NFE_JIRA_ACCEPTANCE_FIELD=customfield_10000
 
-# k6 credentials (never put real passwords in the Jira story body)
-NFE_USER=Admin
-NFE_PASS=secret
+# App login credentials come from Watch-me recording and/or story YAML
+# credentials: { username, password } — not global NFE_USER/NFE_PASS
 ```
 
 ### 5. Verify auth
@@ -135,13 +134,15 @@ workload:
 thresholds:
   http_req_duration: ["p(95)<2000"]
   http_req_failed: ["rate<0.01"]
-credential_env:
-  username: NFE_USER
-  password: NFE_PASS
+credentials:
+  username: Admin
+  password: admin123
 ```
 ````
 
 `target_url` host becomes the **app folder** (`opensource-demo.orangehrmlive.com`). `recording` is the **flow** stem (e.g. `Create Claim` → `artifacts/recordings/opensource-demo.orangehrmlive.com/create-claim.json`). Legacy flat `artifacts/recordings/Create Claim.json` still resolves.
+
+**Credentials (preferred order):** Watch-me recording store (when `NFE_STORE_CREDENTIALS`) → story `credentials:` block → optional legacy `credential_env:` that names env vars to resolve at runtime. Do **not** put passwords in free-text acceptance criteria.
 
 When the story includes a **workload** block, that model is **authoritative** for the k6 run (VUs, iterations, duration/stages, executor, thresholds). The Jira pipeline skips analyse’s default 1 VU × 2 smoke and emits + runs a single script with the story options. If no workload is specified, NFE keeps default smoke and labels `workload_source=default_smoke`.
 
@@ -263,13 +264,13 @@ MCP uses Atlassian’s remote MCP / OAuth flow (see [Atlassian Rovo MCP](https:/
 
 ## Recording gate
 
-If `artifacts/recordings/<name>.json` is missing, the worker comments instructions, sets `nfe-blocked`, and stops. After Watch-me, add **`nfe-recording-ready`** (keep `nfe-agent`) and say **work on SCRUM-1** again (or **force** if needed).
+If `artifacts/recordings/<domain>/<flow>.json` is missing (legacy flat `artifacts/recordings/<name>.json` also checked), the worker comments instructions, sets `nfe-blocked`, and stops. After Watch-me, add **`nfe-recording-ready`** (keep `nfe-agent`) and say **work on SCRUM-1** again (or **force** if needed).
 
 ---
 
 ## Security notes
 
-- Never put app passwords in the Jira description; use `credential_env` + `NFE_USER` / `NFE_PASS`.
+- Never put app passwords in free-text AC; use Watch-me recording store and/or story `credentials:` (optional legacy `credential_env:` for env indirection).
 - Comments are sanitized ([`src/integrations/jira/security.py`](../../src/integrations/jira/security.py)).
 - Parsed `target_url` goes through NFE URL policy.
 - Chat replies mirror Jira comments briefly and do not dump secrets.

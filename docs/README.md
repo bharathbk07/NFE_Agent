@@ -45,6 +45,8 @@ Overview: [workers/overview.md](workers/overview.md)
 
 | Doc | Description |
 |-----|-------------|
+| [**Flow diagrams**](pipeline/flow-diagrams.md) | User flow, end-to-end pipeline, data transmission (Mermaid) |
+| [Load-Test IR → k6](pipeline/load-test-ir-and-k6.md) | Deterministic IR blueprint, protocol/hybrid emit, Run 2 randomization |
 | [Smoke check and self-heal](pipeline/smoke-and-self-heal.md) | k6 smoke gate, heal loop, catastrophic abort (≥60% fail), Chromium vs HTTP |
 | [App artifacts & knowledge](pipeline/app-artifacts-and-knowledge.md) | Domain-scoped recordings/k6, markdown knowledge, local ChromaDB RAG |
 
