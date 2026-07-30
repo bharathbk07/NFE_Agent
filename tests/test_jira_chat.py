@@ -11,6 +11,42 @@ from src.agents.intent_router import _heuristic_intent
 from src.nodes.jira_story import extract_issue_key, run_jira_story, summarize_jira_result
 
 
+def test_heuristic_jira_list_phrases():
+    phrases = [
+        "list all jira stroy",
+        "list jira stories",
+        "show jira issues",
+        "list all jira stories?",
+    ]
+    for text in phrases:
+        intent, confidence, _reason = _heuristic_intent(text, False)
+        assert intent == "pe_assist", text
+        assert confidence >= 0.9
+
+
+def test_run_jira_story_list_only_does_not_auto_run():
+    from src.integrations.jira.client import JiraIssue
+
+    state = {"messages": [HumanMessage(content="list all jira stroy")]}
+    only = JiraIssue(key="SCRUM-9", summary="Solo", status="To Do")
+    with (
+        patch(
+            "src.nodes.jira_story._list_eligible_issues",
+            return_value=[only],
+        ),
+        patch(
+            "src.nodes.jira_story._prepare_and_run",
+            new_callable=AsyncMock,
+        ) as mocked,
+    ):
+        out = asyncio.run(run_jira_story(state))
+
+    mocked.assert_not_awaited()
+    content = out["messages"][0].content
+    assert "SCRUM-9" in content
+    assert "Eligible" in content or "work on" in content.lower()
+
+
 def test_heuristic_jira_perf_phrases():
     """Only explicit execute commands short-circuit; NL mentions do not."""
     phrases = [
@@ -55,7 +91,7 @@ def test_guard_downgrades_jira_question():
         "what about the jira smoke results?",
         True,
     )
-    assert guarded.intent == "analysis_qa"
+    assert guarded.intent == "pe_assist"
 
 
 def test_extract_issue_key():

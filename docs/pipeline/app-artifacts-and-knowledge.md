@@ -52,9 +52,29 @@ App/domain paths are preferred. Readers still fall back to legacy flat files:
 - `artifacts/recordings/<host>.json`
 - `artifacts/k6/<host>.js` / `<host>_ir.json` (legacy flat; prefer `k6/<domain>/<flow>.*`)
 
-## Markdown knowledge
+## Script recipes (correlation / heal memory)
 
-After a successful analyse / Jira workload smoke, NFE upserts a **flow card** under `knowledge/<domain>/flows/<flow>.md` with target URL, artifact paths, TXN names, workload source, and last smoke status.
+After a **green** smoke, NFE also writes:
+
+```text
+artifacts/knowledge/<domain>/flows/<flow>_recipe.json
+```
+
+That recipe stores reusable correlations, vars, and heal notes for the app/flow.
+
+**Reuse loop (current):**
+
+1. **Knowledge-first on reuse / Jira:** if a saved `{flow}_ir.json` exists for the
+   same app/flow, analyse loads it and skips traffic rebuild + correlation
+   classifier (no from-scratch analyse). Recipe correlations/vars are merged in.
+2. If a green recipe exists → also skip optional Run 3 capture on full analyse.
+3. If smoke still fails → rule-based heal (≤2) as before.
+4. If smoke passes → upsert/update the recipe for the next run.
+
+Force a full rebuild: set state `force_rebuild_ir=true` (or ask the agent to
+rebuild from the recording).
+
+Knowledge markdown cards (`flows/<flow>.md`) remain the human-readable index; recipes are the machine-usable fix memory.
 
 ## Local ChromaDB RAG
 

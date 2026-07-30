@@ -134,6 +134,27 @@ async def run_perf_for_request(
         )
         heal_notes.extend(assert_notes)
 
+        from src.utils.script_recipes import (
+            apply_script_recipe_to_ir,
+            upsert_script_recipe,
+        )
+
+        ir, recipe_notes = apply_script_recipe_to_ir(ir, app_id, flow_id or "default")
+        heal_notes.extend(recipe_notes)
+        if recipe_notes:
+            # Re-emit k6 after recipe merge
+            from src.utils.k6_generator import emit_k6_from_ir as _emit_recipe
+
+            if story_workload:
+                ir["workload"] = dict(story_workload)
+            k6_script = _emit_recipe(ir)
+            ir, k6_script, assert_ok, assert_notes = prepare_ir_and_script_for_smoke(
+                ir,
+                k6_script,
+                network_requests=network_reqs,
+            )
+            heal_notes.extend(assert_notes)
+
         k6_file = save_k6_script(
             k6_script,
             target_url=target_url,
@@ -218,6 +239,16 @@ async def run_perf_for_request(
             if smoke.get("ok"):
                 heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
                 break
+
+        if smoke.get("ok") is True and app_id:
+            upsert_script_recipe(
+                app_id,
+                flow_id or "default",
+                ir=ir,
+                heal_notes=heal_notes,
+                smoke_ok=True,
+                target_url=target_url,
+            )
     else:
         if story_workload and not k6_script:
             logger.error(

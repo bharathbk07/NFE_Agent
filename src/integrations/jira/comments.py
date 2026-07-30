@@ -223,7 +223,10 @@ def _why_failed_section(
             f"(`{smoke_summary or exit_code}`)."
         )
     elif thr_fails:
-        lines.append("* Test **completed**, but **SLA / thresholds failed**:")
+        lines.append(
+            "* k6 **finished the planned iterations**, but **SLA / thresholds failed** "
+            "(this is **not** a passed performance test):"
+        )
         for r in thr_fails[:15]:
             lines.append(
                 f"  * `{r['metric']}` → `{r['threshold']}`"
@@ -234,7 +237,9 @@ def _why_failed_section(
         lines.append("* Smoke status unknown (no conclusive pass/fail).")
     else:
         lines.append(
-            "* Test **completed** (or attempted), but smoke checks / script validation failed."
+            "* Smoke / script validation **FAILED** "
+            "(often correlation, auth, or hardcoded IDs). "
+            "This is **not** a completed successful performance test."
         )
 
     if failed_urls:

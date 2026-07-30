@@ -28,6 +28,7 @@ Overview: [agents/overview.md](agents/overview.md)
 | Correlation classifier | [agents/correlation-classifier-agent.md](agents/correlation-classifier-agent.md) |
 | Transaction agent | [agents/transaction-agent.md](agents/transaction-agent.md) |
 | Analysis QA | [agents/analysis-qa-agent.md](agents/analysis-qa-agent.md) |
+| PE Assistant runtime | [agents/pe-assistant-runtime.md](agents/pe-assistant-runtime.md) |
 | Shared state | [agents/agent-state.md](agents/agent-state.md) |
 
 ## Workers

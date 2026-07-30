@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -184,6 +184,146 @@ def extract_watch_me_label(text: str) -> str:
     if m:
         return m.group(1).strip()
     return ""
+
+
+def list_knowledge_apps() -> List[str]:
+    """Return app ids that already have a ``artifacts/knowledge/<app>/`` folder."""
+    root = artifacts_root() / "knowledge"
+    if not root.is_dir():
+        return []
+    return sorted(
+        p.name
+        for p in root.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name.strip()
+    )
+
+
+def resolve_evidence_scope(
+    *,
+    question: str = "",
+    app: str = "",
+    flow: str = "",
+    target_url: str = "",
+    state: Optional[dict] = None,
+) -> Tuple[str, str, str]:
+    """Best-effort ``(app, flow, target_url)`` for trend / Confluence sync.
+
+    Empty session scope (``app=""``, ``flow=default``) is the common assist
+    failure mode — recover from the question, prior messages, default app,
+    and local knowledge folders so Confluence ingest can write KPIs.
+    """
+    state = state or {}
+    q = question or ""
+    q_lower = q.lower()
+    url = (target_url or str(state.get("target_url") or "")).strip()
+    app_id = (app or str(state.get("app") or "")).strip()
+    flow_id = (flow or str(state.get("flow") or "")).strip()
+
+    # URLs / hosts mentioned in the question or recent human messages
+    blob = q
+    for msg in list(state.get("messages") or [])[-12:]:
+        content = getattr(msg, "content", None)
+        if content is None and isinstance(msg, dict):
+            content = msg.get("content")
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("text"):
+                    parts.append(str(block["text"]))
+                elif isinstance(block, str):
+                    parts.append(block)
+            content = " ".join(parts)
+        if content:
+            blob += "\n" + str(content)
+
+    if not url:
+        m = re.search(r"https?://[^\s\"'<>]+", blob, re.I)
+        if m:
+            url = m.group(0).rstrip(").,;]")
+
+    if not app_id and url:
+        app_id = app_id_from_url(url)
+
+    if not app_id:
+        # Host-like token in text (orangehrmlive.com, example.com)
+        m = re.search(
+            r"\b([a-z0-9][a-z0-9.-]+\.(?:com|net|org|io|live|dev|local))\b",
+            blob,
+            re.I,
+        )
+        if m:
+            app_id = app_id_from_url(f"https://{m.group(1)}")
+
+    if not app_id:
+        try:
+            from config.settings import settings
+
+            app_id = resolve_app_id(default_app=settings.NFE_DEFAULT_APP or "")
+        except Exception:
+            app_id = ""
+
+    # Flow hints: create-claim / Create Claim / story wording
+    if re.search(r"create[\s_-]*claim", blob, re.I):
+        flow_id = "create-claim"
+    elif not flow_id or flow_id.lower() in {"default", "none", "(none)"}:
+        if re.search(
+            r"\b(that\s+user\s+stor(?:y|ies)|that\s+stor(?:y|ies)|"
+            r"jira\s+stor(?:y|ies)|user\s+stor(?:y|ies))\b",
+            q_lower,
+        ):
+            # Prefer the story flow that has local history when scope is bare default
+            apps = [app_id] if app_id else list_knowledge_apps()
+            for candidate_app in apps:
+                flows_dir = artifacts_root() / "knowledge" / candidate_app / "flows"
+                if (flows_dir / "create-claim.md").is_file() or any(
+                    (artifacts_root() / "knowledge" / candidate_app / "runs").glob(
+                        "create-claim_*.md"
+                    )
+                ):
+                    flow_id = "create-claim"
+                    if not app_id:
+                        app_id = candidate_app
+                    break
+        if not flow_id or flow_id.lower() in {"default", "none", "(none)"}:
+            flow_id = slug_flow(flow_id) or "default"
+    else:
+        flow_id = slug_flow(flow_id) or flow_id
+
+    if not app_id:
+        known = list_knowledge_apps()
+        if len(known) == 1:
+            app_id = known[0]
+        elif known:
+            # Prefer app that already has runs for this flow
+            flow_slug = slug_flow(flow_id) or flow_id or "default"
+            scored: List[Tuple[int, str]] = []
+            for name in known:
+                runs = artifacts_root() / "knowledge" / name / "runs"
+                n = (
+                    len(list(runs.glob(f"{flow_slug}_*.md")))
+                    if runs.is_dir()
+                    else 0
+                )
+                scored.append((n, name))
+            scored.sort(key=lambda t: (-t[0], t[1]))
+            if scored[0][0] > 0:
+                app_id = scored[0][1]
+            else:
+                app_id = scored[0][1]
+
+    if app_id and not url:
+        # Recover target_url from flow card when possible
+        try:
+            from src.utils.knowledge_store import read_flow
+
+            card = read_flow(app_id, flow_id or "default") or ""
+            m = re.search(r"\*\*Target URL:\*\*\s*`([^`]+)`", card)
+            if m and m.group(1) not in {"n/a", ""}:
+                url = m.group(1).strip()
+        except Exception:
+            pass
+
+    return app_id, flow_id or "default", url
 
 
 def ensure_app_dirs(app_id: str) -> Path:

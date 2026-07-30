@@ -78,7 +78,18 @@ def test_should_publish_completed_with_summary(tmp_path, monkeypatch):
     path.write_text(json.dumps(summary), encoding="utf-8")
 
     smoke = {"ok": False, "skipped": False, "exit_code": 99, "summary": "failed"}
-    assert should_publish_to_confluence(smoke, str(path)) is True
+    assert should_publish_to_confluence(smoke, str(path)) is False
+    assert (
+        explain_confluence_skip(smoke, str(path)) == "smoke_failed_no_publish"
+    )
+
+    # Passing smoke with summary → publish
+    assert (
+        should_publish_to_confluence(
+            {"ok": True, "skipped": False, "exit_code": 0}, str(path)
+        )
+        is True
+    )
 
 
 def test_should_publish_no_sla_completed(tmp_path, monkeypatch):
@@ -547,6 +558,7 @@ def test_comment_results_why_failed_and_confluence():
     )
     assert "Why it failed" in body
     assert "401" in body
+    assert "not** a completed successful" in body.lower() or "FAILED" in body
     assert "Confluence" in body
     assert "wiki/spaces/ENG" in body
 

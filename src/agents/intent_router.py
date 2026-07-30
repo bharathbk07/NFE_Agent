@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 IntentName = Literal[
     "conversation",
     "analysis_qa",
+    "pe_assist",
     "performance_analysis",
     "follow_up_analysis",
     "watch_me",
@@ -83,6 +84,21 @@ JIRA_EXECUTE_NO_KEY = re.compile(
     re.IGNORECASE,
 )
 
+# List eligible NFE stories via REST (not MCP). Tolerates typos like "stroy".
+JIRA_LIST_COMMAND = re.compile(
+    r"^\s*("
+    r"(please\s+)?"
+    r"(list|show|display|get)\s+"
+    r"(all\s+|the\s+|my\s+|available\s+|open\s+)?"
+    r"(jira\s+)?"
+    r"(s(?:tory|tories|troy|troies)|issues?|tickets?)"
+    r"|"
+    r"what\s+(jira\s+)?(s(?:tory|tories|troy|troies)|issues?|tickets?)\s+"
+    r"(are\s+)?(there|available|open|eligible)"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+
 FOLLOW_UP_COMMAND = re.compile(
     r"^\s*("
     r"run\s+again|analyze\s+again|analyse\s+again|"
@@ -111,6 +127,11 @@ STRUCTURED_KEYS_RE = re.compile(
 # Soft signals for the LLM prompt only (never used as hard routing).
 _SOFT_WATCH = re.compile(r"\b(watch\s+me|record\s+while|i('?ll| will)\s+click)\b", re.I)
 _SOFT_JIRA = re.compile(r"\b(jira|scrum-\d+|[A-Z][A-Z0-9]+-\d+)\b", re.I)
+_SOFT_JIRA_LIST = re.compile(
+    r"\b(list|show|display)\b.*\b(jira|stor\w*|issues?|tickets?)\b"
+    r"|\b(jira|stories|issues)\b.*\b(list|available|open)\b",
+    re.I,
+)
 _SOFT_REUSE = re.compile(r"\b(saved\s+recording|list\s+recordings|reuse\s+recording)\b", re.I)
 _SOFT_QA = re.compile(
     r"\b(why|what|how|explain|trend|smoke|p95|script|result|fail|token|csrf)\b",
@@ -129,8 +150,9 @@ class IntentDecision(BaseModel):
 
     intent: IntentName = Field(
         description=(
-            "conversation = casual chat / math / greetings unrelated to prior analysis; "
-            "analysis_qa = question about prior analysis results in this chat; "
+            "conversation = greetings / math only; "
+            "pe_assist = personal PE assistant (supervisor + specialists); "
+            "analysis_qa = legacy alias for pe_assist; "
             "watch_me = user will click in a headed browser the bot opens; "
             "reuse_recording = load/list a saved Watch-me recording; "
             "jira_perf = user explicitly asks to EXECUTE a Jira issue workflow; "
@@ -184,6 +206,10 @@ def _soft_signals(text: str, has_prior: bool) -> str:
         hints.append(
             "- message mentions Jira / an issue key (topic ≠ execute unless asked)"
         )
+    if _SOFT_JIRA_LIST.search(text):
+        hints.append(
+            "- message may ask to list eligible Jira stories (use jira_perf list mode)"
+        )
     if _SOFT_REUSE.search(text):
         hints.append("- message mentions saved/list recordings")
     if _SOFT_QA.search(text):
@@ -232,6 +258,10 @@ def _mechanical_intent(
     ):
         return "conversation", 0.9, "Math expression"
 
+    # List eligible stories → PE assistant (Integrations specialist), not execute worker
+    if JIRA_LIST_COMMAND.match(cleaned):
+        return "pe_assist", 0.96, "Explicit Jira list → PE assistant"
+
     # Explicit whole-message Jira *execute* commands only
     if JIRA_EXECUTE_WITH_KEY.match(cleaned) or JIRA_EXECUTE_NO_KEY.match(cleaned):
         if not _QUESTIONISH.search(cleaned):
@@ -273,16 +303,46 @@ def _mechanical_intent(
     return None
 
 
-def _wants_jira_perf(text: str) -> bool:
-    """True only for explicit Jira *execute* commands (mechanical path).
+def wants_jira_list(text: str) -> bool:
+    """True when the user asks to list eligible Jira stories (not execute)."""
+    return bool(JIRA_LIST_COMMAND.match((text or "").strip()))
 
-    Kept for callers/tests; natural-language Jira mentions return False.
-    """
+
+def _wants_jira_perf(text: str) -> bool:
+    """True for explicit Jira *execute* commands (mechanical path)."""
     cleaned = (text or "").strip()
+    if wants_jira_list(cleaned):
+        return False
     if _QUESTIONISH.search(cleaned):
         return False
     return bool(
         JIRA_EXECUTE_WITH_KEY.match(cleaned) or JIRA_EXECUTE_NO_KEY.match(cleaned)
+    )
+
+
+def _promote_to_pe_assist(decision: IntentDecision, text: str) -> IntentDecision:
+    """Map open PE chat onto the supervisor path (not canned conversation)."""
+    if decision.intent in ("pe_assist", "analysis_qa"):
+        return IntentDecision(
+            intent="pe_assist",
+            confidence=decision.confidence,
+            reply=None,
+            reason=decision.reason or "pe_assist",
+        )
+    if decision.intent != "conversation":
+        return decision
+    cleaned = (text or "").strip()
+    if GREETING_OR_CHAT.match(cleaned):
+        return decision
+    if len(cleaned) < 80 and re.fullmatch(
+        r"\s*\d+\s*[\+\-\*/]\s*\d+\s*[?.!]?\s*", cleaned
+    ):
+        return decision
+    return IntentDecision(
+        intent="pe_assist",
+        confidence=max(decision.confidence, 0.7),
+        reply=None,
+        reason=f"Promoted conversation → pe_assist ({decision.reason})",
     )
 
 
@@ -333,6 +393,7 @@ async def classify_intent(
         )
         if isinstance(decision, IntentDecision):
             decision = _guard_pipeline_intents(decision, text, has_prior_analysis_context)
+            decision = _promote_to_pe_assist(decision, text)
             if decision.intent == "conversation" and not decision.reply:
                 decision.reply = _default_conversation_reply(
                     text, has_prior_analysis_context
@@ -341,6 +402,7 @@ async def classify_intent(
         if isinstance(decision, dict):
             parsed = IntentDecision.model_validate(decision)
             parsed = _guard_pipeline_intents(parsed, text, has_prior_analysis_context)
+            parsed = _promote_to_pe_assist(parsed, text)
             if parsed.intent == "conversation" and not parsed.reply:
                 parsed.reply = _default_conversation_reply(
                     text, has_prior_analysis_context
@@ -349,19 +411,11 @@ async def classify_intent(
     except Exception as exc:
         logger.warning("LLM intent classification failed (%s); defaulting carefully.", exc)
 
-    # Fail closed: never auto-run Jira/pipeline on ambiguity
-    if has_prior_analysis_context:
-        return IntentDecision(
-            intent="analysis_qa",
-            confidence=0.55,
-            reason="Ambiguous with prior analysis; answering from context (fail-closed)",
-        )
-
+    # Fail closed: never auto-run Jira/pipeline on ambiguity — use PE assistant
     return IntentDecision(
-        intent="conversation",
+        intent="pe_assist",
         confidence=0.55,
-        reply=_default_conversation_reply(text, False),
-        reason="Ambiguous; defaulting to conversation (fail-closed)",
+        reason="Ambiguous; defaulting to pe_assist (fail-closed)",
     )
 
 
@@ -377,26 +431,26 @@ def _guard_pipeline_intents(
     """
     if decision.intent not in ("jira_perf", "performance_analysis", "follow_up_analysis"):
         return decision
+    # Listing stories → PE assistant (not jira execute worker)
+    if decision.intent == "jira_perf" and (
+        wants_jira_list(text) or _SOFT_JIRA_LIST.search(text or "")
+    ):
+        return IntentDecision(
+            intent="pe_assist",
+            confidence=decision.confidence,
+            reply=None,
+            reason="List Jira → pe_assist (Integrations specialist)",
+        )
     if not _QUESTIONISH.search(text or ""):
         return decision
-    # Question + prior context → QA; question without prior → conversation
-    if has_prior:
-        return IntentDecision(
-            intent="analysis_qa",
-            confidence=min(decision.confidence, 0.75),
-            reply=None,
-            reason=(
-                f"Guarded: message is a question; refused pipeline intent "
-                f"'{decision.intent}' ({decision.reason})"
-            ),
-        )
+    # Question + prior context → PE assist; question without prior → PE assist too
     return IntentDecision(
-        intent="conversation",
-        confidence=0.6,
-        reply=_default_conversation_reply(text, False),
+        intent="pe_assist",
+        confidence=min(decision.confidence, 0.75),
+        reply=None,
         reason=(
-            f"Guarded: question without prior analysis; refused pipeline intent "
-            f"'{decision.intent}'"
+            f"Guarded: message is a question; refused pipeline intent "
+            f"'{decision.intent}' ({decision.reason})"
         ),
     )
 

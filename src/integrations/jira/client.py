@@ -416,3 +416,63 @@ class JiraClient:
                 resp2, context=f"POST transition {key}→{target_status}", issue_key=key
             )
             return True
+
+    def create_issue(
+        self,
+        *,
+        summary: str,
+        description: str = "",
+        acceptance_criteria: str = "",
+        labels: Optional[Sequence[str]] = None,
+        parent_key: Optional[str] = None,
+        project_key: Optional[str] = None,
+        issuetype: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a Jira issue (analysis ticket). Fail closed without project."""
+        from src.integrations.jira.adf import report_markup_to_adf
+
+        project = (
+            (project_key or settings.NFE_JIRA_ANALYSIS_PROJECT or settings.JIRA_PROJECT_KEY or "")
+            .strip()
+        )
+        if not project and parent_key:
+            # Infer project from parent key prefix
+            project = str(parent_key).split("-", 1)[0]
+        if not project:
+            raise NFEConfigError(
+                "NFE_JIRA_ANALYSIS_PROJECT or JIRA_PROJECT_KEY required to create issues",
+                code=ErrorCode.CONFIG_MISSING,
+                user_message="Configure NFE_JIRA_ANALYSIS_PROJECT to create analysis issues.",
+            )
+        itype = (issuetype or settings.NFE_JIRA_ANALYSIS_ISSUETYPE or "Task").strip()
+        fields: Dict[str, Any] = {
+            "project": {"key": project},
+            "summary": (summary or "")[:255],
+            "issuetype": {"name": itype},
+            "labels": list(labels or []),
+        }
+        body_parts = []
+        if description:
+            body_parts.append(sanitize_comment(description))
+        if acceptance_criteria:
+            body_parts.append("h2. Acceptance criteria\n" + sanitize_comment(acceptance_criteria))
+        if body_parts:
+            fields["description"] = report_markup_to_adf("\n\n".join(body_parts))
+        # Optional AC custom field
+        try:
+            ac_field = self.resolve_acceptance_field()
+            if ac_field and acceptance_criteria:
+                fields[ac_field] = sanitize_comment(acceptance_criteria)[:8000]
+        except Exception:
+            pass
+        with self._client() as client:
+            resp = client.post("/rest/api/3/issue", json={"fields": fields})
+            _raise_for_status(resp, context="POST create issue")
+            data = resp.json() or {}
+        key = str(data.get("key") or "")
+        url = ""
+        base = (settings.JIRA_BASE_URL or "").rstrip("/")
+        if key and base:
+            url = f"{base}/browse/{key}"
+        return {"key": key, "id": data.get("id"), "url": url, "project": project}
+

@@ -50,8 +50,8 @@ def parse_json_from_llm(text: str) -> Any:
         Decoded JSON value of any JSON-compatible type.
 
     Raises:
-        ValueError: If the response is empty.
-        json.JSONDecodeError: If no valid JSON payload can be decoded.
+        ValueError: If the response is empty or contains no JSON payload.
+        json.JSONDecodeError: If a candidate payload cannot be decoded.
     """
     cleaned = extract_message_text(text)
     if not cleaned:
@@ -65,16 +65,26 @@ def parse_json_from_llm(text: str) -> Any:
     fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
     if fence_match:
         cleaned = fence_match.group(1).strip()
+        if not cleaned:
+            raise ValueError("LLM returned empty JSON fence")
 
     array_match = re.search(r"(\[[\s\S]*\])", cleaned)
     if array_match:
-        cleaned = array_match.group(1)
+        cleaned = array_match.group(1).strip()
 
     object_match = re.search(r"(\{[\s\S]*\})", cleaned)
     if object_match and not array_match:
-        cleaned = object_match.group(1)
+        cleaned = object_match.group(1).strip()
 
-    return json.loads(cleaned)
+    if not cleaned:
+        raise ValueError("LLM returned no JSON object or array")
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"LLM returned non-JSON structured output ({exc})"
+        ) from exc
 
 
 class RobustJsonOutputParser(JsonOutputParser):

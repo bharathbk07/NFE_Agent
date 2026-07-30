@@ -62,3 +62,5 @@ NFE uses a typed exception hierarchy in [`src/exceptions.py`](../../src/exceptio
 - [`src/integrations/jira/`](../../src/integrations/jira/) — comment sanitization, label gate
 
 MCP servers in [`config/mcp_servers.json`](../../config/mcp_servers.json) stay **disabled** by default; npm packages are version-pinned (no `@latest`).
+
+Studio (`langgraph dev`) should stay localhost-only.

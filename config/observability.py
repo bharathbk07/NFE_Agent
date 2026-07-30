@@ -15,6 +15,43 @@ logger = logging.getLogger(__name__)
 _INITIALIZED = False
 
 
+def _env_truthy(name: str) -> bool:
+    """Return True when an env var is a common truthy flag."""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _strip_env_quotes(value: str) -> str:
+    text = (value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        return text[1:-1].strip()
+    return text
+
+
+def sync_langsmith_env() -> bool:
+    """Validate LangSmith tracing env per current LangSmith docs.
+
+    Expected in ``.env`` (only these):
+      LANGSMITH_TRACING=true
+      LANGSMITH_API_KEY=...
+      LANGSMITH_PROJECT=...          # optional
+      LANGSMITH_ENDPOINT=...         # regional / self-hosted
+
+    Returns:
+        ``True`` when tracing is enabled and an API key is present.
+    """
+    # Strip accidental quotes from project / endpoint values
+    project = _strip_env_quotes(os.getenv("LANGSMITH_PROJECT", "").strip())
+    if project:
+        os.environ["LANGSMITH_PROJECT"] = project
+    endpoint = _strip_env_quotes(os.getenv("LANGSMITH_ENDPOINT", "").strip())
+    if endpoint:
+        os.environ["LANGSMITH_ENDPOINT"] = endpoint
+
+    tracing = _env_truthy("LANGSMITH_TRACING")
+    api_key = os.getenv("LANGSMITH_API_KEY", "").strip()
+    return tracing and bool(api_key)
+
+
 def _normalize_dynatrace_env_url(base_url: str) -> str:
     """Remove an OTLP suffix from a Dynatrace URL.
 
@@ -272,12 +309,20 @@ def initialize_observability() -> None:
         return
     _INITIALIZED = True
 
-    ls_tracing = os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
-    if ls_tracing:
-        logger.info("LangSmith tracing detected in environment and active.")
+    tracing_on = sync_langsmith_env()
+    if tracing_on:
+        logger.info(
+            "LangSmith tracing enabled (project=%s endpoint=%s).",
+            os.getenv("LANGSMITH_PROJECT") or "default",
+            os.getenv("LANGSMITH_ENDPOINT") or "default",
+        )
+    elif _env_truthy("LANGSMITH_TRACING"):
+        logger.warning(
+            "LANGSMITH_TRACING=true but LANGSMITH_API_KEY is missing — traces will not export."
+        )
     else:
         logger.warning(
-            "LangSmith tracing is disabled. Deep agent trace metrics will not be pushed."
+            "LangSmith tracing is disabled. Set LANGSMITH_TRACING=true and LANGSMITH_API_KEY."
         )
 
     dt_api_url = os.getenv("TRACELOOP_BASE_URL") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -292,7 +337,7 @@ def initialize_observability() -> None:
 
     otlp_base_url = _normalize_otlp_base_url(dt_api_url)
     env_url = _normalize_dynatrace_env_url(dt_api_url)
-    service_name = os.getenv("LANGCHAIN_PROJECT", "mcp-agent-service")
+    service_name = os.getenv("LANGSMITH_PROJECT") or "mcp-agent-service"
 
     os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", otlp_base_url)
     os.environ.setdefault("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")

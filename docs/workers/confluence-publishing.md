@@ -24,19 +24,13 @@ Space (CONFLUENCE_SPACE_KEY)
 
 | Outcome | Publish? |
 |---------|----------|
-| Test **fully completed**, SLA/thresholds **failed** | **Yes** |
-| Test **fully completed**, SLA/thresholds **passed** | **Yes** |
-| Test **fully completed**, **no SLA** defined | **Yes** |
-| Watcher stopped (`abortOnFail`) with `summary.json` | **Yes** (`COMPLETED — WATCHER STOPPED`) |
-| Completed run but **dominated by HTTP 4xx** (script/correlation bugs) | **No** (`script_4xx_failures`) |
-| Test **stopped mid-run** (timeout/spawn, **no** usable summary) | **No** |
-| k6 missing / skipped | **No** |
+| Smoke/load **passed** (`smoke.ok=true`) with summary | **Yes** |
+| Smoke/SLA **failed** (any reason) | **No** (`smoke_failed_no_publish` / `script_4xx_failures` / …) |
+| Watcher abort / incomplete / skipped / missing script | **No** |
 
-“Fully completed” prefers proof from `summary.json` (`iterations.count > 0`). Incidental `timeout` substrings in stderr no longer block publish when the summary proves the run finished.
+Failures and correlation/script bugs stay on the **Jira story comment** only. Confluence is reserved for **green** evidence so the space is not littered with false “completed” runs.
 
-**4xx gate:** if smoke failed and status counts / failed URLs show mostly 4xx (or fail rate ≥5% with 4xx signal), Confluence is skipped so broken scripts do not overwrite good pages. Real load/SLA results still publish.
-
-Gate: `should_publish_to_confluence()` / `explain_confluence_skip()` in [`src/integrations/confluence/publisher.py`](../../src/integrations/confluence/publisher.py). Skip reasons include `no_space_key`, `missing_confluence_credentials`, `incomplete_no_summary`, `script_4xx_failures`, `smoke_skipped`, etc. Studio chat and Jira comments surface the reason when not published.
+Gate: `should_publish_to_confluence()` / `explain_confluence_skip()` in [`src/integrations/confluence/publisher.py`](../../src/integrations/confluence/publisher.py). Skip reasons include `smoke_failed_no_publish`, `script_4xx_failures`, `no_space_key`, `missing_confluence_credentials`, `incomplete_no_summary`, `smoke_skipped`, etc.
 
 ---
 

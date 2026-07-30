@@ -17,7 +17,7 @@ Plain-language map of planning/analysis agents under [`src/agents/`](../../src/a
 | Parameter agent | [parameter-agent.md](parameter-agent.md) | What the tester typed → variables |
 | Correlation classifier | [correlation-classifier-agent.md](correlation-classifier-agent.md) | Second opinion — param vs correlation |
 | Transaction agent | [transaction-agent.md](transaction-agent.md) | Name business TXNs for reports/k6 |
-| Analysis QA | [analysis-qa-agent.md](analysis-qa-agent.md) | Help desk — answer without recapture |
+| Analysis QA / PE Assistant | [analysis-qa-agent.md](analysis-qa-agent.md) · [pe-assistant-runtime.md](pe-assistant-runtime.md) | PE Agent OS (Brain + Hands + Skills); supervisor fallback |
 | Shared state | [agent-state.md](agent-state.md) | Clipboard shared by all nodes |
 
 Graph wiring: [`src/graph.py`](../../src/graph.py) · Nodes: [`src/nodes/`](../../src/nodes/)  
@@ -31,16 +31,13 @@ Also: [Documentation index](../README.md) · [Workers](../workers/overview.md) �
 Chat message
     │
     ▼
-Intent router ──────────────► conversation / analysis_qa / jira / reuse
-    │                              │
-    │                              └─► Jira worker → pipeline → comment
-    ▼ (performance / watch-me)              │
-Orchestrator ───────────────► (skipped LLM for watch-me)
-    │                                       │
-    ├─► Navigator → Playwright capture (2×) │
-    └─► Watch-me record → replay            │
-    │                                       │
-    ▼                                       ▼
+Intent router ── assist ──► PE Supervisor (specialists)
+    │                         KnowledgeQA / Evidence / Integrations / Scripting
+    │
+    ├─► jira execute (`work on KEY`) → Jira worker
+    └─► watch-me / analyse / reuse → pipeline workers
+              │
+              ▼
 Traffic analyst → Parameter → Correlation → Transaction
     → IR → k6 → smoke → heal
               │

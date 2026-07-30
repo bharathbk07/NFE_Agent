@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from src.security.fs_jail import assert_under_jail, safe_artifact_filename
 from src.exceptions import ErrorCode, NFEValidationError
@@ -263,6 +263,61 @@ def save_load_test_ir(
         "app": app_id,
         "flow": flow_id,
     }
+
+
+def load_load_test_ir(
+    *,
+    target_url: str = "",
+    app: str = "",
+    flow: str = "",
+    label: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Load a previously saved Load-Test IR for an app/flow if present.
+
+    Searches the active artifacts dir (including ``NFE_ARTIFACTS_DIR``), then
+    ``artifacts/k6/<app>/`` and ``artifacts/<app>/`` legacy layouts.
+    """
+    names = stable_artifact_names(
+        target_url, app=app, flow=flow, label=label
+    )
+    app_id = names.get("app") or (app or "").strip()
+    flow_id = names.get("flow") or "default"
+    ir_name = names.get("ir") or f"{flow_id}_ir.json"
+
+    candidates: List[Path] = []
+    if app_id:
+        candidates.extend(
+            [
+                artifacts_dir() / app_id / ir_name,
+                k6_app_dir(app_id) / ir_name,
+                _PROJECT_ROOT / "artifacts" / "k6" / app_id / ir_name,
+                _PROJECT_ROOT / "artifacts" / app_id / ir_name,
+            ]
+        )
+    candidates.append(artifacts_dir() / ir_name)
+
+    seen: Set[str] = set()
+    jail_root = artifacts_dir().resolve()
+    for path in candidates:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not path.is_file():
+            continue
+        try:
+            jailed = assert_under_jail(path, jail_root)
+            data = json.loads(jailed.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load IR %s: %s", path, exc)
+            continue
+        if isinstance(data, dict) and (data.get("transactions") or data.get("vars") is not None):
+            logger.info("Loaded prior Load-Test IR → %s", jailed)
+            return data
+    return None
 
 
 def resolve_k6_path(

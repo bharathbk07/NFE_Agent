@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.messages import AIMessage
 
 from config.settings import settings
-from src.agents.intent_router import ISSUE_KEY_RE, get_latest_human_text
+from src.agents.intent_router import ISSUE_KEY_RE, get_latest_human_text, wants_jira_list
 from src.agents.state import AgentState
 from src.exceptions import (
     NFEAuthError,
@@ -97,17 +97,55 @@ def _list_eligible_issues(client: Optional[JiraClient] = None) -> List[JiraIssue
     return found
 
 
-def _format_candidate_list(issues: List[JiraIssue]) -> str:
-    lines = [
-        "Multiple Jira stories match (`nfe-agent`, To Do / In Progress). "
-        "Which one should I work on?",
-        "",
-    ]
+def _list_assist_board_issues(client: Optional[JiraClient] = None) -> List[JiraIssue]:
+    """Broader To Do / In Progress search for assist listing (label optional)."""
+    from src.integrations.jira.jql import configured_issue_types, configured_statuses
+    from src.integrations.jira.labels import LABEL_DONE, LABEL_RUNNING
+
+    jira = client or JiraClient()
+    parts: List[str] = []
+    statuses = configured_statuses() or ["To Do", "In Progress"]
+    parts.append(
+        "status in (" + ", ".join(f'"{s}"' for s in statuses) + ")"
+    )
+    types = configured_issue_types()
+    if types:
+        parts.append("issuetype in (" + ", ".join(f'"{t}"' for t in types) + ")")
+    parts.append(f'labels != "{LABEL_DONE}"')
+    parts.append(f'labels != "{LABEL_RUNNING}"')
+    jql = " AND ".join(parts) + " ORDER BY updated DESC"
+    try:
+        return jira.search_jql(jql, max_results=20)
+    except Exception as exc:
+        logger.warning("Assist board JQL failed (%s): %s", jql, exc)
+        # Minimal fallback
+        try:
+            return jira.search_jql(
+                'status in ("To Do", "In Progress") ORDER BY updated DESC',
+                max_results=20,
+            )
+        except Exception as exc2:
+            logger.warning("Assist board fallback failed: %s", exc2)
+            return []
+
+
+def _format_candidate_list(issues: List[JiraIssue], *, list_only: bool = False) -> str:
+    if list_only:
+        lines = [
+            "Eligible NFE Jira stories (`nfe-agent`, To Do / In Progress):",
+            "",
+        ]
+    else:
+        lines = [
+            "Multiple Jira stories match (`nfe-agent`, To Do / In Progress). "
+            "Which one should I work on?",
+            "",
+        ]
     for issue in issues:
         lines.append(
             f"* **{issue.key}** [{issue.status or '?'}] — {issue.summary or '(no summary)'}"
         )
-    lines.extend(["", "Reply with e.g. **work on SCRUM-1**."])
+    lines.extend(["", "Reply with e.g. **work on SCRUM-1** to run one."])
     return "\n".join(lines)
 
 
@@ -301,9 +339,11 @@ async def run_jira_story(state: AgentState) -> Dict[str, Any]:
     # Prefer an explicit key in the latest message over a sticky state key
     key = extract_issue_key(text) or state.get("jira_issue_key")
     force = _wants_force(text)
+    list_only = wants_jira_list(text)
 
     try:
-        if key:
+        # List requests never auto-run a story — even if a sticky key exists
+        if key and not list_only:
             return await _prepare_and_run(key, text=text, force=force)
 
         issues = _list_eligible_issues()
@@ -333,12 +373,14 @@ async def run_jira_story(state: AgentState) -> Dict[str, Any]:
             ],
         }
 
-    if len(issues) > 1:
+    if list_only or len(issues) > 1:
         keys = [i.key for i in issues]
         return {
             "jira_candidate_keys": keys,
             "jira_issue_key": None,
-            "messages": [AIMessage(content=_format_candidate_list(issues))],
+            "messages": [
+                AIMessage(content=_format_candidate_list(issues, list_only=list_only))
+            ],
         }
 
     only = issues[0]

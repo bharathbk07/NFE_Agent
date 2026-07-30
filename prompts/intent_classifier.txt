@@ -12,50 +12,31 @@ Optional soft signals (hints only — never decide from these alone):
 Choose exactly one intent:
 
 - watch_me: User wants *interactive* recording where THEY click in a browser
-  the agent opens. Meaning: “record me while I drive”, “I’ll click through”.
-  Not: talking about a past recording, or asking the bot to navigate for them.
+  the agent opens.
 
-- reuse_recording: User wants to load/list/replay a *saved* Watch-me capture
-  without re-recording. Meaning: reuse prior capture, list recordings.
+- reuse_recording: User wants to load/list/replay a *saved* Watch-me capture.
 
-- jira_perf: User explicitly wants NFE to *execute* the Jira story workflow
-  (fetch issue → apply story workload → run k6). Requires clear execute intent
-  such as “work on SCRUM-1”, “process this Jira story”, “run the Jira ticket”.
-  NEVER choose jira_perf merely because the word “Jira”, an issue key, or a
-  ticket field is mentioned. Talking about, asking about, comparing, or
-  explaining Jira/results/smoke/workload is NOT jira_perf.
+- jira_perf: User explicitly wants to *execute* the Jira story pipeline
+  (“work on SCRUM-1”, “process this Jira story”). NOT for listing or questions.
 
-- performance_analysis: User wants a *new* automated browser capture/analysis
-  (bot plans and drives). Needs a new URL/journey, or a clear request to start
-  a new performance analysis run.
+- pe_assist: Personal PE assistant — answer questions, list Jira stories,
+  explain smoke/trends/scripts/concepts using session + knowledge + tools.
+  Prefer this for almost all PE-related chat that is not a clear execute/record.
 
-- follow_up_analysis: User explicitly asks to *rerun* the previous journey
-  (“run again”, “retry the same flow”). Not a question about prior results.
+- analysis_qa: Legacy alias — treat the same as pe_assist.
 
-- analysis_qa: User is asking a question or requesting explanation about prior
-  session evidence — smoke results, failures, KPIs, trends, scripts, IR,
-  correlations, tokens, assertions, workload, Confluence/report links, or
-  what a Jira story said. Prefer this whenever prior context exists and the
-  user is inquiring rather than requesting a new run.
+- performance_analysis: New automated browser capture (bot drives). Needs URL/journey.
 
-- conversation: Greetings, capability questions, math, or unrelated chat.
-  Also use when the user mentions a tool name casually without asking to run it.
+- follow_up_analysis: Explicit rerun of the previous journey only.
 
-Decision rules (priority):
-1. If the message is a question / explanation / “what/why/how/did/does” about
-   results, scripts, smoke, trends, or a ticket → analysis_qa (when prior
-   exists) or conversation (when nothing to answer from).
-2. Mentions of Jira / Confluence / Grafana / Datadog / k6 / SCRUM-1 are
-   *topics*, not automatic triggers. Only execute intents start pipelines.
-3. Prefer watch_me over performance_analysis when the user will drive the browser.
-4. Prefer reuse_recording when they ask to load/list a saved recording.
-5. Prefer jira_perf ONLY for clear “please execute this Jira story/issue” asks.
-6. Prefer follow_up_analysis ONLY for explicit rerun of the prior journey.
-7. When unsure between running a pipeline and answering, choose analysis_qa
-   if prior context exists; otherwise conversation and ask a clarifying question
-   in reply.
+- conversation: Pure greetings or math only. Capability / PE questions → pe_assist.
 
-If intent is conversation, set reply to a short helpful answer that may ask
-what they want to do next. For other intents, set reply to null.
-Confidence should reflect how clear the meaning is (0.55–0.95).
-Reason must cite the user meaning, not keyword matches.
+Decision rules:
+1. Prefer pe_assist for questions, explanations, list-jira, methodology, trends.
+2. Mentions of tool names are topics — not automatic pipeline triggers.
+3. jira_perf only for clear execute of a story.
+4. Prefer watch_me over performance_analysis when the user will drive the browser.
+5. When unsure between pipeline and assist → pe_assist.
+
+If intent is conversation, set reply to a short greeting. Otherwise reply=null.
+Reason must cite user meaning, not keyword matches.

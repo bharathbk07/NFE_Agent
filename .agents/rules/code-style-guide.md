@@ -169,7 +169,7 @@ Every agent action, tool invocation, token count, and exception must be captured
 
 LangSmith Optimization Guidelines
 
-Custom Run Names: Never rely on default ChatGoogleGenerativeAI tag identifiers in production. Declare explicit run_name properties on all chain invocations.
+Custom Run Names: Never rely on default LLM provider tag identifiers in production. Declare explicit run_name properties on all chain invocations.
 
 Context-Aware Metadata: Embed structural tags (e.g., user_id, session_id, environment) inside model context parameters.
 

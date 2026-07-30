@@ -140,8 +140,17 @@ def get_mcp_connections(
             continue
 
         entry = _interpolate(dict(raw))
-        entry.pop("enabled", None)
-        entry.pop("description", None)
+        # Project-only metadata (not MultiServerMCPClient connection fields)
+        for meta_key in (
+            "enabled",
+            "description",
+            "capabilities",
+            "tool_allowlist",
+            "tool_denylist",
+            "timeout_s",
+            "read_only",
+        ):
+            entry.pop(meta_key, None)
 
         # MCP adapters require a transport even when the registry omits it.
         if "transport" not in entry:

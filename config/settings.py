@@ -8,31 +8,17 @@ load_dotenv()
 
 
 def _parse_model_list() -> list[str]:
-    """Build model references from environment configuration.
-
-    Returns:
-        Ordered provider/model references available to the model router.
-    """
+    """Build Cursor model references from environment configuration."""
     models_env = os.getenv("LLM_MODELS", "").strip()
     if models_env:
         return [m.strip() for m in models_env.split(",") if m.strip()]
-    single = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-    models: list[str] = [single] if single else ["gemini-2.5-flash"]
-
-    # Auto-include default Cursor model when SDK credentials are configured
-    cursor_key = os.getenv("CURSOR_API_KEY", "").strip()
-    cursor_runtime = os.getenv("CURSOR_RUNTIME", "local").strip().lower()
-    cursor_repo = os.getenv("CURSOR_CLOUD_REPO", "").strip()
-    cursor_model = os.getenv("CURSOR_DEFAULT_MODEL", "composer-2.5").strip()
-    cursor_sdk_ready = cursor_key and (
-        cursor_runtime != "cloud" or bool(cursor_repo)
+    model = (
+        os.getenv("CURSOR_DEFAULT_MODEL", "").strip()
+        or "composer-2.5"
     )
-    if cursor_sdk_ready and not models_env:
-        cursor_ref = f"cursor:{cursor_model}"
-        if cursor_ref not in models and cursor_model not in models:
-            models.append(cursor_ref)
-
-    return models
+    if ":" not in model:
+        model = f"cursor:{model}"
+    return [model]
 
 
 def _parse_task_routing() -> dict[str, str]:
@@ -56,29 +42,30 @@ class Settings:
     """Expose immutable-at-import environment configuration.
 
     Attributes:
-        GEMINI_API_KEY: Credential used by the Gemini provider.
-        LLM_MODELS: Comma-separated model references for automatic routing.
+        CURSOR_API_KEY: Credential for the Cursor SDK LLM.
+        LLM_MODELS: Optional comma-separated cursor model refs.
         DEBUG_MODE: Whether verbose execution and visible browser mode are enabled.
     """
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-    # Multi-model: comma-separated provider-prefixed refs, e.g.
-    # google:gemini-3.1-flash-lite,google:gemini-3.5-flash,cursor:composer-2.5
-    LLM_MODELS: str = os.getenv("LLM_MODELS", "")
-    LLM_TASK_ROUTING: str = os.getenv("LLM_TASK_ROUTING", "")
-
-    # Cursor AI (native cursor-sdk — see README)
+    # Cursor AI (sole LLM provider — native cursor-sdk)
     CURSOR_API_KEY: str = os.getenv("CURSOR_API_KEY", "")
     CURSOR_RUNTIME: str = os.getenv("CURSOR_RUNTIME", "local")  # local | cloud
     CURSOR_CLOUD_REPO: str = os.getenv("CURSOR_CLOUD_REPO", "")
     CURSOR_WORKDIR: str = os.getenv("CURSOR_WORKDIR", "")
     CURSOR_DEFAULT_MODEL: str = os.getenv("CURSOR_DEFAULT_MODEL", "composer-2.5")
 
-    # LangSmith
-    LANGCHAIN_TRACING_V2: bool = os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
-    LANGCHAIN_API_KEY: str = os.getenv("LANGCHAIN_API_KEY", "")
-    LANGCHAIN_PROJECT: str = os.getenv("LANGCHAIN_PROJECT", "mcp-agent-service")
+    # Optional multi-model list (cursor:… only), e.g. cursor:composer-2.5
+    LLM_MODELS: str = os.getenv("LLM_MODELS", "")
+    LLM_TASK_ROUTING: str = os.getenv("LLM_TASK_ROUTING", "")
+
+    # LangSmith (docs: LANGSMITH_TRACING / LANGSMITH_API_KEY / LANGSMITH_PROJECT)
+    LANGSMITH_TRACING: bool = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
+    LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", "")
+    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "PE-Agent").strip().strip('"').strip("'")
+    LANGSMITH_ENDPOINT: str = os.getenv("LANGSMITH_ENDPOINT", "").strip().strip('"').strip("'")
+    # Back-compat aliases used by a few older call sites
+    LANGCHAIN_TRACING_V2: bool = LANGSMITH_TRACING
+    LANGCHAIN_API_KEY: str = LANGSMITH_API_KEY
+    LANGCHAIN_PROJECT: str = LANGSMITH_PROJECT
 
     # Execution
     DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -179,6 +166,32 @@ class Settings:
     # Project MCP registry (single file for all MCP server definitions)
     # Default: <repo>/config/mcp_servers.json
     MCP_SERVERS_CONFIG: str = os.getenv("MCP_SERVERS_CONFIG", "")
+
+    # PE Agent OS (OpenClaw-inspired)
+    NFE_PE_AGENT_ENABLED: bool = os.getenv("NFE_PE_AGENT_ENABLED", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    NFE_PE_AGENT_MAX_ROUNDS: int = int(os.getenv("NFE_PE_AGENT_MAX_ROUNDS", "10") or "10")
+    NFE_JIRA_CREATE_ENABLED: bool = os.getenv(
+        "NFE_JIRA_CREATE_ENABLED", "false"
+    ).lower() in ("1", "true", "yes", "on")
+    NFE_JIRA_ANALYSIS_PROJECT: str = os.getenv("NFE_JIRA_ANALYSIS_PROJECT", "").strip()
+    NFE_JIRA_ANALYSIS_ISSUETYPE: str = (
+        os.getenv("NFE_JIRA_ANALYSIS_ISSUETYPE", "Task").strip() or "Task"
+    )
+    NFE_HEARTBEAT_ENABLED: bool = os.getenv("NFE_HEARTBEAT_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    NFE_HEARTBEAT_INTERVAL_SEC: int = int(
+        os.getenv("NFE_HEARTBEAT_INTERVAL_SEC", "300") or "300"
+    )
+    JIRA_PROJECT_KEY: str = os.getenv("JIRA_PROJECT_KEY", "").strip()
 
     @property
     def available_models(self) -> list[str]:

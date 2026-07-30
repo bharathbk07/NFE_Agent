@@ -6,7 +6,6 @@ from typing import Any, Dict, Literal
 
 from langchain_core.messages import AIMessage
 
-from src.agents.analysis_qa_agent import AnalysisQAAgent
 from src.agents.intent_router import get_latest_human_text, route_user_message
 from src.agents.state import AgentState
 
@@ -118,7 +117,7 @@ def after_intent_router(
         The next LangGraph node name.
     """
     intent = state.get("intent", "conversation")
-    if intent == "analysis_qa":
+    if intent in ("analysis_qa", "pe_assist"):
         return "answer_analysis_question"
     if intent == "reuse_recording":
         return "load_saved_recording"
@@ -143,24 +142,19 @@ async def respond_conversation(state: AgentState) -> Dict[str, Any]:
 
 
 async def answer_analysis_question(state: AgentState) -> Dict[str, Any]:
-    """Answer a follow-up using existing analysis context.
+    """Run the PE supervisor (personal assistant) for assist-path questions.
 
     Args:
         state: State containing prior analysis and conversation messages.
 
     Returns:
-        A partial state with an AI answer and any rebuilt transaction artifacts.
-
-    Raises:
-        Exception: If the analysis QA agent cannot produce an answer.
+        A partial state with an AI answer from supervisor + specialists.
     """
-    logger.info("Node: answer_analysis_question (lightweight QA only).")
+    logger.info("Node: answer_analysis_question / pe_assist (PE Agent OS).")
     question = get_latest_human_text(state.get("messages"))
-    qa = AnalysisQAAgent()
 
+    # Explicit script regenerate still uses AnalysisQA rebuild helpers
     q = (question or "").lower()
-    # Only rebuild when the user clearly asks to regenerate — not on topic words
-    # like "k6" / "transaction" inside a question about prior results.
     wants_rebuild = bool(
         re.search(
             r"\b("
@@ -172,11 +166,18 @@ async def answer_analysis_question(state: AgentState) -> Dict[str, Any]:
             q,
         )
     )
-
     updates: Dict[str, Any] = {}
     answer_state = dict(state)
+    import uuid
+
+    thread_id = str(state.get("pe_thread_id") or "").strip() or str(uuid.uuid4())
+    answer_state["pe_thread_id"] = thread_id
+    updates["pe_thread_id"] = thread_id
     if wants_rebuild and (state.get("run_records") or state.get("user_journey_steps")):
         try:
+            from src.agents.analysis_qa_agent import AnalysisQAAgent
+
+            qa = AnalysisQAAgent()
             rebuilt = await qa._rebuild_txn_and_k6(state)
             updates["transactions"] = rebuilt["transactions"]
             perf = dict(state.get("performance_test_output") or {})
@@ -192,8 +193,73 @@ async def answer_analysis_question(state: AgentState) -> Dict[str, Any]:
             updates["performance_test_output"] = perf
             answer_state.update(updates)
         except Exception as exc:
-            logger.warning("Could not rebuild TXN/k6 before QA answer: %s", exc)
+            logger.warning("Could not rebuild TXN/k6 before PE assist: %s", exc)
 
-    answer = await qa.answer(question, answer_state)
+    try:
+        from src.agents.runtime.pe_agent import run_pe_agent
+
+        result = await run_pe_agent(answer_state, question or "")
+        answer = result.get("answer") or "I couldn’t produce an answer."
+        if result.get("pending_action") is not None:
+            updates["pending_action"] = result.get("pending_action")
+        else:
+            updates["pending_action"] = None
+        if result.get("agent_authorizations") is not None:
+            updates["agent_authorizations"] = result.get("agent_authorizations")
+        logger.info(
+            "pe_agent sources=%s tools=%s pending=%s",
+            result.get("context_sources"),
+            result.get("tool_calls"),
+            bool(result.get("pending_action")),
+        )
+    except Exception as exc:
+        logger.warning("PE agent failed (%s); trying tool fast-path / supervisor", exc)
+        answer = None
+        try:
+            from src.agents.runtime.assist_fastpath import try_assist_fast_path
+            from src.agents.runtime.exec_approval import (
+                infer_authorizations,
+                merge_authorizations,
+            )
+
+            auth = merge_authorizations(
+                list(answer_state.get("agent_authorizations") or []),
+                infer_authorizations(question or ""),
+            )
+            fast = await try_assist_fast_path(question or "", authorizations=auth)
+            if fast and fast.get("answer"):
+                answer = fast["answer"]
+                updates["agent_authorizations"] = fast.get("agent_authorizations") or auth
+                updates["pending_action"] = None
+                logger.info("Recovered via assist fast-path after PE agent failure")
+        except Exception as fast_exc:
+            logger.warning("Assist fast-path also failed: %s", fast_exc)
+
+        if not answer:
+            try:
+                from src.agents.runtime.supervisor import PESupervisor
+
+                result = await PESupervisor().run(answer_state, question or "")
+                answer = result.get("answer") or ""
+            except Exception as sup_exc:
+                logger.warning("PE supervisor fallback failed (%s)", sup_exc)
+                answer = ""
+
+        if not answer:
+            # Never dump AnalysisQA empty-session text for PE asks
+            user_msg = getattr(exc, "user_message", None)
+            if isinstance(user_msg, str) and user_msg.strip():
+                answer = user_msg.strip()
+            else:
+                answer = (
+                    "LLM service not reachable (Cursor). "
+                    "Check `CURSOR_API_KEY` and `CURSOR_DEFAULT_MODEL`, then try again."
+                )
+
     updates["messages"] = [AIMessage(content=answer)]
+    updates["intent"] = "pe_assist"
     return updates
+
+
+# Alias used by graph / docs
+run_pe_supervisor = answer_analysis_question

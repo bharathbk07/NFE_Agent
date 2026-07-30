@@ -86,15 +86,18 @@ def run_k6_smoke(
     # overrides that fight scenario blocks.
     logger.info("Running k6 smoke: %s", " ".join(cmd))
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-            env=env,
-            cwd=str(path.parent),
-        )
+        from src.utils.stream_progress import progressive_wait
+
+        with progressive_wait(f"k6 smoke ({path.name})", interval_s=5.0):
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+                env=env,
+                cwd=str(path.parent),
+            )
     except subprocess.TimeoutExpired as exc:
         out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
         err = (exc.stderr or "") if isinstance(exc.stderr, str) else "k6 timed out"

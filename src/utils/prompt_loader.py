@@ -19,6 +19,7 @@ def prompt_path(name: str) -> Path:
 
     Args:
         name: Prompt filename, with or without the ``.txt`` suffix.
+            Nested paths under ``prompts/`` are allowed (e.g. ``agents/supervisor``).
 
     Returns:
         Absolute path to the requested prompt file.
@@ -26,15 +27,22 @@ def prompt_path(name: str) -> Path:
     Raises:
         ValueError: If ``name`` is empty or attempts path traversal.
     """
-    filename = name.strip()
+    filename = name.strip().replace("\\", "/")
     if not filename:
         raise ValueError("Prompt name cannot be empty.")
+    if filename.startswith("/") or ".." in filename.split("/"):
+        raise ValueError(f"Invalid prompt name: {name!r}")
     if not filename.endswith(".txt"):
         filename = f"{filename}.txt"
 
+    root = PROMPTS_DIR.resolve()
     candidate = (PROMPTS_DIR / filename).resolve()
-    if candidate.parent != PROMPTS_DIR.resolve():
-        raise ValueError(f"Prompt must be a direct child of {PROMPTS_DIR}.")
+    if not str(candidate).startswith(str(root) + "/") and candidate != root:
+        # Also reject if somehow outside root
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"Prompt must stay under {PROMPTS_DIR}.") from exc
     return candidate
 
 

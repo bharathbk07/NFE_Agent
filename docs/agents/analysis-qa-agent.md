@@ -1,15 +1,18 @@
 # Analysis QA agent
 
-**Layman role:** Help desk — answers follow-ups about the last analysis **without** re-running the browser.
+**Layman role:** Legacy session Q&A helpers — context pack / rebuild used by the PE supervisor specialists.
 
 | | |
 |--|--|
 | **Code** | [`src/agents/analysis_qa_agent.py`](../../src/agents/analysis_qa_agent.py) |
-| **Called from** | `answer_analysis_question` in [`src/nodes/routing.py`](../../src/nodes/routing.py) |
-| **Prompt** | [`prompts/analysis_qa.txt`](../../prompts/analysis_qa.txt) |
-| **LLM?** | Yes for Q&A (`TaskType.EXTRACTION`); rebuild path is deterministic |
+| **Runtime** | Prefer [PE Assistant runtime](pe-assistant-runtime.md) (`pe_assist` → supervisor) |
+| **Called from** | Fallback inside `answer_analysis_question`; context helpers used by specialists |
+| **Prompt** | [`prompts/analysis_qa.txt`](../../prompts/analysis_qa.txt) (legacy); specialists use `prompts/agents/*` |
 
 ← [All agents](overview.md)
+
+Studio chat assist path now runs the **multi-sub-agent PE supervisor**. This module still builds the session/knowledge context pack and optional TXN/k6 rebuild.
+
 
 ---
 

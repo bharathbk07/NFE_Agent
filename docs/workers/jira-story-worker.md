@@ -28,7 +28,7 @@ When you say things like **“work on SCRUM-1”** or **“work on jira story”
 5. Post an ADF **Test Report** comment (pass/fail, stats, heal notes).
 6. Update lifecycle labels (`nfe-queued` / `nfe-running` / `nfe-blocked` / `nfe-done`).
 
-If smoke/SLA fails or the run aborts, the comment leads with **Why it failed / stopped**. If Confluence published a completed run, the comment links that page.
+If smoke/SLA fails or the run aborts, the comment leads with **Why it failed / stopped**, the story stays **`nfe-blocked`** (not `nfe-done`), and Confluence is **not** published. Only a passing smoke gets `nfe-done` + Confluence.
 
 ---
 

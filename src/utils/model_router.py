@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
 _TIMEOUT_SLACK_SECONDS = 15.0
+_LLM_UNREACHABLE_USER_MESSAGE = (
+    "LLM service not reachable. Cursor SDK failed. "
+    "Check CURSOR_API_KEY and CURSOR_DEFAULT_MODEL / LLM_MODELS, then try again."
+)
 
 
 @contextmanager
@@ -70,12 +74,14 @@ class TaskType(str, Enum):
     NAVIGATION = "navigation"
     EXTRACTION = "extraction"
     SELF_HEAL = "self_heal"
+    # PE assistant chat / specialist tool loops — needs reasoning, not flash-lite
+    ASSIST = "assist"
 
 
-REASONING_TASKS = {TaskType.ORCHESTRATION, TaskType.NAVIGATION}
+REASONING_TASKS = {TaskType.ORCHESTRATION, TaskType.NAVIGATION, TaskType.ASSIST}
 FAST_TASKS = {TaskType.EXTRACTION, TaskType.SELF_HEAL}
-# Cursor SDK is wired for planning tasks only — never extraction/self_heal.
-CURSOR_ALLOWED_TASKS = REASONING_TASKS
+# Both configured Cursor models are eligible for every task.
+CURSOR_ALLOWED_TASKS = set(TaskType)
 
 
 def _is_retriable_llm_error(exc: BaseException) -> bool:
@@ -99,6 +105,9 @@ def _is_retriable_llm_error(exc: BaseException) -> bool:
         "RateLimitError",
         "CursorAgentError",
         "NetworkError",
+        "JSONDecodeError",
+        "OutputParserException",
+        "ValidationError",
     ):
         return True
 
@@ -108,6 +117,11 @@ def _is_retriable_llm_error(exc: BaseException) -> bool:
         "504",
         "502",
         "500",
+        "404",
+        "not found",
+        "not_found",
+        "model_not_found",
+        "is not found",
         "unavailable",
         "high demand",
         "resource exhausted",
@@ -126,6 +140,17 @@ def _is_retriable_llm_error(exc: BaseException) -> bool:
         "cursor sdk",
         "rate limit",
         "cursoragenterror",
+        "generator didn't stop",
+        "did not stop",
+        "invalid argument",
+        "invalid_argument",
+        "expecting value",
+        "empty response",
+        "empty json",
+        "empty structured",
+        "non-json structured",
+        "structured output parse failed",
+        "retriable",
     )
     return any(m in text for m in markers) or name == "BlockingError"
 
@@ -165,11 +190,31 @@ def _specs_for_task(specs: List[ModelSpec], task: TaskType) -> List[ModelSpec]:
         task: Pipeline task category.
 
     Returns:
-        Eligible specifications, excluding Cursor from fast extraction tasks.
+        Eligible specifications. Both Google and Cursor are eligible for every
+        task so the router can fail over when one provider is down.
     """
-    if task in CURSOR_ALLOWED_TASKS:
-        return list(specs)
-    return [s for s in specs if s.provider != "cursor"]
+    del task  # All configured viable providers are eligible for every task.
+    return list(specs)
+
+
+def _order_cross_provider(ordered: List[ModelSpec], eligible: List[ModelSpec]) -> List[ModelSpec]:
+    """Append remaining models so the other provider is tried after the primary.
+
+    Ensures Google ↔ Cursor failover: after the preferred model, try the other
+    provider before remaining same-provider siblings when both exist.
+    """
+    seen = {s.ref for s in ordered}
+    if not ordered:
+        return list(eligible)
+
+    primary_provider = ordered[0].provider
+    other_provider = [
+        s for s in eligible if s.provider != primary_provider and s.ref not in seen
+    ]
+    same_provider = [
+        s for s in eligible if s.provider == primary_provider and s.ref not in seen
+    ]
+    return ordered + other_provider + same_provider
 
 
 class ModelRouter:
@@ -188,18 +233,22 @@ class ModelRouter:
 
         if not self._specs:
             raise NFEConfigError(
-                "No LLM models configured. Set LLM_MODELS or GEMINI_MODEL in .env",
+                "No LLM models configured. Set CURSOR_API_KEY and CURSOR_DEFAULT_MODEL in .env",
                 code=ErrorCode.CONFIG_MISSING,
                 user_message=(
-                    "No LLM models configured. Set LLM_MODELS or GEMINI_MODEL in .env."
+                    "No LLM models configured. Set CURSOR_API_KEY and "
+                    "CURSOR_DEFAULT_MODEL (or LLM_MODELS=cursor:composer-2.5) in .env."
                 ),
             )
 
         if len(self._specs) == 1:
-            logger.info("Single model configured — using '%s' for all tasks.", self._specs[0].ref)
+            logger.info(
+                "Using Cursor model '%s' for all tasks.",
+                self._specs[0].ref,
+            )
         else:
             logger.info(
-                "Multi-model mode — %s models: %s",
+                "Cursor multi-model mode — %s models: %s",
                 len(self._specs),
                 [s.ref for s in self._specs],
             )
@@ -246,7 +295,7 @@ class ModelRouter:
         if not eligible:
             raise RuntimeError(
                 f"No eligible models for task '{task.value}'. "
-                "Add a google: model to LLM_MODELS for extraction/self_heal."
+                "Set CURSOR_API_KEY and CURSOR_DEFAULT_MODEL / LLM_MODELS."
             )
         if len(eligible) == 1:
             return [eligible[0].ref]
@@ -285,6 +334,8 @@ class ModelRouter:
             if spec not in ordered:
                 ordered.append(spec)
 
+        # Prefer failing over to the other provider before same-provider siblings.
+        ordered = _order_cross_provider(ordered[:1], ordered)
         return [s.ref for s in ordered]
 
     def select_model(self, task: TaskType) -> str:
@@ -303,7 +354,7 @@ class ModelRouter:
         if not eligible:
             raise RuntimeError(
                 f"No eligible models for task '{task.value}'. "
-                "Add a google: model to LLM_MODELS for extraction/self_heal."
+                "Set CURSOR_API_KEY and CURSOR_DEFAULT_MODEL / LLM_MODELS."
             )
         if len(eligible) == 1:
             return eligible[0].ref
@@ -462,7 +513,7 @@ class ModelRouter:
         raise NFEIntegrationError(
             str(last_error),
             code=ErrorCode.LLM_PROVIDER,
-            user_message="All configured LLM providers failed for this task.",
+            user_message=_LLM_UNREACHABLE_USER_MESSAGE,
             cause=last_error,
         )
 
@@ -539,13 +590,19 @@ class ModelRouter:
         raise NFEIntegrationError(
             str(last_error),
             code=ErrorCode.LLM_PROVIDER,
-            user_message="All configured LLM providers failed for this task.",
+            user_message=_LLM_UNREACHABLE_USER_MESSAGE,
             cause=last_error,
         )
 
     def routing_summary(self) -> Dict[str, str]:
         """Return selected primary model references keyed by task value."""
-        return {task.value: self.select_model(task) for task in TaskType}
+        summary: Dict[str, str] = {}
+        for task in TaskType:
+            try:
+                summary[task.value] = self.select_model(task)
+            except RuntimeError:
+                summary[task.value] = "(none)"
+        return summary
 
 
 _router: Optional[ModelRouter] = None

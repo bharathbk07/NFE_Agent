@@ -336,18 +336,19 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install
-cp .env.example .env   # set GEMINI_API_KEY (and optional keys)
+cp .env.example .env   # set CURSOR_API_KEY (and optional keys)
 ```
 
 Minimal `.env`:
 
 ```ini
-GEMINI_API_KEY=your-key
-GEMINI_MODEL=gemini-2.5-flash
+CURSOR_API_KEY=your-cursor-api-key
+CURSOR_DEFAULT_MODEL=composer-2.5
+CURSOR_RUNTIME=local
 NFE_STORE_CREDENTIALS=true
 ```
 
-Optional: multi-model routing (`LLM_MODELS`), Cursor SDK, LangSmith, Dynatrace OTLP, Jira, Confluence, abort thresholds—see [`.env.example`](.env.example).
+Optional: LangSmith, Jira, Confluence, abort thresholds—see [`.env.example`](.env.example).
 
 ### Run the chatbot UI
 

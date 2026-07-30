@@ -265,16 +265,30 @@ async def process_issue_key(
                 aborted_by_watcher=bool(result.get("aborted_by_watcher")),
             ),
         )
-        jira.set_lifecycle(
-            key,
-            add=[LABEL_DONE],
-            remove=[
-                LABEL_RUNNING,
-                LABEL_QUEUED,
-                LABEL_BLOCKED,
-                LABEL_RECORDING_READY,
-            ],
-        )
+        # Only mark nfe-done on a real pass. Failures / incomplete stay blocked
+        # so the board never looks "done" when smoke/SLA failed.
+        if result.get("smoke_ok") is True:
+            jira.set_lifecycle(
+                key,
+                add=[LABEL_DONE],
+                remove=[
+                    LABEL_RUNNING,
+                    LABEL_QUEUED,
+                    LABEL_BLOCKED,
+                    LABEL_RECORDING_READY,
+                ],
+            )
+        else:
+            jira.set_lifecycle(
+                key,
+                add=[LABEL_BLOCKED],
+                remove=[
+                    LABEL_RUNNING,
+                    LABEL_QUEUED,
+                    LABEL_DONE,
+                    LABEL_RECORDING_READY,
+                ],
+            )
         return {**result, "issue": key, "skipped": False}
     except NFESecurityError:
         raise

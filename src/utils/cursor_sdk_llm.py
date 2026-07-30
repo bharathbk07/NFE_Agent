@@ -1,8 +1,8 @@
 """
 LangChain chat model backed by the native Cursor SDK (no OpenAI proxy).
 
-Uses Agent.prompt() for one-shot calls. Intended for orchestration and
-navigation planning only — extraction/self_heal stay on Google Gemini.
+Uses Agent.prompt() for one-shot calls. Eligible for every task as a
+Google↔Cursor failover candidate when configured in LLM_MODELS.
 """
 from __future__ import annotations
 
@@ -169,7 +169,21 @@ class CursorSDKChatModel(BaseChatModel):
             self.timeout,
         )
         try:
-            result = Agent.prompt(prompt, options)
+            import concurrent.futures
+
+            # Hard ceiling: hung Cursor SDK must not block the Studio worker forever.
+            hard_timeout = min(max(5.0, float(self.timeout)), 45.0)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(Agent.prompt, prompt, options)
+                try:
+                    result = future.result(timeout=hard_timeout)
+                except concurrent.futures.TimeoutError as exc:
+                    # Running SDK call may keep going in the background thread;
+                    # do not wait for it — free the LangGraph worker immediately.
+                    raise RuntimeError(
+                        f"Cursor SDK timed out after {hard_timeout}s. "
+                        "Restart langgraph if Studio stays stuck."
+                    ) from exc
         except CursorAgentError as exc:
             raise RuntimeError(f"Cursor SDK agent error: {exc}") from exc
 
@@ -242,7 +256,19 @@ class CursorSDKChatModel(BaseChatModel):
 
         def parse_structured(message: BaseMessage) -> Any:
             """Decode and optionally validate one structured model message."""
-            data = parse_json_from_llm(extract_message_text(message.content))
+            raw = extract_message_text(message.content)
+            if not raw:
+                raise ValueError(
+                    "Cursor SDK returned empty structured output "
+                    "(retriable — try next LLM provider)."
+                )
+            try:
+                data = parse_json_from_llm(raw)
+            except Exception as exc:
+                raise ValueError(
+                    f"Cursor SDK structured output parse failed: {exc} "
+                    "(retriable — try next LLM provider)."
+                ) from exc
             if is_pydantic:
                 return schema.model_validate(data)
             return data

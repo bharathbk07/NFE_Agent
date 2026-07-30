@@ -44,6 +44,13 @@ async def analyse_traffic(state: AgentState) -> Dict[str, Any]:
 
     logger.info("Node: analyse_traffic starting...")
 
+    try:
+        from src.utils.stream_progress import emit_progress
+
+        emit_progress("analyse: starting correlation / IR / smoke", phase="analyse")
+    except Exception:
+        pass
+
     error_log = list(state.get("error_log", []))
     records = list(state.get("run_records", []) or [])
 
@@ -63,6 +70,25 @@ Please verify the user journey steps or selectors. If credentials are required, 
     user_steps = state.get("user_journey_steps", [])
     sub_tasks = state.get("sub_tasks", [])
     credentials = state.get("credentials", {}) or {}
+
+    # Knowledge-first: same recording / Jira reuse → load saved IR before rebuild
+    try:
+        from src.utils.script_reuse import try_load_prior_ir_for_state
+
+        prior_ir = try_load_prior_ir_for_state(dict(state))
+    except Exception as reuse_exc:
+        logger.warning("Prior IR lookup failed (%s); full analyse", reuse_exc)
+        prior_ir = None
+    if prior_ir is not None:
+        return await _analyse_from_prior_ir(
+            state,
+            prior_ir=prior_ir,
+            records=records,
+            user_steps=user_steps,
+            sub_tasks=sub_tasks,
+            credentials=credentials,
+            error_log=error_log,
+        )
 
     from src.agents.correlation_classifier_agent import (
         CorrelationClassifierAgent,
@@ -103,6 +129,21 @@ Please verify the user journey steps or selectors. If credentials are required, 
     run1 = records[0]
     run2 = records[1]
     parameterizable_candidates, correlations, dependencies = _analyze_pair(run1, run2)
+
+    # Resolve app/flow early so recipes can skip extra capture / seed IR heals
+    app_id = state.get("app") or ""
+    flow_id = state.get("flow") or state.get("recording_label") or ""
+    try:
+        from src.utils.app_registry import resolve_app_and_flow
+
+        app_id, flow_id = resolve_app_and_flow(
+            target_url=state.get("target_url") or "",
+            label=flow_id,
+            recording_hint=flow_id,
+            explicit_app=app_id,
+        )
+    except Exception:
+        pass
 
     # Protocol value-mapping ledger: deliberate test-data randomization must not
     # be treated as server-generated correlation tokens (CSRF / session / IDs).
@@ -151,6 +192,15 @@ Please verify the user journey steps or selectors. If credentials are required, 
         dependencies=dependencies,
         sub_tasks=sub_tasks,
     )
+    try:
+        from src.utils.stream_progress import emit_progress
+
+        emit_progress(
+            f"analyse: classifier done (needs_extra_run={advice.needs_extra_run})",
+            phase="analyse",
+        )
+    except Exception:
+        pass
     parameterizable_candidates, correlations, dependencies = apply_correlation_advice(
         advice=advice,
         user_steps=user_steps,
@@ -162,7 +212,16 @@ Please verify the user journey steps or selectors. If credentials are required, 
     dependencies = filter_dependencies_against_ledger(dependencies, randomization_ledger)
 
     extra_run_note = ""
-    if advice.needs_extra_run and len(records) < 3:
+    from src.utils.script_recipes import has_green_recipe
+
+    if advice.needs_extra_run and has_green_recipe(app_id, flow_id or "default"):
+        advice.needs_extra_run = False
+        extra_run_note = (
+            f"**Skipped extra capture:** known green script recipe exists for "
+            f"`{app_id}/{flow_id or 'default'}` — reusing prior correlation/heal knowledge."
+        )
+        logger.info("Skipping Run 3 — green recipe for %s/%s", app_id, flow_id)
+    elif advice.needs_extra_run and len(records) < 3:
         reason = advice.extra_run_reason or "LLM requested another capture to confirm correlations"
         logger.info("Executing RUN 3 (extra correlation probe): %s", reason)
         extra_run_note = f"**Extra run performed:** {reason}"
@@ -302,22 +361,13 @@ Please verify the user journey steps or selectors. If credentials are required, 
     heal_notes: List[str] = []
     names = None
     skip_k6_smoke = bool(state.get("skip_k6_smoke"))
-    app_id = state.get("app") or ""
-    flow_id = state.get("flow") or state.get("recording_label") or ""
-    try:
-        from src.utils.app_registry import resolve_app_and_flow
-
-        app_id, flow_id = resolve_app_and_flow(
-            target_url=state.get("target_url") or "",
-            label=flow_id,
-            recording_hint=flow_id,
-            explicit_app=app_id,
-        )
-    except Exception:
-        pass
     try:
         from src.utils.k6_mcp import run_k6_smoke_preferred
         from src.utils.k6_healer import heal_load_test_ir, format_smoke_section
+        from src.utils.script_recipes import (
+            apply_script_recipe_to_ir,
+            upsert_script_recipe,
+        )
 
         try:
             from src.utils.artifacts import stable_artifact_names
@@ -329,6 +379,21 @@ Please verify the user journey steps or selectors. If credentials are required, 
             flow_id = names.get("flow") or flow_id
         except Exception:
             names = None
+
+        # Reuse prior green knowledge for this app/flow before first smoke
+        load_test_ir, recipe_notes = apply_script_recipe_to_ir(
+            load_test_ir, app_id, flow_id or "default"
+        )
+        heal_notes.extend(recipe_notes)
+        if recipe_notes:
+            k6_script = generate_k6_script(
+                target_url=state["target_url"],
+                parameterizable_candidates=parameterizable_candidates,
+                dependencies=dependencies,
+                transactions=transactions,
+                network_requests=run1.get("network_requests") or [],
+                ir=load_test_ir,
+            )
 
         k6_file = save_k6_script(
             k6_script,
@@ -448,6 +513,16 @@ Please verify the user journey steps or selectors. If credentials are required, 
                 if smoke_result.get("ok"):
                     heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
                     break
+        # Persist knowledge only when smoke is green — next runs reuse it
+        if smoke_result.get("ok") is True and app_id:
+            upsert_script_recipe(
+                app_id,
+                flow_id or "default",
+                ir=load_test_ir,
+                heal_notes=heal_notes,
+                smoke_ok=True,
+                target_url=state.get("target_url") or "",
+            )
     except Exception as art_err:
         logger.warning("Failed to write/validate k6 artifact: %s", art_err)
         if not k6_file:
@@ -651,6 +726,233 @@ Please verify the user journey steps or selectors. If credentials are required, 
         "randomization_state": randomization_state,
         "randomization_ledger": randomization_ledger,
         "non_randomizable_endpoints": non_randomizable_endpoints,
+        "app": app_id or state.get("app") or "",
+        "flow": flow_id or state.get("flow") or "",
+        "messages": [AIMessage(content=summary_markdown)],
+    }
+
+
+async def _analyse_from_prior_ir(
+    state: AgentState,
+    *,
+    prior_ir: Dict[str, Any],
+    records: List[Dict[str, Any]],
+    user_steps: List[Any],
+    sub_tasks: List[Any],
+    credentials: Dict[str, Any],
+    error_log: List[str],
+) -> Dict[str, Any]:
+    """Finish analyse using a saved IR (skip traffic rebuild + LLM classifier)."""
+    from src.agents.correlation_classifier_agent import CorrelationAdvice
+    from src.utils.k6_generator import emit_k6_from_ir, generate_k6_script
+    from src.utils.script_reuse import materialize_k6_from_prior_ir
+    from src.utils.script_recipes import upsert_script_recipe
+
+    del credentials  # unused — IR already encodes vars
+    run1 = records[0] if records else {}
+    load_test_ir, k6_script, reuse_notes, app_id, flow_id = materialize_k6_from_prior_ir(
+        dict(state), prior_ir
+    )
+    correlations = list(load_test_ir.get("correlations") or [])
+    dependencies = list(load_test_ir.get("dependencies") or [])
+    parameterizable_candidates = list(
+        load_test_ir.get("parameterizable_candidates") or load_test_ir.get("vars") or []
+    )
+    transactions = list(load_test_ir.get("transactions") or [])
+    cookie_notes = list(load_test_ir.get("cookie_notes") or [])
+    advice = CorrelationAdvice(
+        summary=(
+            f"Reused saved IR for {app_id}/{flow_id} "
+            "(skipped correlation rebuild / classifier)."
+        )
+    )
+    har = network_logs_to_har(run1.get("network_requests") or [])
+    heal_notes: List[str] = list(reuse_notes)
+    k6_file: Dict[str, str] = {}
+    smoke_result: Dict[str, Any] = {}
+    names = None
+    skip_k6_smoke = bool(state.get("skip_k6_smoke"))
+
+    try:
+        from src.utils.artifacts import stable_artifact_names
+        from src.utils.k6_assertion_gate import (
+            assertion_coverage_failure_result,
+            prepare_ir_and_script_for_smoke,
+        )
+        from src.utils.k6_healer import heal_load_test_ir
+        from src.utils.k6_mcp import run_k6_smoke_preferred
+
+        names = stable_artifact_names(
+            state.get("target_url") or "", app=app_id, flow=flow_id
+        )
+        app_id = names.get("app") or app_id
+        flow_id = names.get("flow") or flow_id
+
+        if not k6_script:
+            k6_script = emit_k6_from_ir(load_test_ir) or generate_k6_script(
+                target_url=state.get("target_url") or "",
+                parameterizable_candidates=parameterizable_candidates,
+                dependencies=dependencies,
+                transactions=transactions,
+                network_requests=run1.get("network_requests") or [],
+                ir=load_test_ir,
+            )
+
+        load_test_ir, k6_script, assert_ok, assert_notes = prepare_ir_and_script_for_smoke(
+            load_test_ir,
+            k6_script,
+            network_requests=run1.get("network_requests") or [],
+        )
+        heal_notes.extend(assert_notes)
+
+        k6_file = save_k6_script(
+            k6_script,
+            target_url=state.get("target_url") or "",
+            filename=(names or {}).get("script"),
+            app=app_id,
+            flow=flow_id,
+        )
+        save_load_test_ir(
+            load_test_ir,
+            target_url=state.get("target_url") or "",
+            filename=(names or {}).get("ir"),
+            app=app_id,
+            flow=flow_id,
+        )
+
+        if skip_k6_smoke:
+            smoke_result = {
+                "ok": None,
+                "skipped": True,
+                "summary": "deferred_to_jira_workload_run",
+            }
+        elif not assert_ok:
+            smoke_result = assertion_coverage_failure_result(assert_notes)
+        else:
+            smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
+            attempt = 0
+            max_heals = 2
+            while (
+                smoke_result.get("ok") is False
+                and not smoke_result.get("skipped")
+                and not smoke_result.get("assertion_gate_failed")
+                and attempt < max_heals
+            ):
+                attempt += 1
+                load_test_ir, notes = heal_load_test_ir(
+                    load_test_ir, smoke_result, attempt=attempt
+                )
+                heal_notes.extend(notes)
+                k6_script = emit_k6_from_ir(load_test_ir) or generate_k6_script(
+                    target_url=state.get("target_url") or "",
+                    parameterizable_candidates=parameterizable_candidates,
+                    dependencies=dependencies,
+                    transactions=transactions,
+                    network_requests=run1.get("network_requests") or [],
+                    ir=load_test_ir,
+                )
+                load_test_ir, k6_script, assert_ok, assert_notes = (
+                    prepare_ir_and_script_for_smoke(
+                        load_test_ir,
+                        k6_script,
+                        network_requests=run1.get("network_requests") or [],
+                    )
+                )
+                heal_notes.extend(assert_notes)
+                k6_file = save_k6_script(
+                    k6_script,
+                    target_url=state.get("target_url") or "",
+                    filename=k6_file.get("filename") or (names or {}).get("script"),
+                    app=app_id,
+                    flow=flow_id,
+                )
+                save_load_test_ir(
+                    load_test_ir,
+                    target_url=state.get("target_url") or "",
+                    filename=(names or {}).get("ir"),
+                    app=app_id,
+                    flow=flow_id,
+                )
+                if not assert_ok:
+                    smoke_result = assertion_coverage_failure_result(assert_notes)
+                    break
+                smoke_result = await run_k6_smoke_preferred(k6_file.get("path") or "")
+                if smoke_result.get("ok"):
+                    heal_notes.append(f"Smoke passed after heal attempt {attempt}.")
+                    break
+
+        if smoke_result.get("ok") is True and app_id:
+            upsert_script_recipe(
+                app_id,
+                flow_id or "default",
+                ir=load_test_ir,
+                heal_notes=heal_notes,
+                smoke_ok=True,
+                target_url=state.get("target_url") or "",
+            )
+    except Exception as art_err:
+        logger.warning("Prior-IR analyse artifact/smoke failed: %s", art_err)
+
+    perf_output = build_performance_test_output(
+        target_url=state.get("target_url") or "",
+        user_steps=user_steps,
+        sub_tasks=sub_tasks,
+        correlations=correlations,
+        dependencies=dependencies,
+        parameterizable_candidates=parameterizable_candidates,
+        transactions=transactions,
+        har=har,
+        k6_script=k6_script,
+        load_test_ir=load_test_ir,
+        k6_file=k6_file,
+    )
+    perf_output["cookie_correlation_notes"] = cookie_notes
+    perf_output["correlation_advice_summary"] = advice.summary
+    perf_output["knowledge_reuse"] = True
+    if smoke_result:
+        perf_output["k6_smoke"] = {
+            "ok": smoke_result.get("ok"),
+            "skipped": smoke_result.get("skipped"),
+            "summary": smoke_result.get("summary"),
+            "heal_notes": heal_notes,
+            "html_report": smoke_result.get("html_report") or "",
+            "summary_json": smoke_result.get("summary_json") or "",
+            "exit_code": smoke_result.get("exit_code"),
+            "failed_checks": list(smoke_result.get("failed_checks") or []),
+            "failed_urls": list(smoke_result.get("failed_urls") or []),
+            "status_counts": dict(smoke_result.get("status_counts") or {}),
+        }
+
+    summary_markdown = format_correlation_report(
+        user_steps=user_steps,
+        run1_requests=run1.get("network_requests") or [],
+        dependencies=dependencies,
+        parameterizable_candidates=parameterizable_candidates,
+        correlations=correlations,
+        sub_tasks=sub_tasks,
+        transactions=transactions,
+        k6_script=k6_script,
+        k6_file=k6_file,
+        include_transactions=True,
+        include_k6=True,
+        cookie_notes=cookie_notes,
+        correlation_advice_summary=advice.summary or "",
+        extra_run_note="\n".join(reuse_notes),
+        smoke_result=smoke_result,
+        heal_notes=heal_notes,
+        brief=True,
+    )
+
+    return {
+        "run_records": records,
+        "correlations": correlations,
+        "dependencies": dependencies,
+        "parameterizable_candidates": parameterizable_candidates,
+        "transactions": transactions,
+        "performance_test_output": perf_output,
+        "correlation_advice": advice.model_dump(),
+        "cookie_correlation_notes": cookie_notes,
+        "error_log": error_log,
         "app": app_id or state.get("app") or "",
         "flow": flow_id or state.get("flow") or "",
         "messages": [AIMessage(content=summary_markdown)],

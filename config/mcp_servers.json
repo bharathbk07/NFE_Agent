@@ -3,6 +3,11 @@
         "k6": {
             "enabled": false,
             "description": "Grafana k6 MCP (k6 x mcp). Optional — smoke/heal uses CLI k6 run for HTML reports. Set enabled true and NFE_K6_MCP=mcp only if you need MCP tools in-bot.",
+            "capabilities": ["k6", "scripting"],
+            "tool_allowlist": ["*"],
+            "tool_denylist": [],
+            "timeout_s": 20,
+            "read_only": true,
             "transport": "stdio",
             "command": "k6",
             "args": [
@@ -14,6 +19,11 @@
         "playwright": {
             "enabled": false,
             "description": "Optional Playwright MCP for interactive browser tools. Pipeline uses in-process Playwright+CDP by default. Pin version — do not use @latest.",
+            "capabilities": ["browser"],
+            "tool_allowlist": ["*"],
+            "tool_denylist": [],
+            "timeout_s": 30,
+            "read_only": false,
             "transport": "stdio",
             "command": "npx",
             "args": [
@@ -25,6 +35,11 @@
         "chrome-devtools": {
             "enabled": false,
             "description": "Optional Chrome DevTools MCP for live network/perf traces. Not used as the capture layer. Pin version — do not use @latest.",
+            "capabilities": ["browser", "monitoring"],
+            "tool_allowlist": ["*"],
+            "tool_denylist": [],
+            "timeout_s": 30,
+            "read_only": true,
             "transport": "stdio",
             "command": "npx",
             "args": [
@@ -34,8 +49,13 @@
             "env": {}
         },
         "atlassian": {
-            "enabled": false,
-            "description": "Atlassian Rovo MCP (Jira/Confluence). Interactive Studio use only — the NFE Jira worker uses REST. Pin mcp-remote; do not use @latest.",
+            "enabled": true,
+            "description": "Atlassian Rovo MCP (Jira/Confluence). PE Agent binds these tools for list/search when asked (or when REST is empty). Product story *execute* still uses REST workers. Pin mcp-remote; do not use @latest.",
+            "capabilities": ["jira", "confluence", "alm"],
+            "tool_allowlist": ["*"],
+            "tool_denylist": ["*delete*", "*transition*", "*create*", "*update*"],
+            "timeout_s": 20,
+            "read_only": true,
             "transport": "stdio",
             "command": "npx",
             "args": [

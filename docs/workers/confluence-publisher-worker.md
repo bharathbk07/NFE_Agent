@@ -60,9 +60,8 @@ analyse / Jira pipeline finishes smoke
 
 | Outcome | Publish? |
 |---------|----------|
-| Completed + SLA failed | Yes |
-| Completed + SLA passed | Yes |
-| Completed + no SLA | Yes |
+| Smoke **passed** | Yes |
+| Smoke/SLA **failed** | **No** |
 | Mid-run abort / timeout / skipped | **No** |
 
 ---

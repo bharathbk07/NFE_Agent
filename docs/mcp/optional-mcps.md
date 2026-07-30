@@ -11,7 +11,16 @@ Python agents load via `src/tools/mcp_client.py`.
 
 1. Edit `config/mcp_servers.json`
 2. Set `"enabled": true` on the server you need
-3. Use `${env:VAR}` for secrets (resolved from `.env` / process env)
+3. Set `"capabilities": ["jira", ...]` so PE specialists can auto-bind tools
+4. Optional safety: `read_only`, `tool_allowlist`, `tool_denylist`, `timeout_s`
+5. Use `${env:VAR}` for secrets (resolved from `.env` / process env)
+6. Restart the LangGraph app — **no graph code change**
+
+PE assistant / PE Agent OS load MCP tools via `get_tools_for_capabilities(...)`.
+Story **execute** (`work on KEY`) still uses REST workers. List/search can use
+**Atlassian MCP** when you ask for MCP, or when REST returns no issues.
+
+See also: [PE Assistant runtime](../agents/pe-assistant-runtime.md).
 
 ```json
 {
@@ -61,7 +70,7 @@ Requires: `pip install langchain-mcp-adapters` (listed in `requirements.txt`).
 | `k6` | `enabled: false` | Optional Grafana [`k6 x mcp`](https://grafana.com/docs/k6/latest/set-up/configure-ai-assistant/). Smoke/heal uses **CLI** `k6 run` (needed for HTML report JSON). Enable only if you want MCP tools in-bot. |
 | `playwright` | `enabled: false` | Pipeline already uses in-process Playwright + CDP |
 | `chrome-devtools` | `enabled: false` | Optional live DevTools traces — not the capture layer |
-| `atlassian` | `enabled: false` | Atlassian Rovo MCP via pinned `mcp-remote`. Interactive Studio only; Jira worker uses REST ([`jira-integration.md`](../workers/jira-integration.md)). |
+| `atlassian` | `true`/`false` | Enrichment for Integrations specialist via capabilities `jira`/`confluence`/`alm`. Product list/process uses **REST**. |
 
 Turn a server on only when a sub-agent should call that MCP at runtime.
 

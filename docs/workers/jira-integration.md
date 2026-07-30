@@ -172,7 +172,7 @@ Add **force** or **re-run** in the message to reprocess or confirm after a clari
 
 The agent replies in chat with a short summary. Jira gets a **Test Report** comment as **Atlassian Document Format (ADF)** headings/lists (Jira Cloud REST v3 does not render Markdown/wiki markup in API comments).
 
-When smoke/SLA fails or the run aborts mid-way, the comment leads with **Why it failed / stopped** (failed URLs, checks, thresholds, exit code). If Confluence publishing succeeded for a *completed* run, the comment also includes the Confluence run-page URL. See [`confluence-publishing.md`](confluence-publishing.md). Worker design: [`jira-story-worker.md`](jira-story-worker.md).
+When smoke/SLA fails or the run aborts mid-way, the comment leads with **Why it failed / stopped** (failed URLs, checks, thresholds, exit code) and does **not** call it a successful completed test. Confluence publishes **only on pass**; failures stay on the Jira comment. Worker design: [`jira-story-worker.md`](jira-story-worker.md).
 
 ### 9. Optional CLI (debug)
 
@@ -254,11 +254,18 @@ Minimum granular scopes for NFE’s operations:
 
 ### Atlassian MCP (optional Studio)
 
-MCP uses Atlassian’s remote MCP / OAuth flow (see [Atlassian Rovo MCP](https://www.atlassian.com/platform/rovo-mcp)). Enable only for interactive Studio use:
+MCP uses Atlassian’s remote MCP / OAuth flow (see [Atlassian Rovo MCP](https://www.atlassian.com/platform/rovo-mcp)).
 
-1. Set `"enabled": true` on `atlassian` in [`config/mcp_servers.json`](../../config/mcp_servers.json).
-2. Complete OAuth when prompted.
-3. Keep REST env vars for the chat-driven pipeline — MCP is not used for processing stories.
+**Important:** `"enabled": true` on `atlassian` in [`config/mcp_servers.json`](../../config/mcp_servers.json) does **not** attach MCP tools to this app’s Studio chat. The graph is intent → nodes; listing/running stories uses **Jira REST** (`JIRA_*` env), not MCP.
+
+| You want… | Do this |
+|-----------|---------|
+| List eligible stories in chat | Say **list jira stories** (REST) |
+| Run a story | Say **work on SCRUM-1** (REST) |
+| Atlassian MCP in a custom agent | Call `get_mcp_tools(server_names=["atlassian"])` in code — not wired into the default graph |
+
+1. Optional: enable `atlassian` + complete OAuth if you build a custom MCP-using agent.
+2. Keep REST env vars configured — chat Jira commands depend on them.
 
 ---
 

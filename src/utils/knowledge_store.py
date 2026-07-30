@@ -229,6 +229,7 @@ def ingest_run_history(
         f"- **fail_rate:** `{merged.get('fail_rate', 'n/a')}`",
         f"- **checks_rate:** `{merged.get('checks_rate', 'n/a')}`",
         f"- **http_reqs:** `{merged.get('http_reqs', 'n/a')}`",
+        f"- **VUs:** `{merged.get('vus', 'n/a')}`",
         f"- **Workload source:** `{merged.get('workload_source', 'n/a')}`",
         f"- **k6:** `{merged.get('k6_path', 'n/a')}`",
         f"- **summary_json:** `{merged.get('summary_json', 'n/a')}`",
@@ -326,6 +327,17 @@ def list_run_history(
             text = jailed.read_text(encoding="utf-8")
             kpi = parse_kpi_from_run_markdown(text)
             kpi.setdefault("path", str(jailed))
+            if not isinstance(kpi.get("vus"), (int, float)):
+                summary_path = str(kpi.get("summary_json") or "").strip()
+                if summary_path and summary_path.lower() not in {"n/a", ""}:
+                    try:
+                        from src.utils.perf_trend import extract_kpis_from_summary_json
+
+                        extra = extract_kpis_from_summary_json(summary_path)
+                        if isinstance(extra.get("vus"), (int, float)):
+                            kpi["vus"] = int(extra["vus"])
+                    except Exception:
+                        pass
             out.append(kpi)
         except Exception:
             continue

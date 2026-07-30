@@ -89,7 +89,7 @@ NFE_K6_SLA_ABORT_ON_FAIL=false
 
 After `delayAbortEval`, if ≥60% of requests have failed (`http_req_failed` rate ≥ `NFE_K6_ABORT_FAIL_RATE`), k6 aborts. Same for p99 above `NFE_K6_ABORT_P99_MS` or checks pass-rate below `NFE_K6_ABORT_CHECKS_MIN`.
 
-NFE marks the run **failed**, tags `aborted_by_watcher`, and still **publishes Confluence** when `summary.json` exists (`COMPLETED — WATCHER STOPPED`) — unless the 4xx script gate skips. Infrastructure timeouts / spawn failures without a summary do **not** publish.
+NFE marks the run **failed**, tags `aborted_by_watcher`, and does **not** publish Confluence on fail (pass-only publish). Infrastructure timeouts / spawn failures without a summary also do **not** publish. Findings stay on the Jira story comment.
 
 **Default smoke** (empty workload) does **not** use `abortOnFail`, so self-heal can see the full failure set.
 

@@ -92,7 +92,7 @@ def is_dominant_4xx_script_failure(
     """True when the run failed mainly due to HTTP 4xx (script/correlation bugs).
 
     Those runs should **not** publish to Confluence — they pollute the space with
-    broken-script noise. Real completed load/SLA results still publish.
+    broken-script noise. Only **passing** smoke/load runs publish.
     """
     smoke = smoke_result or {}
     if smoke.get("ok") is True:
@@ -163,6 +163,20 @@ def explain_confluence_skip(
     if code in ("K6_SCRIPT_MISSING",):
         return "script_missing"
 
+    # Hard gate: never publish a failed / inconclusive smoke as a "completed" run.
+    # SLA fail, script/correlation fail, and unknown status stay on Jira comments only.
+    smoke_ok = smoke.get("ok")
+    if smoke_ok is not True:
+        if smoke_ok is False:
+            summary_path = (summary_json or smoke.get("summary_json") or "").strip()
+            summary = load_summary(summary_path) if summary_path else {}
+            if is_dominant_4xx_script_failure(smoke, summary):
+                return "script_4xx_failures"
+            if is_watcher_abort(smoke, summary):
+                return "sla_watcher_abort_no_publish"
+            return "smoke_failed_no_publish"
+        return "smoke_unknown_no_publish"
+
     summary_path = (summary_json or smoke.get("summary_json") or "").strip()
     summary = load_summary(summary_path) if summary_path else {}
     iterations = _summary_iteration_count(summary) if summary else None
@@ -174,9 +188,6 @@ def explain_confluence_skip(
     )
 
     if completed:
-        # Do not pollute Confluence with broken-script 4xx smoke failures.
-        if is_dominant_4xx_script_failure(smoke, summary):
-            return "script_4xx_failures"
         return ""
 
     summary_text = str(smoke.get("summary") or "").lower()
@@ -222,12 +233,9 @@ def explain_confluence_skip(
         return "incomplete_no_summary"
 
     if "aborted" in combined or "interrupted" in combined:
-        # Without a usable summary this is an infra / mid-run stop.
         if not summary:
             return "incomplete_aborted"
 
-    if is_dominant_4xx_script_failure(smoke, summary):
-        return "script_4xx_failures"
     return ""
 
 
@@ -237,11 +245,10 @@ def should_publish_to_confluence(
     *,
     require_config: bool = True,
 ) -> bool:
-    """Return True only for fully completed k6 runs (SLA pass/fail/none).
+    """Return True only for **passing** completed k6 runs.
 
-    Mid-run abort / timeout / skipped / missing script → False.
-    When ``summary.json`` has iterations > 0, publish even if stderr mentions
-    incidental ``timeout`` substrings (common false positive).
+    Failed smoke/SLA, mid-run abort, timeout, skipped, or missing script → False.
+    Failures stay on the Jira story comment; Confluence is evidence of green runs.
     """
     return not bool(
         explain_confluence_skip(

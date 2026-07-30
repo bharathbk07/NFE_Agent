@@ -145,3 +145,7 @@ class AgentState(TypedDict):
     randomization_state: NotRequired[Dict[str, Any]]
     randomization_ledger: NotRequired[List[RandomizationLedgerEntry]]
     non_randomizable_endpoints: NotRequired[List[Dict[str, Any]]]
+    # PE Agent OS (OpenClaw-inspired)
+    pe_thread_id: NotRequired[str]
+    pending_action: NotRequired[Dict[str, Any]]
+    agent_authorizations: NotRequired[List[str]]

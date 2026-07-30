@@ -17,6 +17,7 @@ from src.nodes.routing import (
     answer_analysis_question,
     respond_conversation,
     route_intent,
+    run_pe_supervisor,
 )
 
 __all__ = [
@@ -34,5 +35,6 @@ __all__ = [
     "route_intent",
     "run_automation",
     "run_jira_story",
+    "run_pe_supervisor",
     "watch_me_record",
 ]
